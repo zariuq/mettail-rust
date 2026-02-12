@@ -58,13 +58,21 @@ examples/src/*_gen.rs
 
 # Generated files (languages/src/generated is committed so CI build script can find .lalrpop files)
 # /languages/src/generated - do not ignore; build script needs these before macro runs
+/languages/src/generated/tinyml.lalrpop
+/languages/src/generated/tinyml-datalog.rs
+/languages/src/generated/tinyml-blocks.ts
+/languages/src/generated/tinyml-categories.ts
+/languages/src/generated/tinymlsmoke.lalrpop
+/languages/src/generated/tinymlsmoke-datalog.rs
+/languages/src/generated/tinymlsmoke-blocks.ts
+/languages/src/generated/tinymlsmoke-categories.ts
 
 # trybuild artifacts
 target/tests/trybuild/
 
 # Work-in-progress directories
 **/wip/
+/.artifacts/
 
 # Implementation plans and developer notes
 *.plan.md
-

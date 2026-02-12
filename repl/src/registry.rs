@@ -7,6 +7,7 @@ use mettail_languages::ambient::AmbientLanguage;
 use mettail_languages::calculator::CalculatorLanguage;
 use mettail_languages::lambda::LambdaLanguage;
 use mettail_languages::rhocalc::RhoCalcLanguage;
+use mettail_languages::tinyml_from_lean::TinyMLSmokeLanguage;
 
 /// Registry of available languages
 pub struct LanguageRegistry {
@@ -59,6 +60,7 @@ pub fn build_registry() -> Result<LanguageRegistry> {
     registry.register(Box::new(CalculatorLanguage));
     registry.register(Box::new(LambdaLanguage));
     registry.register(Box::new(RhoCalcLanguage));
+    registry.register(Box::new(TinyMLSmokeLanguage));
 
     if registry.languages.is_empty() {
         bail!("No languages available.");

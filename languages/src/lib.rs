@@ -13,6 +13,7 @@ pub mod ambient;
 pub mod calculator;
 pub mod lambda;
 pub mod rhocalc;
+pub mod tinyml_from_lean;
 
 // Re-export eqrel for the generated Ascent code
 // The generated code uses `#[ds(crate::eqrel)]` which expects eqrel at crate root

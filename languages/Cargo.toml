@@ -36,6 +36,10 @@ path = "tests/ambient_tests.rs"
 name = "rhocalc_tests"
 path = "tests/rhocalc_tests.rs"
 
+[[bin]]
+name = "tinymlsmoke_roundtrip"
+path = "tests/tinymlsmoke_roundtrip.rs"
+
 [[bench]]
 name = "rhocalc_bench"
 harness = false
