@@ -121,6 +121,34 @@ Applied rewrite →
   | server!(request) }
 ```
 
+## Non-Interactive CLI (Agent-Friendly)
+
+For automation and AI-agent workflows, use one-shot commands instead of the REPL:
+
+```bash
+# List available languages
+./target/debug/mettail languages
+
+# Run one term and print machine-parseable key=value output
+./target/debug/mettail run --lang rhocalc --term "0"
+```
+
+Example output:
+
+```text
+MODE=run
+LANGUAGE=RhoCalc
+INPUT=0
+PARSE_OK=1
+TERM_ID=5206408872174730967
+ASCENT_OK=1
+ALL_TERMS=8
+REWRITES=0
+NORMAL_FORMS=8
+REWRITE_TARGETS=
+REACHABLE_NORMAL_FORM=0
+```
+
 ---
 
 ## 🙏 Credits
