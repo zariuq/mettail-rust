@@ -143,7 +143,7 @@ fn literal_payload_type(nt: &str, category: &syn::Ident, language: &LanguageDef)
             } else {
                 quote! { i32 }
             }
-        }
+        },
         "Boolean" => quote! { bool },
         "StringLiteral" => quote! { std::string::String },
         "FloatLiteral" => {
@@ -152,7 +152,7 @@ fn literal_payload_type(nt: &str, category: &syn::Ident, language: &LanguageDef)
             } else {
                 quote! { f64 }
             }
-        }
+        },
         _ => quote! { std::string::String }, // fallback for str/other
     }
 }
@@ -203,7 +203,9 @@ fn generate_variant(rule: &GrammarRule, language: &LanguageDef) -> TokenStream {
     } else if fields.len() == 1 {
         #[allow(clippy::cmp_owned)]
         match &fields[0] {
-            FieldType::NonTerminal(ident) if crate::gen::is_literal_nonterminal(&ident.to_string()) => {
+            FieldType::NonTerminal(ident)
+                if crate::gen::is_literal_nonterminal(&ident.to_string()) =>
+            {
                 // Literal rule: payload type from nonterminal name (Integer, Boolean, StringLiteral, FloatLiteral)
                 let nt = ident.to_string();
                 let payload_type = literal_payload_type(&nt, &rule.category, language);

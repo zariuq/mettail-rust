@@ -131,6 +131,10 @@ For automation and AI-agent workflows, use one-shot commands instead of the REPL
 
 # Run one term and print machine-parseable key=value output
 ./target/debug/mettail run --lang rhocalc --term "0"
+
+# Human-readable run output
+./target/debug/mettail run --lang mettaminimalstate --pretty \
+  --term "(State (Eval ATrue) AFalse AFalse)"
 ```
 
 Example output:
@@ -147,6 +151,44 @@ REWRITES=0
 NORMAL_FORMS=8
 REWRITE_TARGETS=
 REACHABLE_NORMAL_FORM=0
+```
+
+## Lean Export Round-Trip Scripts
+
+Regenerate Lean-exported languages and check one-step Rust rewrite parity:
+
+```bash
+# TinyML smoke
+./scripts/roundtrip_tinymlsmoke.sh
+
+# MeTTaMinimalState
+./scripts/roundtrip_mettaminimal.sh
+
+# Benchmark MeTTaMinimal roundtrip (default: 3 runs)
+./scripts/bench_mettaminimal_roundtrip.sh
+
+# Benchmark with 5 runs
+./scripts/bench_mettaminimal_roundtrip.sh 5
+```
+
+Both scripts:
+1. Call Lean export tooling in `mettapedia`
+2. Regenerate `languages/src/*_from_lean.rs`
+3. Build a dedicated round-trip checker binary
+4. Assert the expected rewritten term is produced
+
+Current MeTTaMinimal smoke example (full exported language):
+- Input: `(State (Eval ATrue) AFalse ATrue)`
+- Expected one-step target: `(State (Return ATrue) AFalse ATrue)`
+
+MeTTaMinimal REPL examples (PeTTa-style small state transitions):
+```bash
+./target/debug/mettail repl mettaminimalstate
+# then:
+list-examples
+example mm_eval_true
+example mm_return_true
+example mm_done_noop
 ```
 
 ---

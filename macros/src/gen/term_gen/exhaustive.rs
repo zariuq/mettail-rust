@@ -403,54 +403,60 @@ fn generate_nary_case(
     arg_cats: &[Ident],
     language: &LanguageDef,
 ) -> TokenStream {
-    // For now, use a simplified approach: all args at depth-1
-    // This is less comprehensive but simpler
-    let n = arg_cats.len();
+    // Simplified n-ary strategy: all arguments come from depth-1.
+    if arg_cats.iter().any(|cat| !is_lang_type(cat, language)) {
+        return quote! {};
+    }
 
-    let field_names: Vec<TokenStream> = arg_cats
+    let field_names: Vec<Ident> = arg_cats.iter().map(category_to_field_name).collect();
+    let args_vars: Vec<Ident> = (0..arg_cats.len())
+        .map(|i| syn::Ident::new(&format!("args{}", i), proc_macro2::Span::call_site()))
+        .collect();
+    let arg_vars: Vec<Ident> = (0..arg_cats.len())
+        .map(|i| syn::Ident::new(&format!("arg{}", i), proc_macro2::Span::call_site()))
+        .collect();
+
+    let constructor_args: Vec<TokenStream> = arg_vars
         .iter()
-        .enumerate()
-        .map(|(i, cat)| {
-            if !is_lang_type(cat, language) {
-                return quote! {};
-            }
-            let field = category_to_field_name(cat);
-            let di = syn::Ident::new(&format!("d{}", i), proc_macro2::Span::call_site());
-            let argi = syn::Ident::new(&format!("args{}", i), proc_macro2::Span::call_site());
-            quote! {
-                if let Some(#argi) = self.#field.get(&#di)
-            }
-        })
-        .collect();
-
-    let arg_iters: Vec<TokenStream> = (0..n)
-        .map(|i| {
-            let argi = syn::Ident::new(&format!("args{}", i), proc_macro2::Span::call_site());
-            let argi_single = syn::Ident::new(&format!("arg{}", i), proc_macro2::Span::call_site());
-            quote! {
-                for #argi_single in #argi
-            }
-        })
-        .collect();
-
-    let constructor_args: Vec<TokenStream> = (0..n)
-        .map(|i| {
-            let argi = syn::Ident::new(&format!("arg{}", i), proc_macro2::Span::call_site());
+        .map(|argi| {
             quote! {
                 Box::new(#argi.clone())
             }
         })
         .collect();
 
-    // Simplified: just use depth-1 for all args
+    let push_ctor = quote! {
+        terms.push(#cat_name::#label(#(#constructor_args),*));
+    };
+
+    let nested_loops =
+        arg_vars
+            .iter()
+            .zip(args_vars.iter())
+            .rfold(push_ctor, |acc, (argi, argsi)| {
+                quote! {
+                    for #argi in #argsi {
+                        #acc
+                    }
+                }
+            });
+
+    let nested_ifs =
+        field_names
+            .iter()
+            .zip(args_vars.iter())
+            .rfold(nested_loops, |acc, (field, argsi)| {
+                quote! {
+                    if let Some(#argsi) = self.#field.get(&d) {
+                        #acc
+                    }
+                }
+            });
+
     quote! {
         if depth > 0 {
             let d = depth - 1;
-            #(#field_names)* {
-                #(#arg_iters)* {
-                    terms.push(#cat_name::#label(#(#constructor_args),*));
-                }
-            }
+            #nested_ifs
         }
     }
 }

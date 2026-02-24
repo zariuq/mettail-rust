@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use mettail_repl::{build_registry, LanguageRegistry, Repl};
+use mettail_repl::{
+    build_registry, format_term_pretty, normalize_input_for_language, prettify_output_for_language,
+    LanguageRegistry, Repl,
+};
 use std::fs;
 
 /// MeTTaIL Term Explorer - Interactive REPL for exploring rewrite systems
@@ -30,11 +33,19 @@ enum Command {
         #[arg(long = "lang", short = 'l', value_name = "LANGUAGE")]
         language: String,
         /// Term text to parse and execute
-        #[arg(long = "term", short = 't', value_name = "TERM", conflicts_with = "term_file")]
+        #[arg(
+            long = "term",
+            short = 't',
+            value_name = "TERM",
+            conflicts_with = "term_file"
+        )]
         term: Option<String>,
         /// Read term text from file
         #[arg(long = "term-file", value_name = "FILE", conflicts_with = "term")]
         term_file: Option<String>,
+        /// Human-readable output (instead of key=value machine output)
+        #[arg(long = "pretty")]
+        pretty: bool,
     },
     /// List available language names.
     Languages,
@@ -46,11 +57,9 @@ fn main() -> Result<()> {
 
     match args.command {
         Some(Command::Repl { language }) => run_repl(registry, language)?,
-        Some(Command::Run {
-            language,
-            term,
-            term_file,
-        }) => run_once(&registry, &language, term.as_deref(), term_file.as_deref())?,
+        Some(Command::Run { language, term, term_file, pretty }) => {
+            run_once(&registry, &language, term.as_deref(), term_file.as_deref(), pretty)?
+        },
         Some(Command::Languages) => {
             for name in sorted_language_names(&registry) {
                 println!("{name}");
@@ -105,23 +114,33 @@ fn run_once(
     language_name: &str,
     term: Option<&str>,
     term_file: Option<&str>,
+    pretty: bool,
 ) -> Result<()> {
     let language = match registry.get(language_name) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("ERROR={}", sanitize_line(&e.to_string()));
-            eprintln!(
-                "AVAILABLE_LANGUAGES={}",
-                sorted_language_names(registry).join(",")
-            );
+            eprintln!("AVAILABLE_LANGUAGES={}", sorted_language_names(registry).join(","));
             std::process::exit(2);
         },
     };
 
-    let input = resolve_term_input(term, term_file)?;
-    println!("MODE=run");
-    println!("LANGUAGE={}", language.name());
-    println!("INPUT={}", sanitize_line(&input));
+    let raw_input = resolve_term_input(term, term_file)?;
+    let input = normalize_input_for_language(language.name(), &raw_input);
+    if pretty {
+        println!("Mode: run (pretty)");
+        println!("Language: {}", language.name());
+        println!("Input:");
+        for line in
+            format_term_pretty(&prettify_output_for_language(language.name(), &input)).lines()
+        {
+            println!("  {}", line);
+        }
+    } else {
+        println!("MODE=run");
+        println!("LANGUAGE={}", language.name());
+        println!("INPUT={}", sanitize_line(&input));
+    }
 
     let parsed = match language.parse_term(&input) {
         Ok(t) => t,
@@ -131,8 +150,13 @@ fn run_once(
             std::process::exit(3);
         },
     };
-    println!("PARSE_OK=1");
-    println!("TERM_ID={}", parsed.term_id());
+    if pretty {
+        println!("Parsed: ok");
+        println!("Term ID: {}", parsed.term_id());
+    } else {
+        println!("PARSE_OK=1");
+        println!("TERM_ID={}", parsed.term_id());
+    }
 
     let initial_id = parsed.term_id();
     let results = match language.run_ascent(parsed.as_ref()) {
@@ -143,12 +167,21 @@ fn run_once(
             std::process::exit(4);
         },
     };
-    println!("ASCENT_OK=1");
-    println!("ALL_TERMS={}", results.all_terms.len());
-    println!("REWRITES={}", results.rewrites.len());
-    println!("NORMAL_FORMS={}", results.normal_forms().len());
+    if pretty {
+        println!(
+            "Summary: terms={} rewrites={} normal_forms={}",
+            results.all_terms.len(),
+            results.rewrites.len(),
+            results.normal_forms().len()
+        );
+    } else {
+        println!("ASCENT_OK=1");
+        println!("ALL_TERMS={}", results.all_terms.len());
+        println!("REWRITES={}", results.rewrites.len());
+        println!("NORMAL_FORMS={}", results.normal_forms().len());
+    }
 
-    let targets: Vec<String> = results
+    let target_raw: Vec<String> = results
         .rewrites_from(initial_id)
         .into_iter()
         .filter_map(|rw| {
@@ -156,15 +189,39 @@ fn run_once(
                 .all_terms
                 .iter()
                 .find(|t| t.term_id == rw.to_id)
-                .map(|info| sanitize_line(&info.display))
+                .map(|info| prettify_output_for_language(language.name(), &info.display))
         })
         .collect();
-    println!("REWRITE_TARGETS={}", targets.join(" | "));
-
-    if let Some(nf) = results.normal_form_reachable_from(initial_id) {
-        println!("REACHABLE_NORMAL_FORM={}", sanitize_line(&nf.display));
+    if pretty {
+        if target_raw.is_empty() {
+            println!("One-step targets: (none)");
+        } else {
+            println!("One-step targets:");
+            for (i, t) in target_raw.iter().enumerate() {
+                println!("  {}.", i);
+                for line in format_term_pretty(t).lines() {
+                    println!("    {}", line);
+                }
+            }
+        }
+        if let Some(nf) = results.normal_form_reachable_from(initial_id) {
+            println!("Reachable normal form:");
+            let rendered = prettify_output_for_language(language.name(), &nf.display);
+            for line in format_term_pretty(&rendered).lines() {
+                println!("  {}", line);
+            }
+        } else {
+            println!("Reachable normal form: (none)");
+        }
     } else {
-        println!("REACHABLE_NORMAL_FORM=");
+        let targets: Vec<String> = target_raw.iter().map(|t| sanitize_line(t)).collect();
+        println!("REWRITE_TARGETS={}", targets.join(" | "));
+
+        if let Some(nf) = results.normal_form_reachable_from(initial_id) {
+            println!("REACHABLE_NORMAL_FORM={}", sanitize_line(&nf.display));
+        } else {
+            println!("REACHABLE_NORMAL_FORM=");
+        }
     }
 
     Ok(())

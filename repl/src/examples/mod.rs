@@ -5,6 +5,7 @@
 
 pub mod ambient;
 pub mod calculator;
+pub mod mettaminimal;
 pub mod rhocalc;
 
 /// Metadata for an example process
@@ -21,6 +22,7 @@ pub enum LanguageName {
     RhoCalculus,
     AmbientCalculus,
     Calculator,
+    MeTTaMinimalState,
 }
 
 impl LanguageName {
@@ -29,6 +31,7 @@ impl LanguageName {
             LanguageName::RhoCalculus => "rhocalc",
             LanguageName::AmbientCalculus => "ambient",
             LanguageName::Calculator => "calculator",
+            LanguageName::MeTTaMinimalState => "mettaminimalstate",
         }
     }
 }
@@ -54,6 +57,7 @@ impl Example {
         examples.extend(rhocalc::all());
         examples.extend(ambient::all());
         examples.extend(calculator::all());
+        examples.extend(mettaminimal::all());
         examples
     }
 
@@ -76,6 +80,7 @@ impl Example {
             LanguageName::RhoCalculus => rhocalc::all(),
             LanguageName::AmbientCalculus => ambient::all(),
             LanguageName::Calculator => calculator::all(),
+            LanguageName::MeTTaMinimalState => mettaminimal::all(),
         }
     }
 
@@ -101,5 +106,22 @@ impl Example {
                 e.language.as_str().eq_ignore_ascii_case(language_name) && e.category == cat
             })
             .collect()
+    }
+}
+
+impl ExampleCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            ExampleCategory::Simple => "Simple",
+            ExampleCategory::Branching => "Branching",
+            ExampleCategory::Complex => "Complex",
+            ExampleCategory::Parallel => "Parallel",
+            ExampleCategory::Advanced => "Advanced",
+            ExampleCategory::Performance => "Performance",
+            ExampleCategory::EdgeCase => "Edge Cases",
+            ExampleCategory::Mobility => "Mobility",
+            ExampleCategory::Security => "Security",
+            ExampleCategory::MultiComm => "Multi-Comm",
+        }
     }
 }

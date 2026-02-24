@@ -1,0 +1,97 @@
+// Generated LALRPOP grammar for theory: MeTTaMinimalState
+// This file is auto-generated - do not edit manually
+
+use super::{State, Instr, Atom, VarCategory};
+
+grammar;
+
+match {
+    "instr",
+    "atom",
+} else {
+    r"[a-zA-Z_][a-zA-Z0-9_]*",
+    _
+}
+
+Comma<T>: Vec<T> = {
+    <mut v:(<T> ",")*> <e:T?> => match e {
+        None => v,
+        Some(e) => { v.push(e); v }
+    }
+};
+
+Ident: std::string::String = {
+    r"[a-zA-Z_][a-zA-Z0-9_]*" => <>.to_string(),
+};
+
+pub State: State = {
+    "C_State" "(" <instr:Instr> "," <x:Atom> "," <y:Atom> ")" => State::C_State(Box::new(instr), Box::new(x), Box::new(y))
+,
+    <v:Ident> => State::SVar(mettail_runtime::OrdVar(mettail_runtime::Var::Free(mettail_runtime::get_or_create_var(v.clone())))),
+    "^" <x:Ident> "." "{" <body:State> "}" => {
+        let binder = mettail_runtime::Binder(mettail_runtime::get_or_create_var(x.clone()));
+        // Infer binder type from usage in body (supports higher-order types)
+        match body.infer_var_type(&x) {
+            Some(ref t) => match t.base_type() {
+                VarCategory::State => State::LamState(mettail_runtime::Scope::new(binder, Box::new(body))),
+                VarCategory::Instr => State::LamInstr(mettail_runtime::Scope::new(binder, Box::new(body))),
+                VarCategory::Atom => State::LamAtom(mettail_runtime::Scope::new(binder, Box::new(body))),
+            },
+            None => panic!("Lambda binder '{}' not used in body", x),
+        }
+    },
+    "^" "[" <xs:Comma<Ident>> "]" "." "{" <body:State> "}" => {
+        let binder_names: Vec<_> = xs.clone();
+        let binders: Vec<_> = xs.into_iter()
+            .map(|x| mettail_runtime::Binder(mettail_runtime::get_or_create_var(x)))
+            .collect();
+        // Infer binder type from first binder's usage in body
+        let first_binder = binder_names.first().expect("Multi-lambda needs at least one binder");
+        match body.infer_var_type(first_binder) {
+            Some(ref t) => match t.base_type() {
+                VarCategory::State => State::MLamState(mettail_runtime::Scope::new(binders, Box::new(body))),
+                VarCategory::Instr => State::MLamInstr(mettail_runtime::Scope::new(binders, Box::new(body))),
+                VarCategory::Atom => State::MLamAtom(mettail_runtime::Scope::new(binders, Box::new(body))),
+            },
+            None => panic!("Lambda binder '{}' not used in body", first_binder),
+        }
+    },
+    "$state" "(" <lam:State> "," <arg:State> ")" => {
+        State::ApplyState(Box::new(lam), Box::new(arg))
+    },
+    "$instr" "(" <lam:State> "," <arg:Instr> ")" => {
+        State::ApplyInstr(Box::new(lam), Box::new(arg))
+    },
+    "$atom" "(" <lam:State> "," <arg:Atom> ")" => {
+        State::ApplyAtom(Box::new(lam), Box::new(arg))
+    },
+    "$$state(" <lam:State> "," <args:Comma<State>> ")" => {
+        State::MApplyState(Box::new(lam), args)
+    },
+    "$$instr(" <lam:State> "," <args:Comma<Instr>> ")" => {
+        State::MApplyInstr(Box::new(lam), args)
+    },
+    "$$atom(" <lam:State> "," <args:Comma<Atom>> ")" => {
+        State::MApplyAtom(Box::new(lam), args)
+    }
+};
+
+pub Instr: Instr = {
+    "C_Eval" "(" <a:Atom> ")" => Instr::C_Eval(Box::new(a)),
+    "C_Unify" "(" <lhs:Atom> "," <rhs:Atom> ")" => Instr::C_Unify(Box::new(lhs), Box::new(rhs)),
+    "C_Chain" "(" <src:Atom> "," <tmpl:Atom> ")" => Instr::C_Chain(Box::new(src), Box::new(tmpl)),
+    "C_CollapseBind" "(" <src:Atom> ")" => Instr::C_CollapseBind(Box::new(src)),
+    "C_SuperposeBind" "(" <packed:Atom> ")" => Instr::C_SuperposeBind(Box::new(packed)),
+    "C_Return" "(" <a:Atom> ")" => Instr::C_Return(Box::new(a)),
+    "C_Done" => Instr::C_Done
+,
+    "instr" ":" <v:Ident> => Instr::IVar(mettail_runtime::OrdVar(mettail_runtime::Var::Free(mettail_runtime::get_or_create_var(v.clone()))))
+};
+
+pub Atom: Atom = {
+    "C_ATrue" => Atom::C_ATrue,
+    "C_AFalse" => Atom::C_AFalse
+,
+    "atom" ":" <v:Ident> => Atom::AVar(mettail_runtime::OrdVar(mettail_runtime::Var::Free(mettail_runtime::get_or_create_var(v.clone()))))
+};
+

@@ -12,6 +12,7 @@
 pub mod ambient;
 pub mod calculator;
 pub mod lambda;
+pub mod mettaminimal_from_lean;
 pub mod rhocalc;
 pub mod tinyml_from_lean;
 

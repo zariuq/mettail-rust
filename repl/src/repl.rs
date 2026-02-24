@@ -1,4 +1,5 @@
 use crate::examples::{Example, ExampleCategory};
+use crate::metta_surface::{normalize_input_for_language, prettify_output_for_language};
 use crate::pretty::format_term_pretty;
 use crate::registry::LanguageRegistry;
 use crate::state::ReplState;
@@ -8,6 +9,7 @@ use mettail_runtime::{AscentResults, Language, TermInfo};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result as RustyResult};
 use std::any::Any;
+use std::collections::HashSet;
 use std::time::Instant;
 
 /// Replace whole-word occurrences of env-bound identifiers in the input with their display form.
@@ -317,9 +319,20 @@ impl Repl {
         // Store the theory name in state
         self.state.load_language(language.name());
 
-        // Try to auto-load environment from repl/src/examples/{theory_name}.txt
-        let env_file = format!("repl/src/examples/{}.txt", language_name);
-        if std::path::Path::new(&env_file).exists() {
+        // Try to auto-load environment from repl/src/examples/{language}.txt.
+        // Accept the raw argument and canonical language names.
+        let mut candidates = vec![
+            format!("repl/src/examples/{}.txt", language_name),
+            format!("repl/src/examples/{}.txt", language.name()),
+            format!("repl/src/examples/{}.txt", language.name().to_lowercase()),
+        ];
+        let mut seen = HashSet::new();
+        candidates.retain(|c| seen.insert(c.clone()));
+
+        for env_file in candidates {
+            if !std::path::Path::new(&env_file).exists() {
+                continue;
+            }
             match self.load_env_from_file(&env_file) {
                 Ok(count) if count > 0 => {
                     println!("  [{} definitions from {}]", count, env_file);
@@ -329,6 +342,7 @@ impl Repl {
                     println!("  {} Failed to load {}: {}", "⚠".yellow(), env_file, e);
                 },
             }
+            break;
         }
         println!();
 
@@ -511,14 +525,15 @@ impl Repl {
         let language = self.registry.get(language_name)?;
 
         // Pre-substitute env-bound identifiers so RHS like `x && (3 == 3)` parses when x is Bool
+        let normalized_term = normalize_input_for_language(language.name(), term_str);
         let parse_input = if let Some(env) = self.state.environment() {
             if !language.is_env_empty(env) {
-                pre_substitute_env(term_str, language, env)
+                pre_substitute_env(&normalized_term, language, env)
             } else {
-                term_str.to_string()
+                normalized_term
             }
         } else {
-            term_str.to_string()
+            normalized_term
         };
 
         // Parse the term WITHOUT clearing var cache
@@ -569,7 +584,8 @@ impl Repl {
                         // No comment on this item, reset section tracking
                         last_comment = None;
                     }
-                    println!("  {} = {}", name.cyan(), value.green());
+                    let rendered = prettify_output_for_language(language.name(), value);
+                    println!("  {} = {}", name.cyan(), rendered.green());
                 }
             }
         } else {
@@ -745,14 +761,15 @@ impl Repl {
             // Try to parse as assignment
             if let Some((name, term_str)) = Self::parse_assignment(line) {
                 // Pre-substitute so RHS can reference names defined earlier in this file
+                let normalized_term = normalize_input_for_language(language.name(), &term_str);
                 let parse_input = if let Some(env) = self.state.environment() {
                     if !language.is_env_empty(env) {
-                        pre_substitute_env(&term_str, language, env)
+                        pre_substitute_env(&normalized_term, language, env)
                     } else {
-                        term_str.to_string()
+                        normalized_term
                     }
                 } else {
-                    term_str.to_string()
+                    normalized_term
                 };
                 // Parse the term (using parse_term_for_env to share variable IDs)
                 match language.parse_term_for_env(&parse_input) {
@@ -799,9 +816,16 @@ impl Repl {
     }
 
     fn cmd_term(&mut self) -> Result<()> {
+        let language_name = self
+            .state
+            .language_name()
+            .ok_or_else(|| anyhow::anyhow!("No language loaded. Use 'lang <language>' first."))?;
+        let language = self.registry.get(language_name)?;
+
         println!("{}", "Current term:".bold());
         if let Some(term) = self.state.current_term() {
-            let formatted = format_term_pretty(&format!("{}", term));
+            let rendered = prettify_output_for_language(language.name(), &format!("{}", term));
+            let formatted = format_term_pretty(&rendered);
             println!("{}", formatted.cyan());
         } else {
             println!("{}", "(none)".dimmed());
@@ -929,14 +953,15 @@ impl Repl {
         println!();
         print!("Parsing... ");
 
+        let normalized_term = normalize_input_for_language(language.name(), term_str);
         let parse_input = if let Some(env) = self.state.environment() {
             if !language.is_env_empty(env) {
-                pre_substitute_env(term_str, language, env)
+                pre_substitute_env(&normalized_term, language, env)
             } else {
-                term_str.to_string()
+                normalized_term
             }
         } else {
-            term_str.to_string()
+            normalized_term
         };
 
         let term = language
@@ -972,10 +997,13 @@ impl Repl {
                 let results = AscentResults::from_single_term(result_term.as_ref());
                 println!();
                 println!("{}", "Current term (result):".bold());
-                let formatted = format_term_pretty(&format!("{}", result_term));
+                let rendered =
+                    prettify_output_for_language(language.name(), &format!("{}", result_term));
+                let formatted = format_term_pretty(&rendered);
                 println!("{}", formatted.cyan());
                 println!();
-                self.state.set_term_with_id(result_term, results, result_id)?;
+                self.state
+                    .set_term_with_id(result_term, results, result_id)?;
                 return Ok(());
             }
         }
@@ -1002,12 +1030,17 @@ impl Repl {
             // Step: always show initial term so user can apply rewrites one by one
             let available = results.rewrites_from(initial_id).len();
             println!("{}", "Current term (initial):".bold());
-            let formatted = format_term_pretty(&format!("{}", term));
+            let rendered = prettify_output_for_language(language.name(), &format!("{}", term));
+            let formatted = format_term_pretty(&rendered);
             println!("{}", formatted.cyan());
             println!();
             self.state.set_term_with_id(term, results, initial_id)?;
             if available > 0 {
-                println!("  Use {} to apply a rewrite ({} available).", "apply 0".cyan(), available);
+                println!(
+                    "  Use {} to apply a rewrite ({} available).",
+                    "apply 0".cyan(),
+                    available
+                );
             } else {
                 println!("  No rewrites from this term (already a normal form).");
             }
@@ -1018,7 +1051,8 @@ impl Repl {
                     .parse_term(&nf.display)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 println!("{}", "Current term (result):".bold());
-                let formatted = format_term_pretty(&nf.display);
+                let rendered = prettify_output_for_language(language.name(), &nf.display);
+                let formatted = format_term_pretty(&rendered);
                 println!("{}", formatted.cyan());
                 println!();
                 self.state
@@ -1026,7 +1060,8 @@ impl Repl {
                 return Ok(());
             }
             println!("{}", "Current term:".bold());
-            let formatted = format_term_pretty(&format!("{}", term));
+            let rendered = prettify_output_for_language(language.name(), &format!("{}", term));
+            let formatted = format_term_pretty(&rendered);
             println!("{}", formatted.cyan());
             println!();
             self.state.set_term(term, results)?;
@@ -1083,6 +1118,12 @@ impl Repl {
     }
 
     fn cmd_rewrites(&self) -> Result<()> {
+        let language_name = self
+            .state
+            .language_name()
+            .ok_or_else(|| anyhow::anyhow!("No language loaded. Use 'lang <language>' first."))?;
+        let language = self.registry.get(language_name)?;
+
         let results = self.get_results()?;
 
         let current_id = self
@@ -1109,10 +1150,11 @@ impl Repl {
             for (idx, rewrite) in available_rewrites.iter().enumerate() {
                 // Find the target term display
                 let target_info = self.term_by_id(rewrite.to_id)?;
-                let target_display = target_info.display.as_str();
+                let target_display =
+                    prettify_output_for_language(language.name(), &target_info.display);
 
                 // Pretty print the target
-                let formatted = format_term_pretty(target_display);
+                let formatted = format_term_pretty(&target_display);
 
                 println!("  {}) {}", idx.to_string().cyan(), "→".yellow());
                 // Indent each line of the formatted output
@@ -1136,6 +1178,12 @@ impl Repl {
     }
 
     fn cmd_normal_forms(&self) -> Result<()> {
+        let language_name = self
+            .state
+            .language_name()
+            .ok_or_else(|| anyhow::anyhow!("No language loaded. Use 'lang <language>' first."))?;
+        let language = self.registry.get(language_name)?;
+
         let results = self.get_results()?;
 
         let normal_forms = results.normal_forms();
@@ -1147,7 +1195,8 @@ impl Repl {
             println!("{} ({} total):", "Normal forms".bold(), normal_forms.len());
             println!();
             for (idx, nf) in normal_forms.iter().enumerate() {
-                let formatted = format_term_pretty(&nf.display);
+                let rendered = prettify_output_for_language(language.name(), &nf.display);
+                let formatted = format_term_pretty(&rendered);
                 println!("  {})", idx.to_string().cyan());
                 for line in formatted.lines() {
                     println!("    {}", line.green());
@@ -1202,12 +1251,16 @@ impl Repl {
                 println!();
                 println!("{} ({} tuples):", "terms(Term)".bold(), results.all_terms.len());
                 for term_info in &results.all_terms {
-                    let nf_marker = if term_info.is_normal_form { " [NF]".dimmed() } else { "".into() };
+                    let nf_marker = if term_info.is_normal_form {
+                        " [NF]".dimmed()
+                    } else {
+                        "".into()
+                    };
                     println!("  {}{}", term_info.display.green(), nf_marker);
                 }
                 println!();
                 return Ok(());
-            }
+            },
             "rewrites" => {
                 println!();
                 println!("{} ({} tuples):", "rewrites(Term, Term)".bold(), results.rewrites.len());
@@ -1215,17 +1268,24 @@ impl Repl {
                     let from = results.all_terms.iter().find(|t| t.term_id == rw.from_id);
                     let to = results.all_terms.iter().find(|t| t.term_id == rw.to_id);
                     if let (Some(from), Some(to)) = (from, to) {
-                        println!("  {} {} {}", from.display.green(), "→".yellow(), to.display.green());
+                        println!(
+                            "  {} {} {}",
+                            from.display.green(),
+                            "→".yellow(),
+                            to.display.green()
+                        );
                     }
                 }
                 println!();
                 return Ok(());
-            }
+            },
             "equivalences" => {
                 println!();
                 println!("{} ({} classes):", "equivalences".bold(), results.equivalences.len());
                 for equiv in &results.equivalences {
-                    let terms: Vec<_> = equiv.term_ids.iter()
+                    let terms: Vec<_> = equiv
+                        .term_ids
+                        .iter()
                         .filter_map(|id| results.all_terms.iter().find(|t| t.term_id == *id))
                         .map(|t| t.display.as_str())
                         .collect();
@@ -1233,8 +1293,8 @@ impl Repl {
                 }
                 println!();
                 return Ok(());
-            }
-            _ => {}
+            },
+            _ => {},
         }
 
         // Check custom relations
@@ -1249,10 +1309,7 @@ impl Repl {
             return Ok(());
         }
 
-        anyhow::bail!(
-            "Unknown relation: '{}'. Use 'relations' to list available relations.",
-            name
-        )
+        anyhow::bail!("Unknown relation: '{}'. Use 'relations' to list available relations.", name)
     }
 
     fn cmd_apply(&mut self, args: &[&str]) -> Result<()> {
@@ -1381,9 +1438,24 @@ impl Repl {
             )
         })?;
 
+        if let Some(current_lang) = self.state.language_name() {
+            if !example.language.as_str().eq_ignore_ascii_case(current_lang) {
+                anyhow::bail!(
+                    "Example '{}' belongs to language '{}'. Load it with: lang {}",
+                    example.name,
+                    example.language.as_str(),
+                    example.language.as_str()
+                );
+            }
+        }
+
         println!();
         println!("{} {}", "Example:".bold(), example.name.cyan());
         println!("{} {}", "Description:".bold(), example.description);
+        println!("{}", "Source:".bold());
+        for line in format_term_pretty(example.source).lines() {
+            println!("  {}", line.dimmed());
+        }
         println!();
 
         // Parse and load the example
@@ -1395,6 +1467,7 @@ impl Repl {
     fn cmd_list_examples(&self, language_name: &str) -> Result<()> {
         println!();
         println!("{}", "Available Examples:".bold());
+        println!("{} {}", "Language:".bold(), language_name.cyan());
         println!();
 
         // Group by category
@@ -1412,9 +1485,9 @@ impl Repl {
         ] {
             let examples = Example::by_language_name_and_category(language_name, category);
             if !examples.is_empty() {
-                println!("{}", format!("  {:?}:", category).yellow());
+                println!("{}", format!("  {} ({})", category.label(), examples.len()).yellow());
                 for ex in examples {
-                    println!("    {} - {}", ex.name.cyan(), ex.description.dimmed());
+                    println!("    {:<24} {}", ex.name.cyan(), ex.description.dimmed());
                 }
                 println!();
             }

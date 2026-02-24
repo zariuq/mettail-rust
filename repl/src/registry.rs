@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use mettail_languages::ambient::AmbientLanguage;
 use mettail_languages::calculator::CalculatorLanguage;
 use mettail_languages::lambda::LambdaLanguage;
+use mettail_languages::mettaminimal_from_lean::MeTTaMinimalStateLanguage;
 use mettail_languages::rhocalc::RhoCalcLanguage;
 use mettail_languages::tinyml_from_lean::TinyMLSmokeLanguage;
 
@@ -59,6 +60,7 @@ pub fn build_registry() -> Result<LanguageRegistry> {
     registry.register(Box::new(AmbientLanguage));
     registry.register(Box::new(CalculatorLanguage));
     registry.register(Box::new(LambdaLanguage));
+    registry.register(Box::new(MeTTaMinimalStateLanguage));
     registry.register(Box::new(RhoCalcLanguage));
     registry.register(Box::new(TinyMLSmokeLanguage));
 

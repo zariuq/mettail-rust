@@ -1,0 +1,4 @@
+mm_true = C_State(C_Eval(C_ATrue), C_AFalse, C_AFalse)
+mm_false = C_State(C_Eval(C_AFalse), C_ATrue, C_ATrue)
+mm_ret_true = C_State(C_Return(C_ATrue), C_AFalse, C_AFalse)
+mm_done = C_State(C_Done, C_ATrue, C_AFalse)

@@ -40,6 +40,10 @@ path = "tests/rhocalc_tests.rs"
 name = "tinymlsmoke_roundtrip"
 path = "tests/tinymlsmoke_roundtrip.rs"
 
+[[bin]]
+name = "mettaminimal_roundtrip"
+path = "tests/mettaminimal_roundtrip.rs"
+
 [[bench]]
 name = "rhocalc_bench"
 harness = false
