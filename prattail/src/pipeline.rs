@@ -151,8 +151,12 @@ pub fn run_pipeline(spec: &LanguageSpec) -> TokenStream {
         .map(|r| (r.label.clone(), r.category.clone(), r.syntax.clone()))
         .collect();
     let warnings = detect_grammar_warnings(&parser_bundle.rule_infos, &category_names, &all_syntax);
+    // Keep parser ambiguity diagnostics opt-in to avoid noisy batch/CI logs.
+    let emit_warnings = std::env::var_os("PRATTAIL_EMIT_WARNINGS").is_some();
     for warning in &warnings {
-        eprintln!("warning: {}", warning);
+        if emit_warnings {
+            eprintln!("warning: {}", warning);
+        }
     }
 
     // EBNF debug dump (opt-in via environment variable)

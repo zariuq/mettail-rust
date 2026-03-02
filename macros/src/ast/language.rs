@@ -20,7 +20,6 @@ pub enum AttributeValue {
     #[expect(dead_code)] // Parsed from DSL, not yet consumed
     Int(i64),
     /// Boolean value.
-    #[expect(dead_code)] // Parsed from DSL, not yet consumed
     Bool(bool),
     /// String value (e.g., `log_semiring_model_path: "path/to/model.json"`).
     Str(String),
@@ -138,9 +137,9 @@ pub struct FreshnessCondition {
 pub enum Condition {
     /// Freshness condition: if x # Q then
     Freshness(FreshnessCondition),
-    /// Environment query condition: if env_var(x, v) then
+    /// Relation query condition: if rel(arg1, arg2, ...) then
     EnvQuery {
-        /// Relation name (e.g., "env_var")
+        /// Relation name (e.g., "env_var", "eqnLookup")
         relation: Ident,
         /// Arguments to the relation (e.g., ["x", "v"])
         args: Vec<Ident>,
@@ -467,11 +466,49 @@ fn parse_options(input: ParseStream) -> SynResult<HashMap<String, AttributeValue
                     ));
                 },
             },
+            "runtime_surface_policy" => match &value {
+                AttributeValue::Keyword(kw) => match kw.as_str() {
+                    "default" | "deterministic" | "auto" => {},
+                    _ => {
+                        return Err(syn::Error::new(
+                            key_ident.span(),
+                            format!(
+                                "runtime_surface_policy: invalid keyword '{}'. Use 'default', 'deterministic', or 'auto'",
+                                kw
+                            ),
+                        ));
+                    },
+                },
+                _ => {
+                    return Err(syn::Error::new(
+                        key_ident.span(),
+                        "runtime_surface_policy must be a keyword: 'default', 'deterministic', or 'auto'",
+                    ));
+                },
+            },
+            "core_ground_eval" => {
+                if !matches!(&value, AttributeValue::Bool(_)) {
+                    return Err(syn::Error::new(
+                        key_ident.span(),
+                        "core_ground_eval must be boolean: true|false",
+                    ));
+                }
+            },
+            "runtime_contract_deterministic_reduction"
+            | "runtime_contract_memoization_safe"
+            | "runtime_contract_specialization_safe" => {
+                if !matches!(&value, AttributeValue::Bool(_)) {
+                    return Err(syn::Error::new(
+                        key_ident.span(),
+                        "runtime contract flags must be boolean: true|false",
+                    ));
+                }
+            },
             unknown => {
                 return Err(syn::Error::new(
                     key_ident.span(),
                     format!(
-                        "unknown option '{}'. Valid options are: beam_width, log_semiring_model_path, dispatch",
+                        "unknown option '{}'. Valid options are: beam_width, log_semiring_model_path, dispatch, runtime_surface_policy, core_ground_eval, runtime_contract_deterministic_reduction, runtime_contract_memoization_safe, runtime_contract_specialization_safe",
                         unknown
                     ),
                 ));

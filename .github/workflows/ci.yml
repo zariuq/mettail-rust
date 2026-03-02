@@ -71,6 +71,43 @@ jobs:
       - name: Run tests
         run: cargo test --all-features --workspace
 
+  low-memory-build:
+    name: Low Memory Build Profile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustc-codegen-cranelift-preview
+
+      - name: Low-memory check (mettail-languages)
+        run: ./tools/cargo_lowmem.sh check -p mettail-languages --tests
+
+      - name: Low-memory check (mettail-repl)
+        run: ./tools/cargo_lowmem.sh check -p mettail-repl --tests
+
+  low-memory-repl-contract-test:
+    name: Low Memory REPL Contract Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustc-codegen-cranelift-preview
+
+      - name: Run focused contract-gating test
+        env:
+          METTAIL_LOWMEM_USE_CRANELIFT: "1"
+        run: ./tools/cargo_lowmem.sh test -p mettail-repl core_ground_eval_hint_is_disabled_when_contracts_missing_in_dispatch -- --nocapture
+
   fmt:
     name: Formatting
     runs-on: ubuntu-latest
@@ -80,6 +117,25 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  export-sync:
+    name: Lean Export Sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./tools/check_mettafull_export_sync.sh
+
+  metta-surface-suites:
+    name: MeTTa Surface Suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustc-codegen-cranelift-preview
+      - run: ./tools/run_metta_surface_ci.sh
 
   clippy:
     name: Clippy

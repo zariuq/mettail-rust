@@ -25,6 +25,7 @@ clap = { version = "4.5", features = ["derive"] }
 [features]
 wfst = ["mettail-repl/wfst"]
 wfst-log = ["mettail-repl/wfst-log"]
+python-oracle = ["mettail-repl/python-oracle"]
 
 [workspace.package]
 version = "0.1.0"
@@ -54,8 +55,14 @@ ascent_syntax_export = { path = "ascent_syntax_export" }
 query = { path = "query" }
 
 [profile.dev]
-codegen-backend = "cranelift" # Fast compile, slower runtime (~2.7x vs LLVM)
+# Use LLVM: gxhash (used by MORK/pathmap) requires AES/SSE2 feature detection that
+# Cranelift does not propagate correctly. LLVM correctly handles target-cpu=native.
+codegen-backend = "llvm"
 debug = "line-tables-only"    # Saves debuginfo generation time
+
+[profile.test]
+codegen-backend = "llvm"
+inherits = "dev"
 
 [profile.release]
 codegen-backend = "llvm"      # Full LLVM optimization for runtime performance

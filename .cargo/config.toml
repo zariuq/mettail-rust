@@ -1,15 +1,12 @@
-# Build configuration for faster dev builds.
+# Build configuration for linker/runtime flags.
 #
-# Uses two optimizations:
-#   1. Fast linker (mold on Linux, lld on macOS) — speeds up binary/test linking
-#   2. Cranelift codegen backend — replaces LLVM codegen (~59s savings) with a
-#      faster alternative. Trade-off: debug/test binaries run ~2.7x slower than LLVM.
+# Current backend policy (configured in workspace Cargo.toml):
+#   - dev/test/release/bench profiles: LLVM
+# Reason: MORK/pathmap depend on CPU feature propagation (e.g. AES/SSE2) that
+# LLVM handles reliably with target-cpu/native flags.
 #
-# Codegen backend selection (per-profile, via Cargo.toml):
-#   - dev/test profiles: Cranelift (fast compile, slower runtime)
-#   - release/bench profiles: LLVM (slow compile, optimized runtime)
-#   This is configured in workspace Cargo.toml using the unstable `codegen-backend`
-#   profile key, enabled by the [unstable] section below.
+# For memory-constrained CI or local checks we use an explicit Cranelift fallback
+# via scripts/tools (`tools/cargo_lowmem.sh`), not as the default profile backend.
 #
 # Prerequisites:
 #   Linux: mold linker (https://github.com/rui314/mold)
@@ -21,7 +18,7 @@
 #     Ensure llvm bin is in PATH:
 #       Apple Silicon: export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
 #       Intel Mac:     export PATH="/usr/local/opt/llvm/bin:$PATH"
-#   All platforms: nightly toolchain with cranelift (auto-installed via rust-toolchain.toml)
+#   All platforms: nightly toolchain
 #
 # If mold/lld is not installed, comment out the linker and link-arg lines
 # for your platform.
@@ -33,7 +30,7 @@ codegen-backend = true
 # --- Linux x86_64 ---
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+rustflags = ["-C", "link-arg=-fuse-ld=bfd", "-C", "target-cpu=native", "-C", "target-feature=+aes,+sse2"]
 
 # --- macOS Apple Silicon ---
 [target.aarch64-apple-darwin]

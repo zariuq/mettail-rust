@@ -494,21 +494,38 @@ fn generate_language_struct(
                 let mut prog = #prog_struct_name::default();
                 prog.#primary_relation.push((initial.clone(),));
                 prog.step_term.push((initial.clone(),));
+                let mut phase_timings_ms = std::collections::HashMap::new();
+                let __ascent_eval_started = std::time::Instant::now();
                 prog.run();
+                phase_timings_ms.insert(
+                    "ascent_eval_ms".to_string(),
+                    __ascent_eval_started.elapsed().as_secs_f64() * 1000.0,
+                );
 
                 // Extract results
+                let __term_extract_started = std::time::Instant::now();
                 let all_terms: Vec<#primary_type> = prog.#primary_relation
                     .iter()
                     .map(|(p,)| p.clone())
                     .collect();
+                phase_timings_ms.insert(
+                    "term_extract_ms".to_string(),
+                    __term_extract_started.elapsed().as_secs_f64() * 1000.0,
+                );
 
+                let __rewrite_extract_started = std::time::Instant::now();
                 let rewrites: Vec<(#primary_type, #primary_type)> = prog
                     .#rw_relation
                     .iter()
                     .map(|(from, to)| (from.clone(), to.clone()))
                     .collect();
+                phase_timings_ms.insert(
+                    "rewrite_extract_ms".to_string(),
+                    __rewrite_extract_started.elapsed().as_secs_f64() * 1000.0,
+                );
 
                 // Build term info
+                let __term_info_build_started = std::time::Instant::now();
                 let mut term_infos = Vec::new();
                 for t in &all_terms {
                     let term_id = {
@@ -525,8 +542,13 @@ fn generate_language_struct(
                         is_normal_form: !has_rewrites,
                     });
                 }
+                phase_timings_ms.insert(
+                    "term_info_build_ms".to_string(),
+                    __term_info_build_started.elapsed().as_secs_f64() * 1000.0,
+                );
 
                 // Build rewrite list
+                let __rewrite_info_build_started = std::time::Instant::now();
                 let rewrite_list: Vec<mettail_runtime::Rewrite> = rewrites
                     .iter()
                     .map(|(from, to)| {
@@ -543,8 +565,13 @@ fn generate_language_struct(
                         }
                     })
                     .collect();
+                phase_timings_ms.insert(
+                    "rewrite_info_build_ms".to_string(),
+                    __rewrite_info_build_started.elapsed().as_secs_f64() * 1000.0,
+                );
 
                 // Extract equivalence classes from eqrel union-find
+                let __equiv_extract_started = std::time::Instant::now();
                 let equivalences = {
                     use std::collections::hash_map::DefaultHasher;
                     use std::collections::{HashMap, HashSet};
@@ -584,16 +611,28 @@ fn generate_language_struct(
                     }
                     result
                 };
+                phase_timings_ms.insert(
+                    "equivalence_extract_ms".to_string(),
+                    __equiv_extract_started.elapsed().as_secs_f64() * 1000.0,
+                );
 
                 // Extract custom relations
                 let mut custom_relations = std::collections::HashMap::new();
+                let mut relation_timings_ms = std::collections::HashMap::new();
+                let __custom_extract_started = std::time::Instant::now();
                 #custom_relation_extraction
+                phase_timings_ms.insert(
+                    "custom_relation_extract_ms".to_string(),
+                    __custom_extract_started.elapsed().as_secs_f64() * 1000.0,
+                );
 
                 mettail_runtime::AscentResults {
                     all_terms: term_infos,
                     rewrites: rewrite_list,
                     equivalences,
                     custom_relations,
+                    relation_timings_ms,
+                    phase_timings_ms,
                 }
             }
 
@@ -1163,26 +1202,49 @@ fn generate_language_struct_multi(
             let cat_lower = format_ident!("{}", cat.to_string().to_lowercase());
             let rw_rel = format_ident!("rw_{}", cat.to_string().to_lowercase());
             let eq_ind = format_ident!("__eq_{}_ind_common", cat.to_string().to_lowercase());
-            let variant = format_ident!("{}", cat);
-            quote! {
-                #inner_enum_name::#variant(_) => {
-                    let all_terms: Vec<#cat> = prog.#cat_lower.iter().map(|(p,)| p.clone()).collect();
-                    let rewrites: Vec<(#cat, #cat)> = prog.#rw_rel.iter().map(|(from, to)| (from.clone(), to.clone())).collect();
-                    let term_infos: Vec<mettail_runtime::TermInfo> = all_terms.iter().map(|t| {
-                        let wrapped = #inner_enum_name::#variant(t.clone());
-                        let term_id = { use std::collections::hash_map::DefaultHasher; use std::hash::{Hash, Hasher}; let mut hasher = DefaultHasher::new(); wrapped.hash(&mut hasher); hasher.finish() };
-                        let has_rewrites = rewrites.iter().any(|(from, _)| from == t);
-                        mettail_runtime::TermInfo { term_id, display: format!("{}", t), is_normal_form: !has_rewrites }
-                    }).collect();
-                    let rewrite_list: Vec<mettail_runtime::Rewrite> = rewrites.iter().map(|(from, to)| {
-                        use std::collections::hash_map::DefaultHasher; use std::hash::{Hash, Hasher};
-                        let w_from = #inner_enum_name::#variant(from.clone());
-                        let w_to = #inner_enum_name::#variant(to.clone());
-                        let mut h1 = DefaultHasher::new(); let mut h2 = DefaultHasher::new();
-                        w_from.hash(&mut h1); w_to.hash(&mut h2);
-                        mettail_runtime::Rewrite { from_id: h1.finish(), to_id: h2.finish(), rule_name: Some("rewrite".to_string()) }
-                    }).collect();
-                    let equivalences = {
+                let variant = format_ident!("{}", cat);
+                quote! {
+                    #inner_enum_name::#variant(_) => {
+                        let mut phase_timings_ms = std::collections::HashMap::new();
+                        phase_timings_ms.insert("ascent_eval_ms".to_string(), __ascent_eval_ms);
+                        let __term_extract_started = std::time::Instant::now();
+                        let all_terms: Vec<#cat> = prog.#cat_lower.iter().map(|(p,)| p.clone()).collect();
+                        phase_timings_ms.insert(
+                            "term_extract_ms".to_string(),
+                            __term_extract_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        let __rewrite_extract_started = std::time::Instant::now();
+                        let rewrites: Vec<(#cat, #cat)> = prog.#rw_rel.iter().map(|(from, to)| (from.clone(), to.clone())).collect();
+                        phase_timings_ms.insert(
+                            "rewrite_extract_ms".to_string(),
+                            __rewrite_extract_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        let __term_info_build_started = std::time::Instant::now();
+                        let term_infos: Vec<mettail_runtime::TermInfo> = all_terms.iter().map(|t| {
+                            let wrapped = #inner_enum_name::#variant(t.clone());
+                            let term_id = { use std::collections::hash_map::DefaultHasher; use std::hash::{Hash, Hasher}; let mut hasher = DefaultHasher::new(); wrapped.hash(&mut hasher); hasher.finish() };
+                            let has_rewrites = rewrites.iter().any(|(from, _)| from == t);
+                            mettail_runtime::TermInfo { term_id, display: format!("{}", t), is_normal_form: !has_rewrites }
+                        }).collect();
+                        phase_timings_ms.insert(
+                            "term_info_build_ms".to_string(),
+                            __term_info_build_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        let __rewrite_info_build_started = std::time::Instant::now();
+                        let rewrite_list: Vec<mettail_runtime::Rewrite> = rewrites.iter().map(|(from, to)| {
+                            use std::collections::hash_map::DefaultHasher; use std::hash::{Hash, Hasher};
+                            let w_from = #inner_enum_name::#variant(from.clone());
+                            let w_to = #inner_enum_name::#variant(to.clone());
+                            let mut h1 = DefaultHasher::new(); let mut h2 = DefaultHasher::new();
+                            w_from.hash(&mut h1); w_to.hash(&mut h2);
+                            mettail_runtime::Rewrite { from_id: h1.finish(), to_id: h2.finish(), rule_name: Some("rewrite".to_string()) }
+                        }).collect();
+                        phase_timings_ms.insert(
+                            "rewrite_info_build_ms".to_string(),
+                            __rewrite_info_build_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        let __equiv_extract_started = std::time::Instant::now();
+                        let equivalences = {
                         use std::collections::hash_map::DefaultHasher;
                         use std::collections::{HashMap, HashSet};
                         use std::hash::{Hash, Hasher};
@@ -1211,15 +1273,32 @@ fn generate_language_struct_multi(
                             if class.len() > 1 {
                                 result.push(mettail_runtime::EquivClass { term_ids: class.into_iter().collect() });
                             }
+                            }
+                            result
+                        };
+                        phase_timings_ms.insert(
+                            "equivalence_extract_ms".to_string(),
+                            __equiv_extract_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        let mut custom_relations = std::collections::HashMap::new();
+                        let mut relation_timings_ms = std::collections::HashMap::new();
+                        let __custom_extract_started = std::time::Instant::now();
+                        #custom_relation_extraction
+                        phase_timings_ms.insert(
+                            "custom_relation_extract_ms".to_string(),
+                            __custom_extract_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        mettail_runtime::AscentResults {
+                            all_terms: term_infos,
+                            rewrites: rewrite_list,
+                            equivalences,
+                            custom_relations,
+                            relation_timings_ms,
+                            phase_timings_ms,
                         }
-                        result
-                    };
-                    let mut custom_relations = std::collections::HashMap::new();
-                    #custom_relation_extraction
-                    mettail_runtime::AscentResults { all_terms: term_infos, rewrites: rewrite_list, equivalences, custom_relations }
+                    }
                 }
-            }
-        })
+            })
         .collect();
 
     // Per-category type inference functions
@@ -1325,14 +1404,32 @@ fn generate_language_struct_multi(
                 let variant = format_ident!("{}", cat);
                 quote! {
                     #inner_enum_name::#variant(_) => {
+                        let mut phase_timings_ms = std::collections::HashMap::new();
+                        phase_timings_ms.insert("ascent_eval_ms".to_string(), __ascent_eval_ms);
+                        let __term_extract_started = std::time::Instant::now();
                         let all_terms: Vec<#cat> = prog.#cat_lower.iter().map(|(p,)| p.clone()).collect();
+                        phase_timings_ms.insert(
+                            "term_extract_ms".to_string(),
+                            __term_extract_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        let __rewrite_extract_started = std::time::Instant::now();
                         let rewrites: Vec<(#cat, #cat)> = prog.#rw_rel.iter().map(|(from, to)| (from.clone(), to.clone())).collect();
+                        phase_timings_ms.insert(
+                            "rewrite_extract_ms".to_string(),
+                            __rewrite_extract_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        let __term_info_build_started = std::time::Instant::now();
                         let term_infos: Vec<mettail_runtime::TermInfo> = all_terms.iter().map(|t| {
                             let wrapped = #inner_enum_name::#variant(t.clone());
                             let term_id = { use std::collections::hash_map::DefaultHasher; use std::hash::{Hash, Hasher}; let mut hasher = DefaultHasher::new(); wrapped.hash(&mut hasher); hasher.finish() };
                             let has_rewrites = rewrites.iter().any(|(from, _)| from == t);
                             mettail_runtime::TermInfo { term_id, display: format!("{}", t), is_normal_form: !has_rewrites }
                         }).collect();
+                        phase_timings_ms.insert(
+                            "term_info_build_ms".to_string(),
+                            __term_info_build_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        let __rewrite_info_build_started = std::time::Instant::now();
                         let rewrite_list: Vec<mettail_runtime::Rewrite> = rewrites.iter().map(|(from, to)| {
                             use std::collections::hash_map::DefaultHasher; use std::hash::{Hash, Hasher};
                             let w_from = #inner_enum_name::#variant(from.clone());
@@ -1341,6 +1438,11 @@ fn generate_language_struct_multi(
                             w_from.hash(&mut h1); w_to.hash(&mut h2);
                             mettail_runtime::Rewrite { from_id: h1.finish(), to_id: h2.finish(), rule_name: Some("rewrite".to_string()) }
                         }).collect();
+                        phase_timings_ms.insert(
+                            "rewrite_info_build_ms".to_string(),
+                            __rewrite_info_build_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        let __equiv_extract_started = std::time::Instant::now();
                         let equivalences = {
                             use std::collections::hash_map::DefaultHasher;
                             use std::collections::{HashMap, HashSet};
@@ -1373,9 +1475,26 @@ fn generate_language_struct_multi(
                             }
                             result
                         };
+                        phase_timings_ms.insert(
+                            "equivalence_extract_ms".to_string(),
+                            __equiv_extract_started.elapsed().as_secs_f64() * 1000.0,
+                        );
                         let mut custom_relations = std::collections::HashMap::new();
+                        let mut relation_timings_ms = std::collections::HashMap::new();
+                        let __custom_extract_started = std::time::Instant::now();
                         #custom_relation_extraction
-                        mettail_runtime::AscentResults { all_terms: term_infos, rewrites: rewrite_list, equivalences, custom_relations }
+                        phase_timings_ms.insert(
+                            "custom_relation_extract_ms".to_string(),
+                            __custom_extract_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        mettail_runtime::AscentResults {
+                            all_terms: term_infos,
+                            rewrites: rewrite_list,
+                            equivalences,
+                            custom_relations,
+                            relation_timings_ms,
+                            phase_timings_ms,
+                        }
                     }
                 }
             })
@@ -1406,7 +1525,9 @@ fn generate_language_struct_multi(
                         #(#core_seed_arms)*
                         _ => unreachable!(),
                     }
+                    let __ascent_eval_started = std::time::Instant::now();
                     prog.run();
+                    let __ascent_eval_ms = __ascent_eval_started.elapsed().as_secs_f64() * 1000.0;
                     match &term.0 {
                         #(#core_extract_arms)*
                         _ => unreachable!(),
@@ -1419,7 +1540,9 @@ fn generate_language_struct_multi(
                         #(#seed_arms)*
                         #inner_enum_name::Ambiguous(_) => unreachable!(),
                     }
+                    let __ascent_eval_started = std::time::Instant::now();
                     prog.run();
+                    let __ascent_eval_ms = __ascent_eval_started.elapsed().as_secs_f64() * 1000.0;
                     match &term.0 {
                         #(#extract_arms)*
                         #inner_enum_name::Ambiguous(_) => unreachable!(),
@@ -1442,7 +1565,9 @@ fn generate_language_struct_multi(
                         #(#seed_arms)*
                         #inner_enum_name::Ambiguous(_) => unreachable!(),
                     }
+                    let __ascent_eval_started = std::time::Instant::now();
                     prog.run();
+                    let __ascent_eval_ms = __ascent_eval_started.elapsed().as_secs_f64() * 1000.0;
                     match &term.0 {
                         #(#extract_arms)*
                         #inner_enum_name::Ambiguous(_) => unreachable!(),
@@ -2221,15 +2346,21 @@ fn generate_custom_relation_extraction(language: &LanguageDef) -> TokenStream {
         };
 
         extractions.push(quote! {
+            let __rel_extract_started = std::time::Instant::now();
+            let __rel_tuples = prog.#rel_name
+                .iter()
+                .map(|#tuple_pattern| vec![#(#format_exprs),*])
+                .collect::<Vec<_>>();
             custom_relations.insert(
                 #rel_name_str.to_string(),
                 mettail_runtime::RelationData {
                     param_types: vec![#(#param_type_strs.to_string()),*],
-                    tuples: prog.#rel_name
-                        .iter()
-                        .map(|#tuple_pattern| vec![#(#format_exprs),*])
-                        .collect(),
+                    tuples: __rel_tuples,
                 }
+            );
+            relation_timings_ms.insert(
+                #rel_name_str.to_string(),
+                __rel_extract_started.elapsed().as_secs_f64() * 1000.0,
             );
         });
     }

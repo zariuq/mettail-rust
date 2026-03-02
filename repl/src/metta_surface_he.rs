@@ -1,0 +1,494 @@
+//! HE MeTTa surface profile: lowering + decoding for the MeTTaHE backend.
+//!
+//! This module implements the HE-specific translation between surface MeTTa
+//! syntax (SExpr) and HE core terms.  It is intentionally thin — no evaluation,
+//! no rewriting, just structural mapping.
+//!
+//! Lowering:  surface SExpr  →  HE core term string
+//! Decoding:  HE core result →  surface display string
+
+use super::metta_surface::{SExpr, SurfaceSpaceState};
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Lowering: surface → HE core
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Lower a surface `!expr` into the HE initial state term.
+///
+/// Returns a single core term string (HE is deterministic at lowering time).
+/// The surface rewriter is NOT invoked — all semantics come from Ascent.
+pub fn he_lower_eval(
+    expr: &SExpr,
+    space_state: &SurfaceSpaceState,
+) -> Result<String, String> {
+    let atom = he_encode_sexpr(expr)?;
+    let space = he_build_space(space_state);
+    Ok(format!("C_State(C_Metta({atom},C_UndefinedType),{space},C_Empty)"))
+}
+
+/// Encode a surface SExpr as an HE Atom term string.
+pub fn he_encode_sexpr(expr: &SExpr) -> Result<String, String> {
+    match expr {
+        SExpr::Atom(s) => he_encode_atom(s),
+        SExpr::List(items) => {
+            if items.is_empty() {
+                return Ok("C_ExprNil".to_string());
+            }
+            he_encode_expr_list(items)
+        },
+    }
+}
+
+fn he_encode_atom(s: &str) -> Result<String, String> {
+    // Booleans
+    if s == "True" || s == "true" {
+        return Ok("C_True".to_string());
+    }
+    if s == "False" || s == "false" {
+        return Ok("C_False".to_string());
+    }
+
+    // Integer literal — encode with C_ prefix so parse_int_token can strip it.
+    // Token goes directly in C_GInt (not wrapped in C_SymAtom) because
+    // parse_int_token calls token_name_from_atom which expects AVar, not C_SymAtom.
+    if let Some(n) = try_parse_int(s) {
+        let tok = if n < 0 {
+            format!("C_neg_{}", -n)
+        } else {
+            format!("C_{n}")
+        };
+        return Ok(format!("C_GInt({tok})"));
+    }
+
+    // String literal (quoted) — encode with s_ prefix for parser compatibility
+    // Token goes directly in C_GString (not wrapped in C_SymAtom)
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let inner = &s[1..s.len() - 1];
+        let tok = format!("s_{inner}");
+        return Ok(format!("C_GString({tok})"));
+    }
+
+    // Variable
+    if s.starts_with('$') && s.len() > 1 {
+        return Ok(format!("C_VarAtom(C_SymAtom({}))", &s[1..]));
+    }
+
+    // Type keywords
+    match s {
+        "Atom" => return Ok("C_AtomType".to_string()),
+        "Symbol" => return Ok("C_SymbolType".to_string()),
+        "Variable" => return Ok("C_VariableType".to_string()),
+        "Expression" => return Ok("C_ExpressionType".to_string()),
+        "Grounded" => return Ok("C_GroundedType".to_string()),
+        "%Undefined%" => return Ok("C_UndefinedType".to_string()),
+        _ => {},
+    }
+
+    // Grounded operators
+    match s {
+        "+" => return Ok("C_OpAdd".to_string()),
+        "-" => return Ok("C_OpSub".to_string()),
+        "*" => return Ok("C_OpMul".to_string()),
+        "/" => return Ok("C_OpDiv".to_string()),
+        "%" => return Ok("C_OpMod".to_string()),
+        "<" => return Ok("C_OpLt".to_string()),
+        ">" => return Ok("C_OpGt".to_string()),
+        "==" => return Ok("C_OpEq".to_string()),
+        _ => {},
+    }
+
+    // Regular symbol
+    Ok(format!("C_SymAtom(C_SymAtom({s}))"))
+}
+
+fn he_encode_expr_list(items: &[SExpr]) -> Result<String, String> {
+    // Special forms
+    if items.len() == 3 {
+        if let SExpr::Atom(head) = &items[0] {
+            if head == "->" || head == "→" {
+                // (-> argType retType) → C_ArrowType(argType, retType)
+                let arg = he_encode_sexpr(&items[1])?;
+                let ret = he_encode_sexpr(&items[2])?;
+                return Ok(format!("C_ArrowType({arg},{ret})"));
+            }
+        }
+    }
+
+    // General expression: fold into C_ExprCons chain
+    let mut acc = "C_ExprNil".to_string();
+    for item in items.iter().rev() {
+        let encoded = he_encode_sexpr(item)?;
+        acc = format!("C_ExprCons({encoded},{acc})");
+    }
+    Ok(acc)
+}
+
+fn try_parse_int(s: &str) -> Option<i64> {
+    s.parse::<i64>().ok()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Space building
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Build the HE Space term from the session's space state.
+///
+/// Space contains equation entries and type entries as a list of atoms.
+fn he_build_space(space_state: &SurfaceSpaceState) -> String {
+    let mut atoms = Vec::new();
+
+    // Add equation entries: (= lhs rhs) → C_EqAtom(lhs, rhs)
+    for (lhs, rhs) in &space_state.eq_entries {
+        atoms.push(format!("C_EqAtom({lhs},{rhs})"));
+    }
+    // Add pattern equation entries too
+    for (lhs, rhs) in &space_state.pattern_eq_entries {
+        atoms.push(format!("C_EqAtom({lhs},{rhs})"));
+    }
+
+    // Add type entries: (: atom ty) → C_TypeAnnotation(atom, ty)
+    for (atom, ty) in &space_state.type_entries {
+        atoms.push(format!("C_TypeAnnotation({atom},{ty})"));
+    }
+
+    // Fold into ExprCons list
+    let mut list = "C_ExprNil".to_string();
+    for atom in atoms.iter().rev() {
+        list = format!("C_ExprCons({atom},{list})");
+    }
+
+    format!("C_Space({list})")
+}
+
+/// Bootstrap type annotations for HE grounded operators.
+///
+/// Returns (atom_encoded, type_encoded) pairs ready for space_state.type_entries.
+pub fn he_bootstrap_type_entries() -> Vec<(String, String)> {
+    let arith_type = "C_ArrowType(C_GroundedType,C_GroundedType)".to_string();
+    vec![
+        ("C_OpAdd".to_string(), arith_type.clone()),
+        ("C_OpSub".to_string(), arith_type.clone()),
+        ("C_OpMul".to_string(), arith_type.clone()),
+        ("C_OpDiv".to_string(), arith_type.clone()),
+        ("C_OpMod".to_string(), arith_type.clone()),
+        ("C_OpLt".to_string(), arith_type.clone()),
+        ("C_OpGt".to_string(), arith_type.clone()),
+        ("C_OpEq".to_string(), arith_type),
+    ]
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Decoding: HE core result → surface display
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Decode an HE core atom (extracted from C_State's out field) to surface syntax.
+pub fn he_decode_atom(core_atom: &str) -> String {
+    let atom = core_atom.trim();
+
+    // Nullary constants
+    match atom {
+        "C_Empty" => return "()".to_string(),
+        "C_True" => return "True".to_string(),
+        "C_False" => return "False".to_string(),
+        "C_AtomType" => return "Atom".to_string(),
+        "C_SymbolType" => return "Symbol".to_string(),
+        "C_VariableType" => return "Variable".to_string(),
+        "C_ExpressionType" => return "Expression".to_string(),
+        "C_GroundedType" => return "Grounded".to_string(),
+        "C_UndefinedType" => return "%Undefined%".to_string(),
+        "C_StackOverflow" => return "(Error StackOverflow)".to_string(),
+        "C_NoReturn" => return "(Error NoReturn)".to_string(),
+        "C_IncorrectNumberOfArguments" => return "(Error IncorrectNumberOfArguments)".to_string(),
+        "C_ExprNil" => return "()".to_string(),
+        "C_OpAdd" => return "+".to_string(),
+        "C_OpSub" => return "-".to_string(),
+        "C_OpMul" => return "*".to_string(),
+        "C_OpDiv" => return "/".to_string(),
+        "C_OpMod" => return "%".to_string(),
+        "C_OpLt" => return "<".to_string(),
+        "C_OpGt" => return ">".to_string(),
+        "C_OpEq" => return "==".to_string(),
+        "C_Done" => return "Done".to_string(),
+        _ => {},
+    }
+
+    // C_SymAtom(X) → decode inner, or if inner is C_SymAtom(name), just name
+    if let Some(inner) = strip_wrapper(atom, "C_SymAtom") {
+        // Nested C_SymAtom(C_SymAtom(name)) → name
+        if let Some(name) = strip_wrapper(inner, "C_SymAtom") {
+            return name.to_string();
+        }
+        return inner.to_string();
+    }
+
+    // C_VarAtom(C_SymAtom(name)) → $name
+    if let Some(inner) = strip_wrapper(atom, "C_VarAtom") {
+        if let Some(name) = strip_wrapper(inner, "C_SymAtom") {
+            return format!("${name}");
+        }
+        return format!("${inner}");
+    }
+
+    // C_GInt(C_42) → 42, C_GInt(C_neg_42) → -42
+    // The inner token is a bare AVar (not wrapped in C_SymAtom)
+    if let Some(inner) = strip_wrapper(atom, "C_GInt") {
+        return decode_var_display(inner);
+    }
+
+    // C_GString(s_hello) → "hello"
+    if let Some(inner) = strip_wrapper(atom, "C_GString") {
+        let decoded = decode_var_display(inner);
+        if let Some(rest) = decoded.strip_prefix("s_") {
+            return format!("\"{rest}\"");
+        }
+        return format!("\"{decoded}\"");
+    }
+
+    // C_GBool(C_SymAtom(b)) → b
+    if let Some(inner) = strip_wrapper(atom, "C_GBool") {
+        if let Some(b) = strip_wrapper(inner, "C_SymAtom") {
+            return b.to_string();
+        }
+        return inner.to_string();
+    }
+
+    // C_ErrorAtom(src, code) → (Error decoded_src decoded_code)
+    if let Some(inner) = strip_wrapper(atom, "C_ErrorAtom") {
+        let args = split_top_level_args(inner);
+        if args.len() == 2 {
+            let src = he_decode_atom(args[0]);
+            let code = he_decode_atom(args[1]);
+            return format!("(Error {src} {code})");
+        }
+    }
+
+    // C_BadType(expected, actual) → (BadType ...)
+    if let Some(inner) = strip_wrapper(atom, "C_BadType") {
+        let args = split_top_level_args(inner);
+        if args.len() == 2 {
+            let expected = he_decode_atom(args[0]);
+            let actual = he_decode_atom(args[1]);
+            return format!("(BadType {expected} {actual})");
+        }
+    }
+
+    // C_ArrowType(args, ret) → (-> args ret)
+    if let Some(inner) = strip_wrapper(atom, "C_ArrowType") {
+        let args = split_top_level_args(inner);
+        if args.len() == 2 {
+            let a = he_decode_atom(args[0]);
+            let r = he_decode_atom(args[1]);
+            return format!("(-> {a} {r})");
+        }
+    }
+
+    // C_TypeAnnotation(atom, ty) → (: atom ty)
+    if let Some(inner) = strip_wrapper(atom, "C_TypeAnnotation") {
+        let args = split_top_level_args(inner);
+        if args.len() == 2 {
+            let a = he_decode_atom(args[0]);
+            let t = he_decode_atom(args[1]);
+            return format!("(: {a} {t})");
+        }
+    }
+
+    // C_EqAtom(lhs, rhs) → (= lhs rhs)
+    if let Some(inner) = strip_wrapper(atom, "C_EqAtom") {
+        let args = split_top_level_args(inner);
+        if args.len() == 2 {
+            let l = he_decode_atom(args[0]);
+            let r = he_decode_atom(args[1]);
+            return format!("(= {l} {r})");
+        }
+    }
+
+    // C_ExprCons(head, tail) → decode as list
+    if let Some(list) = try_decode_he_cons_list(atom) {
+        return list;
+    }
+
+    // Fallback: return as-is
+    atom.to_string()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Try to decode a display string that came from a free variable (AVar).
+/// The runtime renders these as just the pretty_name, so we extract it.
+fn decode_var_display(s: &str) -> String {
+    let trimmed = s.trim();
+    // If it's a C_ encoded token, decode it
+    if let Some(rest) = trimmed.strip_prefix("C_neg_") {
+        return format!("-{rest}");
+    }
+    if let Some(rest) = trimmed.strip_prefix("C_") {
+        return rest.to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Strip `Prefix(...)` wrapper, returning the inner content.
+fn strip_wrapper<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let with_paren = format!("{prefix}(");
+    let inner = s.strip_prefix(&with_paren)?.strip_suffix(')')?;
+    Some(inner.trim())
+}
+
+/// Split comma-separated args at the top level (respecting nested parens).
+fn split_top_level_args(s: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(s[start..i].trim());
+                start = i + 1;
+            },
+            _ => {},
+        }
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        args.push(last);
+    }
+    args
+}
+
+/// Decode a C_ExprCons chain into surface list notation.
+fn try_decode_he_cons_list(atom: &str) -> Option<String> {
+    let mut items = Vec::new();
+    let mut cur = atom.trim();
+
+    loop {
+        if cur == "C_ExprNil" {
+            break;
+        }
+        let inner = strip_wrapper(cur, "C_ExprCons")?;
+        let args = split_top_level_args(inner);
+        if args.len() != 2 {
+            return None;
+        }
+        items.push(he_decode_atom(args[0]));
+        cur = args[1].trim();
+    }
+
+    if items.is_empty() {
+        Some("()".to_string())
+    } else {
+        Some(format!("({})", items.join(" ")))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  HE-specific state extraction
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Extract the output atom from an HE C_State term.
+/// Same structure as legacy: C_State(instr, space, OUT) — third field.
+pub fn he_extract_state_out_atom(core_state_term: &str) -> Option<String> {
+    let trimmed = core_state_term.trim();
+    // Trim possible leading/trailing whitespace in the Display format
+    let trimmed = trimmed
+        .strip_prefix("C_State(")?
+        .strip_suffix(')')?;
+    let args = split_top_level_args(trimmed);
+    if args.len() == 3 {
+        Some(args[2].trim().to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_symbol() {
+        assert_eq!(
+            he_encode_sexpr(&SExpr::Atom("foo".into())).unwrap(),
+            "C_SymAtom(C_SymAtom(foo))"
+        );
+    }
+
+    #[test]
+    fn encode_integer() {
+        assert_eq!(
+            he_encode_sexpr(&SExpr::Atom("42".into())).unwrap(),
+            "C_GInt(C_42)"
+        );
+    }
+
+    #[test]
+    fn encode_negative_integer() {
+        assert_eq!(
+            he_encode_sexpr(&SExpr::Atom("-7".into())).unwrap(),
+            "C_GInt(C_neg_7)"
+        );
+    }
+
+    #[test]
+    fn encode_variable() {
+        assert_eq!(
+            he_encode_sexpr(&SExpr::Atom("$x".into())).unwrap(),
+            "C_VarAtom(C_SymAtom(x))"
+        );
+    }
+
+    #[test]
+    fn encode_expression() {
+        let expr = SExpr::List(vec![
+            SExpr::Atom("+".into()),
+            SExpr::Atom("1".into()),
+            SExpr::Atom("2".into()),
+        ]);
+        assert_eq!(
+            he_encode_sexpr(&expr).unwrap(),
+            "C_ExprCons(C_OpAdd,C_ExprCons(C_GInt(C_1),C_ExprCons(C_GInt(C_2),C_ExprNil)))"
+        );
+    }
+
+    #[test]
+    fn decode_symbol() {
+        assert_eq!(he_decode_atom("C_SymAtom(C_SymAtom(foo))"), "foo");
+    }
+
+    #[test]
+    fn decode_integer() {
+        assert_eq!(he_decode_atom("C_GInt(C_42)"), "42");
+    }
+
+    #[test]
+    fn decode_negative_integer() {
+        assert_eq!(he_decode_atom("C_GInt(C_neg_7)"), "-7");
+    }
+
+    #[test]
+    fn decode_expr_cons_list() {
+        assert_eq!(
+            he_decode_atom("C_ExprCons(C_SymAtom(C_SymAtom(a)),C_ExprCons(C_SymAtom(C_SymAtom(b)),C_ExprNil))"),
+            "(a b)"
+        );
+    }
+
+    #[test]
+    fn decode_error() {
+        assert_eq!(
+            he_decode_atom("C_ErrorAtom(C_SymAtom(C_SymAtom(x)),C_BadType(C_AtomType,C_SymbolType))"),
+            "(Error x (BadType Atom Symbol))"
+        );
+    }
+
+    #[test]
+    fn roundtrip_simple() {
+        let expr = SExpr::Atom("42".into());
+        let encoded = he_encode_sexpr(&expr).unwrap();
+        assert_eq!(encoded, "C_GInt(C_42)");
+        assert_eq!(he_decode_atom(&encoded), "42");
+    }
+}

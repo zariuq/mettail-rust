@@ -5,7 +5,7 @@
 
 use crate::ast::{
     grammar::{GrammarItem, GrammarRule, PatternOp, SyntaxExpr, TermParam},
-    language::{Equation, FreshnessTarget, LanguageDef, Premise, RewriteRule},
+    language::{AttributeValue, Equation, FreshnessTarget, LanguageDef, Premise, RewriteRule},
     pattern::{Pattern, PatternTerm},
     types::{CollectionType, TypeExpr},
 };
@@ -36,6 +36,7 @@ pub fn generate_metadata(language: &LanguageDef) -> TokenStream {
     // Generate logic relation and rule definitions
     let logic_relation_defs = generate_logic_relation_defs(language);
     let logic_rule_defs = generate_logic_rule_defs(language);
+    let runtime_hints = generate_runtime_optimization_hints(language);
 
     quote! {
         /// Static metadata for the #name language
@@ -67,6 +68,51 @@ pub fn generate_metadata(language: &LanguageDef) -> TokenStream {
             fn logic_rules(&self) -> &'static [mettail_runtime::LogicRuleDef] {
                 #logic_rule_defs
             }
+
+            fn runtime_optimization_hints(&self) -> mettail_runtime::RuntimeOptimizationHints {
+                #runtime_hints
+            }
+        }
+    }
+}
+
+fn generate_runtime_optimization_hints(language: &LanguageDef) -> TokenStream {
+    let surface_policy = match language.options.get("runtime_surface_policy") {
+        Some(AttributeValue::Keyword(kw)) if kw == "deterministic" => {
+            quote! { mettail_runtime::SurfacePolicyHint::Deterministic }
+        },
+        Some(AttributeValue::Keyword(kw)) if kw == "default" || kw == "auto" => {
+            quote! { mettail_runtime::SurfacePolicyHint::Default }
+        },
+        _ => quote! { mettail_runtime::SurfacePolicyHint::Default },
+    };
+
+    let enable_core_ground_eval =
+        matches!(language.options.get("core_ground_eval"), Some(AttributeValue::Bool(true)));
+    let deterministic_reduction = matches!(
+        language
+            .options
+            .get("runtime_contract_deterministic_reduction"),
+        Some(AttributeValue::Bool(true))
+    );
+    let memoization_safe = matches!(
+        language.options.get("runtime_contract_memoization_safe"),
+        Some(AttributeValue::Bool(true))
+    );
+    let specialization_safe = matches!(
+        language.options.get("runtime_contract_specialization_safe"),
+        Some(AttributeValue::Bool(true))
+    );
+
+    quote! {
+        mettail_runtime::RuntimeOptimizationHints {
+            surface_policy: #surface_policy,
+            enable_core_ground_eval: #enable_core_ground_eval,
+            optimization_contracts: mettail_runtime::RuntimeOptimizationContracts {
+                deterministic_reduction: #deterministic_reduction,
+                memoization_safe: #memoization_safe,
+                specialization_safe: #specialization_safe,
+            },
         }
     }
 }

@@ -11,6 +11,8 @@ doc = false  # Same binary as root package; document only from workspace root to
 [features]
 wfst = ["mettail-languages/wfst", "mettail-macros/wfst"]
 wfst-log = ["mettail-languages/wfst-log", "mettail-macros/wfst-log"]
+mork-backend = ["mettail-languages/mork-backend"]
+python-oracle = []
 
 [dependencies]
 # Core MeTTaIL

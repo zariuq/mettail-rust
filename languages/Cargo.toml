@@ -11,6 +11,8 @@ edition = "2021"
 ## Propagate WFST features through macros to mettail-prattail.
 wfst = ["mettail-macros/wfst"]
 wfst-log = ["mettail-macros/wfst-log"]
+## Enable MORK backend spike tests (requires nightly, already satisfied by rust-toolchain.toml)
+mork-backend = ["dep:mork"]
 
 [dependencies]
 mettail-macros = { path = "../macros" }
@@ -21,6 +23,8 @@ indexmap = { workspace = true }
 
 ascent = { workspace = true }
 ascent-byods-rels = { workspace = true }
+
+mork = { path = "../../MORK/kernel", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

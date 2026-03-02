@@ -12,7 +12,13 @@
 pub mod ambient;
 pub mod calculator;
 pub mod lambda;
+pub mod mettafull_legacy;
+pub mod mettahe_from_lean;
+pub mod pyashcore_from_lean;
 pub mod rhocalc;
+
+#[cfg(feature = "mork-backend")]
+pub mod mork_backend;
 
 // Re-export eqrel for the generated Ascent code
 // The generated code uses `#[ds(crate::eqrel)]` which expects eqrel at crate root
@@ -22,6 +28,12 @@ pub use ascent_byods_rels::eqrel;
 pub use ambient::ambient_source;
 pub use calculator::calculator_source;
 pub use lambda::lambda_source;
+pub use pyashcore_from_lean::{
+    pyashcore_classify_state_display, pyashcore_predict_terminal_class_from_display,
+    pyashcore_project_trace, pyashcore_select_single_trace, pyashcore_smoke_case,
+    PyashCoreLanguage, PyashStructuralOutcomeClass, PyashTraceMode, PYASHCORE_SMOKE_EXPECTED,
+    PYASHCORE_SMOKE_INPUT,
+};
 pub use rhocalc::rhocalc_source;
 
 // Note: Different languages may export types with the same names (e.g., Proc, Term)

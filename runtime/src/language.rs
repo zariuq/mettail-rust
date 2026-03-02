@@ -5,7 +5,7 @@
 use std::any::Any;
 use std::fmt;
 
-use crate::LanguageMetadata;
+use crate::{LanguageMetadata, OracleDescriptor, OracleQuery, OracleResponse};
 
 // =============================================================================
 // Type Inference Types
@@ -125,6 +125,20 @@ pub trait Language: Send + Sync {
     /// Run Ascent on a term and return results
     fn run_ascent(&self, term: &dyn Term) -> Result<AscentResults, String>;
 
+    /// List oracle endpoints exposed by this language runtime.
+    ///
+    /// Default: no oracles.
+    fn list_oracles(&self) -> Vec<OracleDescriptor> {
+        Vec::new()
+    }
+
+    /// Query a named oracle endpoint.
+    ///
+    /// Default: returns an unsupported error.
+    fn query_oracle(&self, query: &OracleQuery) -> Result<OracleResponse, String> {
+        Err(format!("language '{}' does not expose oracle '{}'", self.name(), query.oracle))
+    }
+
     /// If the term is fully evaluable (no free variables), evaluate it and return the result term.
     /// Otherwise return `None` (e.g. term contains vars, or language has no native eval).
     /// Default: `None` so languages without native types need not implement.
@@ -217,6 +231,11 @@ pub struct AscentResults {
 
     /// Custom relations: name -> relation data
     pub custom_relations: std::collections::HashMap<String, RelationData>,
+    /// Relation extraction timing in milliseconds: relation name -> elapsed ms
+    pub relation_timings_ms: std::collections::HashMap<String, f64>,
+    /// Core evaluation/extraction phase timings in milliseconds.
+    /// Keys are backend-defined phase labels (e.g. "ascent_eval_ms").
+    pub phase_timings_ms: std::collections::HashMap<String, f64>,
 }
 
 /// Data for a custom relation
@@ -258,6 +277,8 @@ impl AscentResults {
             rewrites: Vec::new(),
             equivalences: Vec::new(),
             custom_relations: std::collections::HashMap::new(),
+            relation_timings_ms: std::collections::HashMap::new(),
+            phase_timings_ms: std::collections::HashMap::new(),
         }
     }
 
@@ -272,6 +293,8 @@ impl AscentResults {
             rewrites: Vec::new(),
             equivalences: Vec::new(),
             custom_relations: std::collections::HashMap::new(),
+            relation_timings_ms: std::collections::HashMap::new(),
+            phase_timings_ms: std::collections::HashMap::new(),
         }
     }
 

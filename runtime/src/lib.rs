@@ -27,6 +27,34 @@ pub use metadata::*;
 mod language;
 pub use language::*;
 
+// Shared runtime execution policy types
+mod policy;
+pub use policy::*;
+
+// Lean-generated optimization contract manifest types
+pub mod manifest;
+pub use manifest::OptManifest;
+
+// Shared runtime diagnostics payloads
+mod diagnostics;
+pub use diagnostics::*;
+
+// Generic frontier rewrite/search utilities
+mod rewrite_search;
+pub use rewrite_search::*;
+
+// Generic re-entrant memoization helper
+mod memo;
+pub use memo::*;
+
+// Generic rule candidate index
+mod rule_index;
+pub use rule_index::*;
+
+// Oracle query contract for external services/FFI-style integrations
+mod oracle;
+pub use oracle::*;
+
 // Matchings enumeration for zip+map correlated search (used by generated rewrite clauses)
 mod matchings;
 pub use matchings::*;

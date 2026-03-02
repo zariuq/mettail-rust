@@ -82,6 +82,7 @@ mod tests {
             rewrites: vec![],
             equivalences: vec![],
             custom_relations,
+            relation_timings_ms: std::collections::HashMap::new(),
         };
         let rows =
             run_query("query(result) <-- path(a, result), !rw_proc(result, _).", &results).unwrap();

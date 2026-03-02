@@ -1,16 +1,325 @@
 use anyhow::{bail, Result};
-use mettail_runtime::Language;
+use mettail_runtime::{
+    AscentResults, Language, LibraryAliasDef, OracleDescriptor, OracleQuery, OracleResponse, Term,
+    TermType, VarTypeInfo,
+};
+use std::any::Any;
 use std::collections::HashMap;
+use std::process::Command;
 
 // Import generated language implementations directly
 use mettail_languages::ambient::AmbientLanguage;
 use mettail_languages::calculator::CalculatorLanguage;
 use mettail_languages::lambda::LambdaLanguage;
+use mettail_languages::mettafull_legacy::MeTTaFullStateLanguage;
+use mettail_languages::mettahe_from_lean::MeTTaHELanguage;
 use mettail_languages::rhocalc::RhoCalcLanguage;
 
 /// Registry of available languages
 pub struct LanguageRegistry {
     languages: HashMap<String, Box<dyn Language>>,
+}
+
+/// Language wrapper that adds a stable read-only metadata oracle.
+struct OracleAugmentedLanguage {
+    inner: Box<dyn Language>,
+    expose_meta_oracle: bool,
+}
+
+impl OracleAugmentedLanguage {
+    fn new(inner: Box<dyn Language>) -> Self {
+        Self { inner, expose_meta_oracle: true }
+    }
+}
+
+fn python_oracle_feature_enabled() -> bool {
+    cfg!(feature = "python-oracle")
+}
+
+fn python_oracle_runtime_enabled() -> bool {
+    std::env::var("METTAIL_ENABLE_PYTHON_ORACLE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn parse_python_arg(raw: &str) -> String {
+    raw.to_string()
+}
+
+fn run_python_call(module: &str, function: &str, args: &[String]) -> Result<String, String> {
+    let mut cmd = Command::new("python3");
+    cmd.arg("-c").arg(
+        r#"
+import importlib, json, sys
+module_name = sys.argv[1]
+fn_name = sys.argv[2]
+raw_args = sys.argv[3:]
+def parse_arg(x):
+    lx = x.lower()
+    if lx == "true":
+        return True
+    if lx == "false":
+        return False
+    try:
+        return int(x)
+    except:
+        pass
+    try:
+        return float(x)
+    except:
+        pass
+    return x
+mod = importlib.import_module(module_name)
+fn = getattr(mod, fn_name)
+res = fn(*[parse_arg(a) for a in raw_args])
+print(json.dumps(res))
+"#,
+    );
+    cmd.arg(module).arg(function);
+    for arg in args {
+        cmd.arg(parse_python_arg(arg));
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to start python3: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("python call failed with status {}", output.status)
+        } else {
+            format!("python call failed: {}", stderr)
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+impl Language for OracleAugmentedLanguage {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn metadata(&self) -> &'static dyn mettail_runtime::LanguageMetadata {
+        self.inner.metadata()
+    }
+
+    fn parse_term(&self, input: &str) -> Result<Box<dyn Term>, String> {
+        self.inner.parse_term(input)
+    }
+
+    fn parse_term_for_env(&self, input: &str) -> Result<Box<dyn Term>, String> {
+        self.inner.parse_term_for_env(input)
+    }
+
+    fn run_ascent(&self, term: &dyn Term) -> Result<AscentResults, String> {
+        self.inner.run_ascent(term)
+    }
+
+    fn list_oracles(&self) -> Vec<OracleDescriptor> {
+        let mut out = self.inner.list_oracles();
+        if self.expose_meta_oracle {
+            out.push(OracleDescriptor {
+                name: "meta".to_string(),
+                operations: vec![
+                    "counts".to_string(),
+                    "has-type".to_string(),
+                    "has-term".to_string(),
+                    "has-rewrite".to_string(),
+                    "has-relation".to_string(),
+                    "library-aliases".to_string(),
+                ],
+                docs: Some(
+                    "Read-only language metadata introspection oracle (types/terms/rewrites/relations)."
+                        .to_string(),
+                ),
+            });
+        }
+        out.push(OracleDescriptor {
+            name: "python".to_string(),
+            operations: vec!["call".to_string()],
+            docs: Some(
+                if python_oracle_feature_enabled() {
+                    "Python oracle (feature-gated + env-gated). Enable with METTAIL_ENABLE_PYTHON_ORACLE=1."
+                } else {
+                    "Python oracle disabled: compile with --features python-oracle."
+                }
+                .to_string(),
+            ),
+        });
+        out
+    }
+
+    fn query_oracle(&self, query: &OracleQuery) -> Result<OracleResponse, String> {
+        if query.oracle == "python" {
+            if !python_oracle_feature_enabled() {
+                return Err(
+                    "python oracle is disabled at compile time; use --features python-oracle"
+                        .to_string(),
+                );
+            }
+            if !python_oracle_runtime_enabled() {
+                return Err(
+                    "python oracle is disabled at runtime; set METTAIL_ENABLE_PYTHON_ORACLE=1"
+                        .to_string(),
+                );
+            }
+            if query.operation != "call" {
+                return Err("python oracle supports only operation 'call'".to_string());
+            }
+            if query.args.len() < 2 {
+                return Err(
+                    "python.call expects: <module> <function> [arg1 arg2 ...]".to_string(),
+                );
+            }
+            let module = &query.args[0];
+            let function = &query.args[1];
+            let args: Vec<String> = query.args[2..].to_vec();
+            let value = run_python_call(module, function, &args)?;
+            return Ok(OracleResponse {
+                rows: vec![vec![value]],
+                diagnostics: vec![format!(
+                    "python.call {}.{}({} args)",
+                    module,
+                    function,
+                    args.len()
+                )],
+            });
+        }
+
+        if !(self.expose_meta_oracle && query.oracle == "meta") {
+            return self.inner.query_oracle(query);
+        }
+        let meta = self.inner.metadata();
+        let mut response = OracleResponse::default();
+        let op = query.operation.as_str();
+        match op {
+            "counts" => {
+                response.rows = vec![
+                    vec!["types".to_string(), meta.types().len().to_string()],
+                    vec!["terms".to_string(), meta.terms().len().to_string()],
+                    vec!["equations".to_string(), meta.equations().len().to_string()],
+                    vec!["rewrites".to_string(), meta.rewrites().len().to_string()],
+                    vec!["logic_relations".to_string(), meta.logic_relations().len().to_string()],
+                    vec!["logic_rules".to_string(), meta.logic_rules().len().to_string()],
+                ];
+            },
+            "has-type" => {
+                let name = query
+                    .args
+                    .first()
+                    .ok_or_else(|| "meta.has-type expects one argument: <type-name>".to_string())?;
+                let found = meta.types().iter().any(|t| t.name == name);
+                response.rows = vec![vec![found.to_string()]];
+            },
+            "has-term" => {
+                let label = query.args.first().ok_or_else(|| {
+                    "meta.has-term expects one argument: <term-label>".to_string()
+                })?;
+                let found = meta.terms().iter().any(|t| t.name == label);
+                response.rows = vec![vec![found.to_string()]];
+            },
+            "has-rewrite" => {
+                let label = query.args.first().ok_or_else(|| {
+                    "meta.has-rewrite expects one argument: <rewrite-name>".to_string()
+                })?;
+                let found = meta
+                    .rewrites()
+                    .iter()
+                    .any(|rw| rw.name.is_some_and(|n| n == label));
+                response.rows = vec![vec![found.to_string()]];
+            },
+            "has-relation" => {
+                let name = query.args.first().ok_or_else(|| {
+                    "meta.has-relation expects one argument: <relation-name>".to_string()
+                })?;
+                let found = meta.logic_relations().iter().any(|r| r.name == name);
+                response.rows = vec![vec![found.to_string()]];
+            },
+            "library-aliases" => {
+                let rows = meta
+                    .library_aliases()
+                    .iter()
+                    .map(|a: &LibraryAliasDef| vec![a.name.to_string(), a.path.to_string()])
+                    .collect::<Vec<_>>();
+                response.rows = rows;
+            },
+            _ => {
+                return Err(format!(
+                    "unknown meta oracle operation '{}', expected one of: counts|has-type|has-term|has-rewrite|has-relation|library-aliases",
+                    op
+                ));
+            },
+        }
+        Ok(response)
+    }
+
+    fn try_direct_eval(&self, term: &dyn Term) -> Option<Box<dyn Term>> {
+        self.inner.try_direct_eval(term)
+    }
+
+    fn normalize_term(&self, term: &dyn Term) -> Box<dyn Term> {
+        self.inner.normalize_term(term)
+    }
+
+    fn format_term(&self, term: &dyn Term) -> String {
+        self.inner.format_term(term)
+    }
+
+    fn create_env(&self) -> Box<dyn Any + Send + Sync> {
+        self.inner.create_env()
+    }
+
+    fn add_to_env(&self, env: &mut dyn Any, name: &str, term: &dyn Term) -> Result<(), String> {
+        self.inner.add_to_env(env, name, term)
+    }
+
+    fn remove_from_env(&self, env: &mut dyn Any, name: &str) -> Result<bool, String> {
+        self.inner.remove_from_env(env, name)
+    }
+
+    fn clear_env(&self, env: &mut dyn Any) {
+        self.inner.clear_env(env);
+    }
+
+    fn substitute_env(&self, term: &dyn Term, env: &dyn Any) -> Result<Box<dyn Term>, String> {
+        self.inner.substitute_env(term, env)
+    }
+
+    fn substitute_env_preserve_structure(
+        &self,
+        term: &dyn Term,
+        env: &dyn Any,
+    ) -> Result<Box<dyn Term>, String> {
+        self.inner.substitute_env_preserve_structure(term, env)
+    }
+
+    fn list_env(&self, env: &dyn Any) -> Vec<(String, String, Option<String>)> {
+        self.inner.list_env(env)
+    }
+
+    fn set_env_comment(
+        &self,
+        env: &mut dyn Any,
+        name: &str,
+        comment: String,
+    ) -> Result<(), String> {
+        self.inner.set_env_comment(env, name, comment)
+    }
+
+    fn is_env_empty(&self, env: &dyn Any) -> bool {
+        self.inner.is_env_empty(env)
+    }
+
+    fn infer_term_type(&self, term: &dyn Term) -> TermType {
+        self.inner.infer_term_type(term)
+    }
+
+    fn infer_var_types(&self, term: &dyn Term) -> Vec<VarTypeInfo> {
+        self.inner.infer_var_types(term)
+    }
+
+    fn infer_var_type(&self, term: &dyn Term, var_name: &str) -> Option<TermType> {
+        self.inner.infer_var_type(term, var_name)
+    }
 }
 
 impl LanguageRegistry {
@@ -58,6 +367,8 @@ pub fn build_registry() -> Result<LanguageRegistry> {
     registry.register(Box::new(AmbientLanguage));
     registry.register(Box::new(CalculatorLanguage));
     registry.register(Box::new(LambdaLanguage));
+    registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(MeTTaFullStateLanguage))));
+    registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(MeTTaHELanguage))));
     registry.register(Box::new(RhoCalcLanguage));
 
     if registry.languages.is_empty() {
@@ -65,4 +376,43 @@ pub fn build_registry() -> Result<LanguageRegistry> {
     }
 
     Ok(registry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mettail_runtime::OracleQuery;
+
+    #[test]
+    fn default_registry_contains_mettafull() {
+        let registry = build_registry().expect("registry should build");
+        assert!(registry.contains("mettafullstate"));
+        assert!(registry.contains("MeTTaFullState"));
+        assert!(registry.contains("mettahe"));
+    }
+
+    #[test]
+    fn mettafull_exposes_meta_oracle() {
+        let registry = build_registry().expect("registry should build");
+        let lang = registry
+            .get("mettafullstate")
+            .expect("mettafullstate should be registered");
+
+        let descriptors = lang.list_oracles();
+        assert!(descriptors.iter().any(|d| d.name == "meta"));
+
+        let counts = lang
+            .query_oracle(&OracleQuery::new("meta", "counts", vec![]))
+            .expect("meta.counts should succeed");
+        assert!(!counts.rows.is_empty());
+        assert!(
+            counts.rows.iter().any(|r| {
+                r.first().is_some_and(|k| k == "rewrites")
+                    && r.get(1)
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .is_some_and(|n| n > 0)
+            }),
+            "meta.counts should report rewrite cardinality"
+        );
+    }
 }

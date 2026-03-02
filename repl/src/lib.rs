@@ -1,7 +1,10 @@
 pub mod examples;
+pub mod metta_surface;
+pub mod metta_surface_he;
 pub mod pretty;
 pub mod registry;
 pub mod repl;
+pub mod run_metta_file;
 pub mod state;
 
 // Re-export eqrel for the generated Ascent code

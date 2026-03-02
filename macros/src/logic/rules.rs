@@ -99,8 +99,9 @@ pub fn generate_rule_clause_with_category(
     let lhs_var = format_ident!("s");
     let lhs_clauses = left.to_ascent_clauses(&lhs_var, category, language, &duplicate_vars);
 
-    // 4. Generate condition checks and collect env query bindings
-    let (condition_clauses, env_bindings) = generate_condition_clauses(conditions, &lhs_clauses);
+    // 4. Generate condition checks and collect relation-query bindings
+    let (condition_clauses, env_bindings) =
+        generate_condition_clauses(conditions, &lhs_clauses, language);
 
     // 5. Merge LHS bindings with env query bindings for RHS generation
     let mut all_bindings = lhs_clauses.bindings.clone();
@@ -150,20 +151,22 @@ pub fn generate_rule_clause_with_category(
     quote! { #head <-- #(#body),*; }
 }
 
-/// Generate condition clauses from freshness and env conditions.
+/// Generate condition clauses from freshness and relation-query conditions.
 ///
-/// For EnvQuery conditions like `if env_var(x, v) then`:
-/// - First arg (x) is looked up from LHS bindings (typically OrdVar)
-/// - Variable name is extracted from OrdVar
-/// - Second arg (v) is bound from the relation query result
+/// For relation query conditions like `if rel(a, b, c) then`:
+/// - Already-bound args are substituted from LHS/relation bindings.
+/// - Unbound args become relation-bound Ascent variables.
 ///
-/// Returns: (clauses, env_bindings) where env_bindings maps val_arg names to dereferenced values
+/// Returns: (clauses, relation_bindings), where relation_bindings map newly
+/// relation-bound variable names to RHS bindings.
 fn generate_condition_clauses(
     conditions: &[Condition],
     lhs_clauses: &AscentClauses,
+    language: &LanguageDef,
 ) -> (Vec<TokenStream>, std::collections::HashMap<String, VariableBinding>) {
     let mut clauses = Vec::new();
-    let mut env_bindings = std::collections::HashMap::new();
+    let mut env_bindings: std::collections::HashMap<String, VariableBinding> =
+        std::collections::HashMap::new();
 
     // Get a default lang_type from existing bindings
     let default_lang_type = lhs_clauses
@@ -186,51 +189,45 @@ fn generate_condition_clauses(
                 }
             },
             Condition::EnvQuery { relation, args } => {
-                if args.len() < 2 {
-                    panic!("EnvQuery condition requires at least 2 arguments (variable name and value)");
-                }
+                // Build relation arguments in-order:
+                // - use existing bindings when present;
+                // - otherwise bind a fresh Ascent variable and expose it for RHS use.
+                let relation_args: Vec<TokenStream> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(arg_idx, arg)| {
+                        let arg_name = arg.to_string();
 
-                let var_arg = &args[0]; // The OrdVar to extract name from
-                let val_arg = &args[1]; // The result to bind
+                        if let Some(binding) = lhs_clauses.bindings.get(&arg_name) {
+                            return binding.expression.clone();
+                        }
+                        if let Some(binding) = env_bindings.get(&arg_name) {
+                            return binding.expression.clone();
+                        }
 
-                // Get binding for var_arg from LHS
-                let var_arg_name = var_arg.to_string();
-                let var_binding_expr = lhs_clauses
-                    .bindings
-                    .get(&var_arg_name)
-                    .map(|b| b.expression.clone())
-                    .unwrap_or_else(|| quote! { #var_arg });
+                        let arg_ident = format_ident!("{}", arg_name);
+                        let arg_lang_type = relation_param_types(language, relation)
+                            .and_then(|tys| tys.get(arg_idx))
+                            .and_then(|ty| relation_param_ident(ty))
+                            .unwrap_or_else(|| default_lang_type.clone());
 
-                // Generate code to extract variable name from OrdVar
-                let var_name_extraction = quote! {
-                    {
-                        let var_name_opt = match #var_binding_expr {
-                            mettail_runtime::OrdVar(mettail_runtime::Var::Free(ref fv)) => {
-                                fv.pretty_name.clone()
-                            }
-                            _ => None
-                        };
-                        var_name_opt
-                    }
-                };
+                        // Ascent relation output positions bind by reference; clone at use sites.
+                        env_bindings.insert(
+                            arg_name,
+                            VariableBinding {
+                                expression: quote! { (#arg_ident).clone() },
+                                lang_type: arg_lang_type,
+                                scope_kind: None,
+                            },
+                        );
 
-                // val_arg will be bound from the relation query (as a reference)
-                let val_binding_name = format_ident!("{}", val_arg.to_string());
+                        quote! { #arg_ident }
+                    })
+                    .collect();
+
                 clauses.push(quote! {
-                    if let Some(var_name) = #var_name_extraction,
-                    #relation(var_name, #val_binding_name)
+                    #relation(#(#relation_args),*)
                 });
-
-                // Add to env_bindings - Ascent binds relation values by reference.
-                // Use .clone() so we don't move out of a shared reference (E0507 for String etc).
-                env_bindings.insert(
-                    val_arg.to_string(),
-                    VariableBinding {
-                        expression: quote! { (#val_binding_name).clone() },
-                        lang_type: default_lang_type.clone(),
-                        scope_kind: None,
-                    },
-                );
             },
         }
     }
@@ -275,6 +272,23 @@ fn generate_forall_clause(
             panic!("ForAll body currently only supports Freshness conditions");
         },
     }
+}
+
+fn relation_param_types<'a>(
+    language: &'a LanguageDef,
+    relation: &syn::Ident,
+) -> Option<&'a [String]> {
+    language
+        .logic
+        .as_ref()?
+        .relations
+        .iter()
+        .find(|decl| decl.name == *relation)
+        .map(|decl| decl.param_types.as_slice())
+}
+
+fn relation_param_ident(type_name: &str) -> Option<syn::Ident> {
+    syn::parse_str::<syn::Ident>(type_name.trim()).ok()
 }
 
 /// Generate a freshness condition clause.

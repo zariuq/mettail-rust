@@ -33,6 +33,5 @@ pub fn write_ascent_file(theory_name: &str, ascent_content: &str) -> std::io::Re
 
     fs::write(&file_path, ascent_content)?;
 
-    eprintln!("Generated Ascent Datalog: {}", file_path.display());
     Ok(())
 }
