@@ -605,11 +605,11 @@ impl Repl {
         println!("{}", "  CLI Batch Examples:".yellow());
         println!(
             "    {}",
-            "mettail --lang mettafullstate --run-metta-file repl/src/examples/mettafullstate_surface.metta --report jsonl --report-file .artifacts/ci/surface.jsonl".green()
+            "mettail --lang mettahe --run-metta-file ../hyperon-experimental/python/tests/scripts/b4_nondeterm.metta --report jsonl --report-file .artifacts/ci/he.jsonl".green()
         );
         println!(
             "    {}",
-            "mettail --lang mettafullstate --quiet-batch -c \"(= foo true)\" -c \"!foo\"".green()
+            "mettail --lang mettahe --quiet-batch -c \"(= (id $x) $x)\" -c \"!(id 5)\"".green()
         );
         println!();
         Ok(())
@@ -3211,9 +3211,15 @@ mod tests {
         path
     }
 
+    fn build_registry_with_legacy_mettafull() -> LanguageRegistry {
+        let mut registry = build_registry().expect("registry should initialize");
+        registry.register(Box::new(MeTTaFullStateLanguage));
+        registry
+    }
+
     #[test]
     fn run_metta_file_jsonl_uses_theory_deterministic_surface_policy_by_default() {
-        let registry = build_registry().expect("registry should initialize");
+        let registry = build_registry_with_legacy_mettafull();
         let mut repl = Repl::new(registry).expect("repl should initialize");
         repl.set_batch_quiet(true);
         repl.load_language("mettafullstate")
@@ -3254,7 +3260,7 @@ mod tests {
 
     #[test]
     fn run_metta_file_json_report_has_no_core_tokens_in_surface_results_for_pln_demo() {
-        let registry = build_registry().expect("registry should initialize");
+        let registry = build_registry_with_legacy_mettafull();
         let mut repl = Repl::new(registry).expect("repl should initialize");
         repl.set_batch_quiet(true);
         repl.load_language("mettafullstate")

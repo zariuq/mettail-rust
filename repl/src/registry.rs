@@ -11,7 +11,6 @@ use std::process::Command;
 use mettail_languages::ambient::AmbientLanguage;
 use mettail_languages::calculator::CalculatorLanguage;
 use mettail_languages::lambda::LambdaLanguage;
-use mettail_languages::mettafull_legacy::MeTTaFullStateLanguage;
 use mettail_languages::mettahe_from_lean::MeTTaHELanguage;
 use mettail_languages::rhocalc::RhoCalcLanguage;
 
@@ -404,7 +403,6 @@ pub fn build_registry() -> Result<LanguageRegistry> {
     registry.register(Box::new(AmbientLanguage));
     registry.register(Box::new(CalculatorLanguage));
     registry.register(Box::new(LambdaLanguage));
-    registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(MeTTaFullStateLanguage))));
     registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(MeTTaHELanguage))));
     registry.register(Box::new(RhoCalcLanguage));
 
@@ -418,22 +416,21 @@ pub fn build_registry() -> Result<LanguageRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mettail_runtime::{OracleQuery, RuntimeBackend};
+    use mettail_runtime::OracleQuery;
+    #[cfg(feature = "mork-backend")]
+    use mettail_runtime::RuntimeBackend;
 
     #[test]
-    fn default_registry_contains_mettafull() {
+    fn default_registry_contains_mettahe() {
         let registry = build_registry().expect("registry should build");
-        assert!(registry.contains("mettafullstate"));
-        assert!(registry.contains("MeTTaFullState"));
         assert!(registry.contains("mettahe"));
+        assert!(!registry.contains("mettafullstate"));
     }
 
     #[test]
-    fn mettafull_exposes_meta_oracle() {
+    fn mettahe_exposes_meta_oracle() {
         let registry = build_registry().expect("registry should build");
-        let lang = registry
-            .get("mettafullstate")
-            .expect("mettafullstate should be registered");
+        let lang = registry.get("mettahe").expect("mettahe should be registered");
 
         let descriptors = lang.list_oracles();
         assert!(descriptors.iter().any(|d| d.name == "meta"));

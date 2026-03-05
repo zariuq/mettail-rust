@@ -7,7 +7,7 @@ use mettail_repl::{build_registry, Repl};
 #[command(name = "mettail")]
 #[command(about = "Interactive term exploration for programming languages", long_about = None)]
 #[command(
-    after_help = "Examples:\n  mettail --lang mettafullstate --run-metta-file repl/src/examples/mettafullstate_surface.metta --report jsonl --report-file .artifacts/ci/surface.jsonl\n  mettail --lang mettahe --parser-backend tree-sitter --run-metta-file ../hyperon-experimental/python/tests/scripts/b4_nondeterm.metta\n  mettail --lang mettafullstate --run-metta-file .artifacts/tmp/fib10.metta --surface-fuel 1024 --surface-deterministic\n  mettail --run-mm2-file ../MORK/examples/fibonacci_unfold_fold/fibonacci_bottom_up.mm2 --mm2-max-steps 200\n  mettail --lang mettafullstate -c \"(= foo true)\" -c \"!foo\"\n  mettail mettafullstate --interactive"
+    after_help = "Examples:\n  mettail --lang mettahe --parser-backend tree-sitter --run-metta-file ../hyperon-experimental/python/tests/scripts/b4_nondeterm.metta\n  mettail --lang mettahe --run-metta-file ../hyperon-experimental/python/tests/scripts/b5_types_prelim.metta --surface-fuel 1024 --surface-deterministic\n  mettail --run-mm2-file ../MORK/examples/fibonacci_unfold_fold/fibonacci_bottom_up.mm2 --mm2-max-steps 200\n  mettail --lang mettahe -c \"(= (id $x) $x)\" -c \"!(id 5)\"\n  mettail mettahe --interactive"
 )]
 struct Args {
     /// Language to load on startup (positional form)
@@ -18,7 +18,7 @@ struct Args {
     #[arg(long, value_name = "LANGUAGE")]
     lang: Option<String>,
 
-    /// Run a .metta surface file (mettafullstate only) and exit unless --interactive
+    /// Run a .metta surface file and exit unless --interactive (requires --lang)
     #[arg(long, value_name = "FILE")]
     run_metta_file: Option<String>,
 
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
 
     if let Some(file) = args.run_metta_file {
         if repl.name_str().is_none() {
-            repl.load_language("mettafullstate")?;
+            anyhow::bail!("--run-metta-file requires --lang (e.g. --lang mettahe)");
         }
         let mut cmd = format!("run-metta-file {file}");
         if args.report != "text" {

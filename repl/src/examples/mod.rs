@@ -5,7 +5,6 @@
 
 pub mod ambient;
 pub mod calculator;
-pub mod mettafullstate;
 pub mod rhocalc;
 
 /// Metadata for an example process
@@ -22,7 +21,6 @@ pub enum LanguageName {
     RhoCalculus,
     AmbientCalculus,
     Calculator,
-    MeTTaFullState,
 }
 
 impl LanguageName {
@@ -31,7 +29,6 @@ impl LanguageName {
             LanguageName::RhoCalculus => "rhocalc",
             LanguageName::AmbientCalculus => "ambient",
             LanguageName::Calculator => "calculator",
-            LanguageName::MeTTaFullState => "mettafullstate",
         }
     }
 }
@@ -57,7 +54,6 @@ impl Example {
         examples.extend(rhocalc::all());
         examples.extend(ambient::all());
         examples.extend(calculator::all());
-        examples.extend(mettafullstate::all());
         examples
     }
 
@@ -80,7 +76,6 @@ impl Example {
             LanguageName::RhoCalculus => rhocalc::all(),
             LanguageName::AmbientCalculus => ambient::all(),
             LanguageName::Calculator => calculator::all(),
-            LanguageName::MeTTaFullState => mettafullstate::all(),
         }
     }
 
@@ -114,12 +109,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mettafull_examples_are_registered() {
-        let metta_examples = Example::by_language(LanguageName::MeTTaFullState);
-        assert!(!metta_examples.is_empty(), "expected mettafullstate examples to be registered");
-        assert!(
-            Example::by_name("metta_bool_not").is_some(),
-            "expected metta_bool_not example to be discoverable by name"
-        );
+    fn core_examples_are_registered() {
+        assert!(!Example::by_language(LanguageName::Calculator).is_empty());
+        assert!(!Example::by_language(LanguageName::AmbientCalculus).is_empty());
+        assert!(!Example::by_language(LanguageName::RhoCalculus).is_empty());
     }
 }
