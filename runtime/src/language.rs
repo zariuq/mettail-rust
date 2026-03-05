@@ -5,7 +5,7 @@
 use std::any::Any;
 use std::fmt;
 
-use crate::{LanguageMetadata, OracleDescriptor, OracleQuery, OracleResponse};
+use crate::{LanguageMetadata, OracleDescriptor, OracleQuery, OracleResponse, RuntimeBackend};
 
 // =============================================================================
 // Type Inference Types
@@ -124,6 +124,31 @@ pub trait Language: Send + Sync {
 
     /// Run Ascent on a term and return results
     fn run_ascent(&self, term: &dyn Term) -> Result<AscentResults, String>;
+
+    /// Whether this language supports the selected core backend.
+    ///
+    /// Default: only Ascent/Auto are supported.
+    fn supports_backend(&self, backend: RuntimeBackend) -> bool {
+        matches!(backend, RuntimeBackend::Auto | RuntimeBackend::Ascent)
+    }
+
+    /// Run one core backend on a term and return results.
+    ///
+    /// Default implementation routes `Auto`/`Ascent` to `run_ascent` and
+    /// rejects `Mork` until the language provides a native core MORK adapter.
+    fn run_backend(
+        &self,
+        term: &dyn Term,
+        backend: RuntimeBackend,
+    ) -> Result<AscentResults, String> {
+        match backend {
+            RuntimeBackend::Auto | RuntimeBackend::Ascent => self.run_ascent(term),
+            RuntimeBackend::Mork => Err(format!(
+                "language '{}' does not yet support native core MORK backend",
+                self.name()
+            )),
+        }
+    }
 
     /// List oracle endpoints exposed by this language runtime.
     ///

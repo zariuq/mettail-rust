@@ -1194,7 +1194,8 @@ fn eval_ground_call_core_inner(
                 .or(Some(flattened))
         } else {
             // Check if this is a lazy builtin (if) that must fire before arg reduction
-            let is_lazy_builtin = items.first()
+            let is_lazy_builtin = items
+                .first()
                 .and_then(|h| atom_head_symbol(h))
                 .map(|s| s == "if")
                 .unwrap_or(false);
@@ -1213,9 +1214,9 @@ fn eval_ground_call_core_inner(
                 // 1. Try reducing arguments (inside-out)
                 // 2. Try builtins on original args
                 // 3. Try pattern equations (only when args are stable)
-                if let Some(result) = eval_ground_call_with_reduced_args(
-                    space, &items, memo, in_progress, depth + 1,
-                ) {
+                if let Some(result) =
+                    eval_ground_call_with_reduced_args(space, &items, memo, in_progress, depth + 1)
+                {
                     Some(result)
                 } else if let Some(result) =
                     eval_ground_builtin_call(space, &items, memo, in_progress, depth + 1)
@@ -1225,10 +1226,8 @@ fn eval_ground_call_core_inner(
                     if &next == expr {
                         Some(next)
                     } else {
-                        eval_ground_call_core_inner(
-                            space, &next, memo, in_progress, depth + 1,
-                        )
-                        .or(Some(next))
+                        eval_ground_call_core_inner(space, &next, memo, in_progress, depth + 1)
+                            .or(Some(next))
                     }
                 } else {
                     None
@@ -1558,13 +1557,12 @@ fn format_core_atom(atom: &Atom) -> String {
             .map(|s| format!("\"{}\"", s))
             .unwrap_or_else(|| "?str".to_string()),
         Atom::C_ANil => "()".to_string(),
-        Atom::C_UserAtom(name) => extract_string_from_atom(name)
-            .unwrap_or_else(|| "?atom".to_string()),
-        Atom::C_AError(tag, msg) => format!(
-            "(Error {} {})",
-            format_core_atom(tag),
-            format_core_atom(msg)
-        ),
+        Atom::C_UserAtom(name) => {
+            extract_string_from_atom(name).unwrap_or_else(|| "?atom".to_string())
+        },
+        Atom::C_AError(tag, msg) => {
+            format!("(Error {} {})", format_core_atom(tag), format_core_atom(msg))
+        },
         _ => {
             if let Some(items) = decode_cons_list(atom) {
                 let parts: Vec<String> = items.iter().map(format_core_atom).collect();

@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use mettail_runtime::{
-    AscentResults, Language, LibraryAliasDef, OracleDescriptor, OracleQuery, OracleResponse, Term,
-    TermType, VarTypeInfo,
+    AscentResults, Language, LibraryAliasDef, OracleDescriptor, OracleQuery, OracleResponse,
+    RuntimeBackend, Term, TermType, VarTypeInfo,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -114,6 +114,45 @@ impl Language for OracleAugmentedLanguage {
         self.inner.run_ascent(term)
     }
 
+    fn supports_backend(&self, backend: RuntimeBackend) -> bool {
+        if matches!(backend, RuntimeBackend::Mork) && self.inner.name() == "MeTTaHE" {
+            #[cfg(feature = "mork-backend")]
+            {
+                return true;
+            }
+            #[cfg(not(feature = "mork-backend"))]
+            {
+                return false;
+            }
+        }
+        self.inner.supports_backend(backend)
+    }
+
+    fn run_backend(
+        &self,
+        term: &dyn Term,
+        backend: RuntimeBackend,
+    ) -> Result<AscentResults, String> {
+        if self.inner.name() == "MeTTaHE"
+            && matches!(backend, RuntimeBackend::Mork | RuntimeBackend::Auto)
+        {
+            #[cfg(feature = "mork-backend")]
+            {
+                return mettail_languages::mettahe_from_lean::run_mettahe_mork_backend(term);
+            }
+            #[cfg(not(feature = "mork-backend"))]
+            {
+                if matches!(backend, RuntimeBackend::Mork) {
+                    return Err(
+                        "MORK backend for MeTTaHE requires mettail-repl built with --features mork-backend"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        self.inner.run_backend(term, backend)
+    }
+
     fn list_oracles(&self) -> Vec<OracleDescriptor> {
         let mut out = self.inner.list_oracles();
         if self.expose_meta_oracle {
@@ -166,9 +205,7 @@ impl Language for OracleAugmentedLanguage {
                 return Err("python oracle supports only operation 'call'".to_string());
             }
             if query.args.len() < 2 {
-                return Err(
-                    "python.call expects: <module> <function> [arg1 arg2 ...]".to_string(),
-                );
+                return Err("python.call expects: <module> <function> [arg1 arg2 ...]".to_string());
             }
             let module = &query.args[0];
             let function = &query.args[1];
@@ -381,7 +418,7 @@ pub fn build_registry() -> Result<LanguageRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mettail_runtime::OracleQuery;
+    use mettail_runtime::{OracleQuery, RuntimeBackend};
 
     #[test]
     fn default_registry_contains_mettafull() {
@@ -413,6 +450,76 @@ mod tests {
                         .is_some_and(|n| n > 0)
             }),
             "meta.counts should report rewrite cardinality"
+        );
+    }
+
+    #[cfg(feature = "mork-backend")]
+    #[test]
+    fn mettahe_registry_supports_core_mork_backend() {
+        let registry = build_registry().expect("registry should build");
+        let lang = registry
+            .get("mettahe")
+            .expect("mettahe should be registered");
+
+        assert!(
+            lang.supports_backend(RuntimeBackend::Mork),
+            "registry wrapper should expose native HE MORK backend"
+        );
+
+        let term = lang
+            .parse_term(
+                "C_State(C_MettaCall(C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),C_AtomType),C_Space(C_ExprCons(C_EqAtom(C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),C_SymAtom(result1)),C_ExprNil)),C_Empty)",
+            )
+            .expect("parse should succeed");
+
+        let mork = lang
+            .run_backend(term.as_ref(), RuntimeBackend::Mork)
+            .expect("registry MORK backend should execute");
+
+        assert!(
+            mork.all_terms
+                .iter()
+                .any(|t| t.display.contains("C_State(C_Done") && t.display.contains("result1")),
+            "expected MORK backend done result1, got {:?}",
+            mork.all_terms
+                .iter()
+                .map(|t| t.display.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "mork-backend")]
+    #[test]
+    fn mettahe_registry_auto_uses_native_mork_backend() {
+        let registry = build_registry().expect("registry should build");
+        let lang = registry
+            .get("mettahe")
+            .expect("mettahe should be registered");
+
+        let term = lang
+            .parse_term(
+                "C_State(C_MettaCall(C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),C_AtomType),C_Space(C_ExprCons(C_EqAtom(C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),C_SymAtom(result1)),C_ExprNil)),C_Empty)",
+            )
+            .expect("parse should succeed");
+
+        let auto = lang
+            .run_backend(term.as_ref(), RuntimeBackend::Auto)
+            .expect("registry Auto backend should execute");
+
+        assert!(
+            auto.phase_timings_ms.contains_key("mork_native_state_ms"),
+            "expected Auto backend to route through native HE MORK path; phase timings: {:?}",
+            auto.phase_timings_ms
+        );
+        assert!(
+            auto.all_terms
+                .iter()
+                .any(|t| t.display.contains("C_State(C_Done") && t.display.contains("result1")),
+            "expected Auto backend done result1, got {:?}",
+            auto.all_terms
+                .iter()
+                .map(|t| t.display.clone())
+                .collect::<Vec<_>>()
         );
     }
 }

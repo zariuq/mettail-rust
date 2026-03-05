@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::lookup_plan::LookupRelationMetadata;
 use crate::metta_surface::{SExpr, SurfaceStmt};
 use mettail_runtime::{
     CoreEvalDiagnostics, RewriteEvalDiagnostics as SurfaceEvalDiagnostics, RuntimeDispatchContracts,
@@ -151,19 +152,52 @@ fn json_string_array(items: &[String]) -> String {
         .join(",")
 }
 
-fn relation_cardinalities_json(items: &[(String, usize)]) -> String {
+fn relation_cardinalities_json(
+    items: &[(String, usize)],
+    lookup_relation_metadata: Option<&HashMap<String, LookupRelationMetadata>>,
+) -> String {
     items
         .iter()
-        .map(|(name, card)| format!("{{\"name\":\"{}\",\"count\":{}}}", json_escape(name), card))
+        .map(|(name, card)| {
+            let mut row = format!("{{\"name\":\"{}\",\"count\":{}", json_escape(name), card);
+            if let Some(meta) = lookup_relation_metadata.and_then(|m| m.get(name)) {
+                row.push_str(&format!(
+                    ",\"logical_relation_id\":\"{}\",\"scope_signature\":\"{}\"",
+                    json_escape(&meta.logical_relation_id),
+                    json_escape(&meta.scope_signature)
+                ));
+                if let Some(kind) = &meta.usage_kind {
+                    row.push_str(&format!(",\"usage_kind\":\"{}\"", json_escape(kind)));
+                }
+            }
+            row.push('}');
+            row
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn relation_timings_json(items: &[(String, f64)]) -> String {
+fn relation_timings_json(
+    items: &[(String, f64)],
+    lookup_relation_metadata: Option<&HashMap<String, LookupRelationMetadata>>,
+) -> String {
     items
         .iter()
         .map(|(name, elapsed_ms)| {
-            format!("{{\"name\":\"{}\",\"elapsed_ms\":{:.3}}}", json_escape(name), elapsed_ms)
+            let mut row =
+                format!("{{\"name\":\"{}\",\"elapsed_ms\":{:.3}", json_escape(name), elapsed_ms);
+            if let Some(meta) = lookup_relation_metadata.and_then(|m| m.get(name)) {
+                row.push_str(&format!(
+                    ",\"logical_relation_id\":\"{}\",\"scope_signature\":\"{}\"",
+                    json_escape(&meta.logical_relation_id),
+                    json_escape(&meta.scope_signature)
+                ));
+                if let Some(kind) = &meta.usage_kind {
+                    row.push_str(&format!(",\"usage_kind\":\"{}\"", json_escape(kind)));
+                }
+            }
+            row.push('}');
+            row
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -206,6 +240,7 @@ pub fn run_metta_file_report_json(
     runtime_imports: RuntimeImportStats,
     surface_policy: &str,
     dispatch_contracts: RuntimeDispatchContracts,
+    lookup_relation_metadata: Option<&HashMap<String, LookupRelationMetadata>>,
 ) -> String {
     let stats = summarize_run_metta_file_entries(entries);
     let mut out = String::new();
@@ -340,11 +375,11 @@ pub fn run_metta_file_report_json(
                 diag.p95_out_degree,
                 diag.reachable_term_count,
                 diag.reachable_rewrite_count,
-                relation_cardinalities_json(&diag.relation_cardinalities),
+                relation_cardinalities_json(&diag.relation_cardinalities, lookup_relation_metadata),
                 diag.relation_extract_total_ms,
-                relation_timings_json(&diag.relation_timings_ms),
+                relation_timings_json(&diag.relation_timings_ms, lookup_relation_metadata),
                 diag.core_phase_total_ms,
-                relation_timings_json(&diag.core_phase_timings_ms)
+                relation_timings_json(&diag.core_phase_timings_ms, None)
             ));
             out.push('}');
         }
@@ -409,6 +444,7 @@ pub fn run_metta_file_report_jsonl(
     runtime_imports: RuntimeImportStats,
     surface_policy: &str,
     dispatch_contracts: RuntimeDispatchContracts,
+    lookup_relation_metadata: Option<&HashMap<String, LookupRelationMetadata>>,
 ) -> String {
     let stats = summarize_run_metta_file_entries(entries);
     let mut lines = Vec::with_capacity(entries.len() + 1);
@@ -514,11 +550,11 @@ pub fn run_metta_file_report_jsonl(
                 diag.p95_out_degree,
                 diag.reachable_term_count,
                 diag.reachable_rewrite_count,
-                relation_cardinalities_json(&diag.relation_cardinalities),
+                relation_cardinalities_json(&diag.relation_cardinalities, lookup_relation_metadata),
                 diag.relation_extract_total_ms,
-                relation_timings_json(&diag.relation_timings_ms),
+                relation_timings_json(&diag.relation_timings_ms, lookup_relation_metadata),
                 diag.core_phase_total_ms,
-                relation_timings_json(&diag.core_phase_timings_ms)
+                relation_timings_json(&diag.core_phase_timings_ms, None)
             ));
             line.push('}');
         }
@@ -707,7 +743,16 @@ fn paren_delta_outside_string(raw: &str) -> i32 {
 
 fn split_top_level_forms(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
     if parse_batch_capture_assignment(trimmed).is_some() {
+        return vec![trimmed.to_string()];
+    }
+    if trimmed.starts_with('!') {
+        return vec![trimmed.to_string()];
+    }
+    if !trimmed.contains('(') && !trimmed.contains(')') {
         return vec![trimmed.to_string()];
     }
 
@@ -789,7 +834,7 @@ fn split_top_level_forms(raw: &str) -> Vec<String> {
     out
 }
 
-fn coalesce_source_forms(
+pub(crate) fn coalesce_source_forms(
     content: &str,
     source_file: &str,
     default_space: &str,
@@ -932,6 +977,22 @@ pub fn split_run_metta_file_line(raw_line: &str) -> Result<Option<(String, Optio
         return Ok(None);
     }
     Ok(Some((cmd_part, expected_surface)))
+}
+
+/// Hyperon compatibility mode accepts occasional prose/header lines in script files.
+/// These are non-empty lines that are not MeTTa forms/commands and contain whitespace.
+pub fn is_hyperon_compat_ignorable_prose_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with(';')
+        || trimmed.starts_with("//")
+        || trimmed.starts_with('!')
+        || trimmed.starts_with('(')
+        || trimmed.starts_with('$')
+    {
+        return false;
+    }
+    trimmed.chars().any(char::is_whitespace)
 }
 
 fn is_batch_binding_ident_start(ch: char) -> bool {
@@ -1244,7 +1305,10 @@ fn cycle_chain_for_target(
     chain
 }
 
-fn resolve_import_path_token(import_path: &str, library_aliases: &HashMap<String, String>) -> String {
+fn resolve_import_path_token(
+    import_path: &str,
+    library_aliases: &HashMap<String, String>,
+) -> String {
     if let Some(lib_name) = import_path.strip_prefix("library:") {
         if let Some(path) = library_aliases.get(lib_name) {
             return path.clone();
@@ -1565,14 +1629,17 @@ pub fn retarget_surface_stmt(stmt: SurfaceStmt, default_space: &str) -> SurfaceS
 mod tests {
     use super::{
         coalesce_source_forms, effective_import_target_space, expand_import_directive_from_source,
-        expand_metta_file_with_imports, expected_surface_mismatch, parse_batch_capture_assignment,
+        expand_metta_file_with_imports, expected_surface_mismatch,
+        is_hyperon_compat_ignorable_prose_line, parse_batch_capture_assignment,
         parse_import_directive, resolve_import_file_path, retarget_surface_stmt,
         run_metta_file_report_json, run_metta_file_report_jsonl, runtime_import_stats_consistent,
         split_top_level_forms, substitute_batch_bindings, BatchBindingEvent, ImportEdge,
         ImportExpansionMeta, RunMettaFileEntry, RuntimeDispatchContracts, RuntimeImportStats,
         DEFAULT_BATCH_SPACE_IDENT,
     };
+    use crate::lookup_plan::LookupRelationMetadata;
     use crate::metta_surface::{SExpr, SurfaceStmt};
+    use mettail_runtime::CoreEvalDiagnostics;
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
@@ -1626,9 +1693,31 @@ mod tests {
     }
 
     #[test]
+    fn hyperon_compat_prose_line_filter_detects_headers() {
+        assert!(is_hyperon_compat_ignorable_prose_line("Auto type-checking can be enabled"));
+        assert!(is_hyperon_compat_ignorable_prose_line("This script checks grounded operators"));
+        assert!(!is_hyperon_compat_ignorable_prose_line("!(pragma! type-check auto)"));
+        assert!(!is_hyperon_compat_ignorable_prose_line("(= (f $x) $x)"));
+        assert!(!is_hyperon_compat_ignorable_prose_line("$tmp = !(new-space!)"));
+        assert!(!is_hyperon_compat_ignorable_prose_line("foo"));
+    }
+
+    #[test]
     fn split_top_level_forms_splits_flat_concatenated_forms() {
         let forms = split_top_level_forms("(a 1) (b 2) (c 3)");
         assert_eq!(forms, vec!["(a 1)", "(b 2)", "(c 3)"]);
+    }
+
+    #[test]
+    fn split_top_level_forms_keeps_bang_prefixed_form_intact() {
+        let forms = split_top_level_forms("! (new-goal-status! lunch-order inactive)");
+        assert_eq!(forms, vec!["! (new-goal-status! lunch-order inactive)"]);
+    }
+
+    #[test]
+    fn split_top_level_forms_keeps_prose_header_line_intact() {
+        let forms = split_top_level_forms("Auto type-checking can be enabled");
+        assert_eq!(forms, vec!["Auto type-checking can be enabled"]);
     }
 
     #[test]
@@ -1878,7 +1967,9 @@ mod tests {
         .expect("expand python imports");
 
         assert!(
-            expanded.iter().all(|line| !line.source_file.ends_with(".py")),
+            expanded
+                .iter()
+                .all(|line| !line.source_file.ends_with(".py")),
             "python source should not be parsed as MeTTa"
         );
         assert!(
@@ -1988,6 +2079,7 @@ mod tests {
                 specialization_safe: true,
                 core_ground_eval_safe: true,
             },
+            None,
         );
         let lines: Vec<&str> = report.lines().collect();
         assert!(!lines.is_empty(), "expected non-empty jsonl report");
@@ -2030,11 +2122,81 @@ mod tests {
                 specialization_safe: true,
                 core_ground_eval_safe: true,
             },
+            None,
         );
         assert!(report.contains("\"surface_policy\":\"default\""));
         assert!(
             report.contains("\"dispatch_contracts\":{\"deterministic_reduction\":false,\"memoization_safe\":true,\"specialization_safe\":true,\"core_ground_eval_safe\":true}")
         );
+    }
+
+    #[test]
+    fn json_report_includes_lookup_relation_metadata_on_relation_timings() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "eqQueryResult".to_string(),
+            LookupRelationMetadata {
+                logical_relation_id: "he.eq_query.result".to_string(),
+                scope_signature: "b0+b1+f2".to_string(),
+                usage_kind: Some("enumerate".to_string()),
+            },
+        );
+
+        let core = CoreEvalDiagnostics {
+            mode: "ascent".to_string(),
+            elapsed_ms: 1.0,
+            term_count: 1,
+            rewrite_count: 0,
+            normal_form_count: 1,
+            root_out_degree: 0,
+            max_out_degree: 0,
+            avg_out_degree: 0.0,
+            p95_out_degree: 0,
+            reachable_term_count: 1,
+            reachable_rewrite_count: 0,
+            relation_cardinalities: vec![("eqQueryResult".to_string(), 2)],
+            relation_extract_total_ms: 0.5,
+            relation_timings_ms: vec![("eqQueryResult".to_string(), 0.5)],
+            core_phase_total_ms: 0.0,
+            core_phase_timings_ms: vec![],
+        };
+        let entries = vec![RunMettaFileEntry {
+            line: 1,
+            input: "!(double 5)".to_string(),
+            status: "pass",
+            error: None,
+            surface_results: None,
+            expected_surface: None,
+            elapsed_ms: Some(1.0),
+            source_file: Some("suite.metta".to_string()),
+            source_line: Some(1),
+            binding_name: None,
+            binding_value: None,
+            surface_diagnostics: None,
+            core_diagnostics: Some(core),
+        }];
+
+        let report = run_metta_file_report_json(
+            "suite.metta",
+            1,
+            0,
+            0,
+            &entries,
+            &ImportExpansionMeta::default(),
+            &[],
+            RuntimeImportStats::default(),
+            "default",
+            RuntimeDispatchContracts {
+                deterministic_reduction: true,
+                memoization_safe: true,
+                specialization_safe: true,
+                core_ground_eval_safe: true,
+            },
+            Some(&metadata),
+        );
+        assert!(report.contains("\"logical_relation_id\":\"he.eq_query.result\""));
+        assert!(report.contains("\"scope_signature\":\"b0+b1+f2\""));
+        assert!(report.contains("\"usage_kind\":\"enumerate\""));
     }
 
     #[test]
@@ -2124,6 +2286,7 @@ mod tests {
                 specialization_safe: false,
                 core_ground_eval_safe: false,
             },
+            None,
         );
         let summary = report.lines().next().expect("summary line");
         assert_eq!(extract_json_bool(summary, "runtime_import_consistent"), Some(false));

@@ -47,9 +47,29 @@ pub use rewrite_search::*;
 mod memo;
 pub use memo::*;
 
+// Shared immutable vector wrapper with lazy-cloning iteration
+mod shared_vec;
+pub use shared_vec::*;
+
 // Generic rule candidate index
 mod rule_index;
 pub use rule_index::*;
+
+// Generic mixed exact/pattern lookup-family index
+mod lookup_family;
+pub use lookup_family::*;
+
+// Shared MeTTa-family matcher/substitution primitives
+mod metta_family;
+pub use metta_family::*;
+
+// Shared MeTTa-family space index orchestration
+mod metta_space_index;
+pub use metta_space_index::*;
+
+// Collision-safe hash/equality cache used by generated language helpers
+mod hash_eq_cache;
+pub use hash_eq_cache::*;
 
 // Oracle query contract for external services/FFI-style integrations
 mod oracle;

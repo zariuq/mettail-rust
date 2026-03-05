@@ -107,7 +107,10 @@ pub trait LanguageMetadata: 'static + Send + Sync {
         let has_atom = self.types().iter().any(|t| t.name == "Atom");
         let has_c_state = self.terms().iter().any(|t| t.name == "C_State");
         // Legacy uses C_Eval, HE uses C_Metta — accept either
-        let has_eval_entry = self.terms().iter().any(|t| t.name == "C_Eval" || t.name == "C_Metta");
+        let has_eval_entry = self
+            .terms()
+            .iter()
+            .any(|t| t.name == "C_Eval" || t.name == "C_Metta");
         has_state && has_instr && has_atom && has_c_state && has_eval_entry
     }
 

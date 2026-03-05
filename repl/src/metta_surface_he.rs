@@ -17,10 +17,7 @@ use super::metta_surface::{SExpr, SurfaceSpaceState};
 ///
 /// Returns a single core term string (HE is deterministic at lowering time).
 /// The surface rewriter is NOT invoked — all semantics come from Ascent.
-pub fn he_lower_eval(
-    expr: &SExpr,
-    space_state: &SurfaceSpaceState,
-) -> Result<String, String> {
+pub fn he_lower_eval(expr: &SExpr, space_state: &SurfaceSpaceState) -> Result<String, String> {
     let atom = he_encode_sexpr(expr)?;
     let space = he_build_space(space_state);
     Ok(format!("C_State(C_Metta({atom},C_UndefinedType),{space},C_Empty)"))
@@ -61,16 +58,17 @@ fn he_encode_atom(s: &str) -> Result<String, String> {
     }
 
     // String literal (quoted) — encode with s_ prefix for parser compatibility
-    // Token goes directly in C_GString (not wrapped in C_SymAtom)
+    // Token goes directly in C_GString (not wrapped in C_SymAtom).
+    // Use hex escaping so arbitrary characters remain parser-safe.
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
         let inner = &s[1..s.len() - 1];
-        let tok = format!("s_{inner}");
+        let tok = encode_string_token(inner);
         return Ok(format!("C_GString({tok})"));
     }
 
     // Variable
     if s.starts_with('$') && s.len() > 1 {
-        return Ok(format!("C_VarAtom(C_SymAtom({}))", &s[1..]));
+        return Ok(format!("C_VarAtom(C_SymAtom({}))", encode_symbol_token(&s[1..])));
     }
 
     // Type keywords
@@ -97,8 +95,9 @@ fn he_encode_atom(s: &str) -> Result<String, String> {
         _ => {},
     }
 
-    // Regular symbol
-    Ok(format!("C_SymAtom(C_SymAtom({s}))"))
+    // Regular symbol. Escape names that include parser-hostile characters
+    // (e.g. '&self', 'find-equal').
+    Ok(format!("C_SymAtom(C_SymAtom({}))", encode_symbol_token(s)))
 }
 
 fn he_encode_expr_list(items: &[SExpr]) -> Result<String, String> {
@@ -216,17 +215,17 @@ pub fn he_decode_atom(core_atom: &str) -> String {
     if let Some(inner) = strip_wrapper(atom, "C_SymAtom") {
         // Nested C_SymAtom(C_SymAtom(name)) → name
         if let Some(name) = strip_wrapper(inner, "C_SymAtom") {
-            return name.to_string();
+            return decode_symbol_token(name);
         }
-        return inner.to_string();
+        return decode_symbol_token(inner);
     }
 
     // C_VarAtom(C_SymAtom(name)) → $name
     if let Some(inner) = strip_wrapper(atom, "C_VarAtom") {
         if let Some(name) = strip_wrapper(inner, "C_SymAtom") {
-            return format!("${name}");
+            return format!("${}", decode_symbol_token(name));
         }
-        return format!("${inner}");
+        return format!("${}", decode_symbol_token(inner));
     }
 
     // C_GInt(C_42) → 42, C_GInt(C_neg_42) → -42
@@ -238,6 +237,9 @@ pub fn he_decode_atom(core_atom: &str) -> String {
     // C_GString(s_hello) → "hello"
     if let Some(inner) = strip_wrapper(atom, "C_GString") {
         let decoded = decode_var_display(inner);
+        if let Some(rest) = decoded.strip_prefix("strhex_") {
+            return format!("\"{}\"", decode_hex_bytes(rest).unwrap_or_else(|| rest.to_string()));
+        }
         if let Some(rest) = decoded.strip_prefix("s_") {
             return format!("\"{rest}\"");
         }
@@ -329,6 +331,59 @@ fn decode_var_display(s: &str) -> String {
     trimmed.to_string()
 }
 
+fn is_safe_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn encode_hex_bytes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.as_bytes() {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn decode_hex_bytes(hex: &str) -> Option<String> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut i = 0;
+    while i < hex.len() {
+        let byte = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
+        bytes.push(byte);
+        i += 2;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn encode_symbol_token(s: &str) -> String {
+    if is_safe_ident(s) {
+        s.to_string()
+    } else {
+        format!("symhex_{}", encode_hex_bytes(s))
+    }
+}
+
+fn decode_symbol_token(tok: &str) -> String {
+    if let Some(hex) = tok.strip_prefix("symhex_") {
+        decode_hex_bytes(hex).unwrap_or_else(|| tok.to_string())
+    } else {
+        tok.to_string()
+    }
+}
+
+fn encode_string_token(s: &str) -> String {
+    format!("strhex_{}", encode_hex_bytes(s))
+}
+
 /// Strip `Prefix(...)` wrapper, returning the inner content.
 fn strip_wrapper<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let with_paren = format!("{prefix}(");
@@ -393,9 +448,7 @@ fn try_decode_he_cons_list(atom: &str) -> Option<String> {
 pub fn he_extract_state_out_atom(core_state_term: &str) -> Option<String> {
     let trimmed = core_state_term.trim();
     // Trim possible leading/trailing whitespace in the Display format
-    let trimmed = trimmed
-        .strip_prefix("C_State(")?
-        .strip_suffix(')')?;
+    let trimmed = trimmed.strip_prefix("C_State(")?.strip_suffix(')')?;
     let args = split_top_level_args(trimmed);
     if args.len() == 3 {
         Some(args[2].trim().to_string())
@@ -417,27 +470,34 @@ mod tests {
     }
 
     #[test]
-    fn encode_integer() {
+    fn encode_symbol_with_hyphen() {
         assert_eq!(
-            he_encode_sexpr(&SExpr::Atom("42".into())).unwrap(),
-            "C_GInt(C_42)"
+            he_encode_sexpr(&SExpr::Atom("find-equal".into())).unwrap(),
+            "C_SymAtom(C_SymAtom(symhex_66696e642d657175616c))"
         );
+    }
+
+    #[test]
+    fn encode_symbol_with_ampersand() {
+        assert_eq!(
+            he_encode_sexpr(&SExpr::Atom("&self".into())).unwrap(),
+            "C_SymAtom(C_SymAtom(symhex_2673656c66))"
+        );
+    }
+
+    #[test]
+    fn encode_integer() {
+        assert_eq!(he_encode_sexpr(&SExpr::Atom("42".into())).unwrap(), "C_GInt(C_42)");
     }
 
     #[test]
     fn encode_negative_integer() {
-        assert_eq!(
-            he_encode_sexpr(&SExpr::Atom("-7".into())).unwrap(),
-            "C_GInt(C_neg_7)"
-        );
+        assert_eq!(he_encode_sexpr(&SExpr::Atom("-7".into())).unwrap(), "C_GInt(C_neg_7)");
     }
 
     #[test]
     fn encode_variable() {
-        assert_eq!(
-            he_encode_sexpr(&SExpr::Atom("$x".into())).unwrap(),
-            "C_VarAtom(C_SymAtom(x))"
-        );
+        assert_eq!(he_encode_sexpr(&SExpr::Atom("$x".into())).unwrap(), "C_VarAtom(C_SymAtom(x))");
     }
 
     #[test]
@@ -459,6 +519,14 @@ mod tests {
     }
 
     #[test]
+    fn decode_escaped_symbol() {
+        assert_eq!(
+            he_decode_atom("C_SymAtom(C_SymAtom(symhex_66696e642d657175616c))"),
+            "find-equal"
+        );
+    }
+
+    #[test]
     fn decode_integer() {
         assert_eq!(he_decode_atom("C_GInt(C_42)"), "42");
     }
@@ -471,7 +539,9 @@ mod tests {
     #[test]
     fn decode_expr_cons_list() {
         assert_eq!(
-            he_decode_atom("C_ExprCons(C_SymAtom(C_SymAtom(a)),C_ExprCons(C_SymAtom(C_SymAtom(b)),C_ExprNil))"),
+            he_decode_atom(
+                "C_ExprCons(C_SymAtom(C_SymAtom(a)),C_ExprCons(C_SymAtom(C_SymAtom(b)),C_ExprNil))"
+            ),
             "(a b)"
         );
     }
@@ -479,7 +549,9 @@ mod tests {
     #[test]
     fn decode_error() {
         assert_eq!(
-            he_decode_atom("C_ErrorAtom(C_SymAtom(C_SymAtom(x)),C_BadType(C_AtomType,C_SymbolType))"),
+            he_decode_atom(
+                "C_ErrorAtom(C_SymAtom(C_SymAtom(x)),C_BadType(C_AtomType,C_SymbolType))"
+            ),
             "(Error x (BadType Atom Symbol))"
         );
     }

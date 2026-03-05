@@ -6,7 +6,18 @@ use mettail_runtime::{
     RuleFragmentSafety, RuleIndex,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::Instant;
+use tree_sitter::{Language as TSLanguage, Node as TSNode, Parser as TSParser};
+
+use crate::lookup_plan::{
+    relation_metadata_index, try_load_lookup_plan, LookupPlanArtifact, LookupRelationMetadata,
+};
+use crate::syntax_spec::{
+    try_load_syntax_spec, CommandHead, DispatchPolicy, EvalPrefixPolicy, LexerSpec, LoweringHeads,
+    SyntaxSpec,
+};
+use std::borrow::Cow;
 
 const DEFAULT_SPACE_IDENT: &str = "&self";
 
@@ -17,6 +28,27 @@ pub enum SurfaceProfile {
     Legacy,
     /// HE MeTTa backend
     HE,
+}
+
+/// Surface syntax policy for command-level parsing.
+///
+/// This is intentionally frontend-only: it governs how textual `.metta` lines
+/// are normalized into `SurfaceStmt`, not core rewrite semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceSyntaxPolicy {
+    /// Match Hyperon/HE behavior: tolerate standalone `!` as a no-op.
+    HyperonCompat,
+    /// Require a non-empty expression after `!`.
+    Strict,
+}
+
+/// Selects which parser frontend is used before normalization/lowering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceParserBackend {
+    /// Current in-process tokenizer/S-expression parser.
+    LegacySExpr,
+    /// Target backend: Tree-sitter parser driven by Lean-generated grammar artifacts.
+    TreeSitter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -95,6 +127,15 @@ struct GroundCallMemoKey {
 #[derive(Debug, Clone)]
 pub struct MeTTaSurfaceSession {
     profile: SurfaceProfile,
+    syntax_policy: SurfaceSyntaxPolicy,
+    parser_backend: SurfaceParserBackend,
+    syntax_spec: Option<SyntaxSpec>,
+    syntax_spec_required: bool,
+    syntax_spec_error: Option<String>,
+    lookup_plan: Option<LookupPlanArtifact>,
+    lookup_relation_metadata: Option<HashMap<String, LookupRelationMetadata>>,
+    lookup_plan_required: bool,
+    lookup_plan_error: Option<String>,
     spaces: HashMap<String, SurfaceSpaceState>,
     space_revisions: HashMap<String, u64>,
     empty_space: SurfaceSpaceState,
@@ -125,6 +166,11 @@ impl MeTTaSurfaceSession {
     pub fn with_profile(profile: SurfaceProfile) -> Self {
         let mut spaces = HashMap::new();
         let mut default_space = SurfaceSpaceState::default();
+        let (syntax_policy, syntax_spec, syntax_spec_required, syntax_spec_error) =
+            syntax_config_from_profile(profile);
+        let (lookup_plan, lookup_relation_metadata, lookup_plan_required, lookup_plan_error) =
+            lookup_plan_config_from_profile(profile);
+        let parser_backend = parser_backend_from_profile(profile);
 
         // HE profile: bootstrap grounded operator type annotations
         if profile == SurfaceProfile::HE {
@@ -136,6 +182,15 @@ impl MeTTaSurfaceSession {
         space_revisions.insert(DEFAULT_SPACE_IDENT.to_string(), 0);
         Self {
             profile,
+            syntax_policy,
+            parser_backend,
+            syntax_spec,
+            syntax_spec_required,
+            syntax_spec_error,
+            lookup_plan,
+            lookup_relation_metadata,
+            lookup_plan_required,
+            lookup_plan_error,
             spaces,
             space_revisions,
             empty_space: SurfaceSpaceState::default(),
@@ -153,6 +208,34 @@ impl MeTTaSurfaceSession {
 
     pub fn profile(&self) -> SurfaceProfile {
         self.profile
+    }
+
+    pub fn syntax_policy(&self) -> SurfaceSyntaxPolicy {
+        self.syntax_policy
+    }
+
+    pub fn set_syntax_policy(&mut self, policy: SurfaceSyntaxPolicy) {
+        self.syntax_policy = policy;
+    }
+
+    pub fn syntax_spec(&self) -> Option<&SyntaxSpec> {
+        self.syntax_spec.as_ref()
+    }
+
+    pub fn lookup_plan(&self) -> Option<&LookupPlanArtifact> {
+        self.lookup_plan.as_ref()
+    }
+
+    pub fn lookup_relation_metadata(&self) -> Option<&HashMap<String, LookupRelationMetadata>> {
+        self.lookup_relation_metadata.as_ref()
+    }
+
+    pub fn parser_backend(&self) -> SurfaceParserBackend {
+        self.parser_backend
+    }
+
+    pub fn set_parser_backend(&mut self, backend: SurfaceParserBackend) {
+        self.parser_backend = backend;
     }
 
     pub fn rewrite_limits(&self) -> SurfaceRewriteLimits {
@@ -208,6 +291,59 @@ impl MeTTaSurfaceSession {
     }
 
     pub fn parse_line(input: &str) -> Result<SurfaceStmt> {
+        match Self::parse_line_with_legacy_syntax(input, SurfaceSyntaxPolicy::Strict, None)? {
+            Some(stmt) => Ok(stmt),
+            None => bail!("empty MeTTa input"),
+        }
+    }
+
+    pub fn parse_line_with_policy(
+        input: &str,
+        syntax_policy: SurfaceSyntaxPolicy,
+    ) -> Result<Option<SurfaceStmt>> {
+        Self::parse_line_with_legacy_syntax(input, syntax_policy, None)
+    }
+
+    pub fn parse_line_for_session(&self, input: &str) -> Result<Option<SurfaceStmt>> {
+        if self.syntax_spec_required && self.syntax_spec.is_none() {
+            if let Some(err) = &self.syntax_spec_error {
+                bail!("{err}");
+            }
+            bail!(
+                "surface syntax spec is required for profile {:?} but was not loaded",
+                self.profile
+            );
+        }
+        if self.lookup_plan_required && self.lookup_plan.is_none() {
+            if let Some(err) = &self.lookup_plan_error {
+                bail!("{err}");
+            }
+            bail!("lookup plan is required for profile {:?} but was not loaded", self.profile);
+        }
+        match self.parser_backend {
+            SurfaceParserBackend::LegacySExpr => Self::parse_line_with_legacy_syntax(
+                input,
+                self.syntax_policy,
+                self.syntax_spec.as_ref(),
+            ),
+            SurfaceParserBackend::TreeSitter => Self::parse_line_with_tree_sitter(
+                input,
+                self.syntax_policy,
+                self.syntax_spec.as_ref(),
+                self.profile,
+            ),
+        }
+    }
+
+    fn parse_line_with_legacy_syntax(
+        input: &str,
+        syntax_policy: SurfaceSyntaxPolicy,
+        syntax_spec: Option<&SyntaxSpec>,
+    ) -> Result<Option<SurfaceStmt>> {
+        let syntax_spec = match syntax_spec {
+            Some(spec) => Some(spec),
+            None => Some(legacy_builtin_syntax_spec()),
+        };
         let trimmed = input.trim();
         if trimmed.is_empty() {
             bail!("empty MeTTa input");
@@ -219,6 +355,13 @@ impl MeTTaSurfaceSession {
             (false, trimmed)
         };
 
+        if force_eval && body.is_empty() {
+            if syntax_policy == SurfaceSyntaxPolicy::HyperonCompat {
+                return Ok(None);
+            }
+            bail!("empty MeTTa input");
+        }
+
         let tokens = tokenize(body)?;
         let mut pos = 0usize;
         let expr = parse_sexpr(&tokens, &mut pos)?;
@@ -226,39 +369,35 @@ impl MeTTaSurfaceSession {
             bail!("unexpected trailing tokens in MeTTa expression");
         }
 
-        if force_eval {
-            if let Some(space_stmt) = parse_mutable_space_eval_stmt(&expr) {
-                return Ok(space_stmt);
+        classify_surface_stmt_from_expr(expr, force_eval, syntax_spec)
+    }
+
+    fn parse_line_with_tree_sitter(
+        input: &str,
+        syntax_policy: SurfaceSyntaxPolicy,
+        syntax_spec: Option<&SyntaxSpec>,
+        profile: SurfaceProfile,
+    ) -> Result<Option<SurfaceStmt>> {
+        if profile == SurfaceProfile::HE && syntax_spec.is_none() {
+            bail!(
+                "surface syntax spec is required for HE profile (missing he.syntax_spec.json/checksum artifacts)"
+            );
+        }
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            bail!("empty MeTTa input");
+        }
+
+        if trimmed == "!" {
+            if syntax_policy == SurfaceSyntaxPolicy::HyperonCompat {
+                return Ok(None);
             }
-        }
-        if let Some(space_stmt) = parse_mutable_space_stmt(&expr) {
-            return Ok(space_stmt);
-        }
-        if let Some(space_stmt) = parse_in_space_mutable_stmt(&expr) {
-            return Ok(space_stmt);
-        }
-        if let Some((space, expr_in_space)) = parse_eval_space_stmt(&expr) {
-            return Ok(SurfaceStmt::EvalIn { space, expr: expr_in_space });
+            bail!("empty MeTTa input");
         }
 
-        if force_eval {
-            return Ok(SurfaceStmt::Eval(expr));
-        }
-
-        if let SExpr::List(items) = &expr {
-            if items.len() == 3 {
-                if let SExpr::Atom(head) = &items[0] {
-                    if head == "=" {
-                        return Ok(SurfaceStmt::DefineEq(items[1].clone(), items[2].clone()));
-                    }
-                    if head == ":" {
-                        return Ok(SurfaceStmt::DefineType(items[1].clone(), items[2].clone()));
-                    }
-                }
-            }
-        }
-
-        Ok(SurfaceStmt::Eval(expr))
+        let dialect_key = dialect_key_for_tree_sitter(syntax_spec, profile);
+        let (force_eval, expr) = parse_sexpr_via_tree_sitter(&dialect_key, trimmed)?;
+        classify_surface_stmt_from_expr(expr, force_eval, syntax_spec)
     }
 
     pub fn apply_stmt(&mut self, stmt: SurfaceStmt) -> Result<SurfaceOutcome> {
@@ -468,14 +607,26 @@ impl MeTTaSurfaceSession {
             let core_term = crate::metta_surface_he::he_lower_eval(expr, space_state)
                 .map_err(|e| anyhow!("HE lowering: {e}"))?;
             self.last_surface_diagnostics = Some(SurfaceEvalDiagnostics {
-                steps: 0, frontier_terms: 0, max_frontier: 0,
-                rewrite_calls: 0, cache_hits: 0, cache_misses: 0,
-                candidate_rules: 0, rule_checks: 0, rule_matches: 0,
-                child_rewrites: 0, ground_rewrites: 0,
-                memo_hits: 0, memo_misses: 0, memo_stores: 0,
+                steps: 0,
+                frontier_terms: 0,
+                max_frontier: 0,
+                rewrite_calls: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                candidate_rules: 0,
+                rule_checks: 0,
+                rule_matches: 0,
+                child_rewrites: 0,
+                ground_rewrites: 0,
+                memo_hits: 0,
+                memo_misses: 0,
+                memo_stores: 0,
                 memo_in_progress_blocks: 0,
-                truncated_by_branch_cap: 0, truncated_by_outcome_cap: false,
-                hit_step_cap: false, normal_forms: 1, elapsed_ms: 0.0,
+                truncated_by_branch_cap: 0,
+                truncated_by_outcome_cap: false,
+                hit_step_cap: false,
+                normal_forms: 1,
+                elapsed_ms: 0.0,
             });
             return Ok(vec![core_term]);
         }
@@ -745,7 +896,7 @@ impl MeTTaSurfaceSession {
 
         // MORK backend dispatch (feature-gated).
         #[cfg(feature = "mork-backend")]
-        if self.use_mork_backend {
+        if self.use_mork_backend && self.profile != SurfaceProfile::HE {
             use mettail_languages::mork_backend::{mork_eval, SExpr as MorkSExpr};
             fn to_mork(e: &SExpr) -> MorkSExpr {
                 match e {
@@ -772,6 +923,12 @@ impl MeTTaSurfaceSession {
             profile.normal_forms = surface_results.len();
             profile.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             return Ok((surface_results, profile));
+        }
+        #[cfg(feature = "mork-backend")]
+        if self.use_mork_backend && self.profile == SurfaceProfile::HE {
+            bail!(
+                "HE MORK must execute through core backend dispatch (run_backend), not surface-only rewrite path"
+            );
         }
         let index = RuleIndex::from_pattern_keys(
             space_state
@@ -1467,15 +1624,423 @@ impl MeTTaSurfaceSession {
     }
 }
 
-fn parse_mutable_space_stmt(expr: &SExpr) -> Option<SurfaceStmt> {
+fn syntax_config_from_profile(
+    profile: SurfaceProfile,
+) -> (SurfaceSyntaxPolicy, Option<SyntaxSpec>, bool, Option<String>) {
+    let dialect = match profile {
+        SurfaceProfile::HE => Some("he"),
+        SurfaceProfile::Legacy => None,
+    };
+    if let Some(dialect) = dialect {
+        match try_load_syntax_spec(dialect) {
+            Ok(Some(loaded)) => {
+                let policy = if loaded.spec.eval_prefix.bang_prefixed_word_is_symbol {
+                    SurfaceSyntaxPolicy::HyperonCompat
+                } else {
+                    SurfaceSyntaxPolicy::Strict
+                };
+                (policy, Some(loaded.spec), true, None)
+            },
+            Ok(None) => (
+                SurfaceSyntaxPolicy::HyperonCompat,
+                None,
+                true,
+                Some(
+                    "surface syntax spec required for HE profile, but no syntax artifacts were found"
+                        .to_string(),
+                ),
+            ),
+            Err(e) => (
+                SurfaceSyntaxPolicy::HyperonCompat,
+                None,
+                true,
+                Some(format!("failed to load HE syntax spec: {e}")),
+            ),
+        }
+    } else {
+        (
+            SurfaceSyntaxPolicy::Strict,
+            Some(legacy_builtin_syntax_spec().clone()),
+            false,
+            None,
+        )
+    }
+}
+
+fn lookup_plan_config_from_profile(
+    profile: SurfaceProfile,
+) -> (
+    Option<LookupPlanArtifact>,
+    Option<HashMap<String, LookupRelationMetadata>>,
+    bool,
+    Option<String>,
+) {
+    let dialect = match profile {
+        SurfaceProfile::HE => Some("he"),
+        SurfaceProfile::Legacy => None,
+    };
+    if let Some(dialect) = dialect {
+        match try_load_lookup_plan(dialect) {
+            Ok(Some(loaded)) => {
+                let metadata = relation_metadata_index(&loaded.artifact);
+                (Some(loaded.artifact), Some(metadata), true, None)
+            },
+            Ok(None) => (
+                None,
+                None,
+                true,
+                Some(
+                    "lookup-plan artifacts are required for HE profile, but no lookup-plan artifacts were found"
+                        .to_string(),
+                ),
+            ),
+            Err(e) => (
+                None,
+                None,
+                true,
+                Some(format!("failed to load HE lookup plan: {e}")),
+            ),
+        }
+    } else {
+        (None, None, false, None)
+    }
+}
+
+fn legacy_builtin_syntax_spec() -> &'static SyntaxSpec {
+    static LEGACY: OnceLock<SyntaxSpec> = OnceLock::new();
+    LEGACY.get_or_init(|| SyntaxSpec {
+        schema_version: 2,
+        dialect: "Legacy".to_string(),
+        lexer: LexerSpec {
+            line_comment_start: Some(";".to_string()),
+            supports_string_literals: true,
+            string_delimiter: "\"".to_string(),
+            escape_char: "\\".to_string(),
+            sexpr_open: "(".to_string(),
+            sexpr_close: ")".to_string(),
+            allow_hash_in_symbol: true,
+            reserve_hash_in_variable: true,
+            trim_ascii_whitespace: true,
+        },
+        eval_prefix: EvalPrefixPolicy {
+            prefix: "!".to_string(),
+            allow_whitespace_after_prefix: true,
+            allow_newline_after_prefix: true,
+            bang_prefixed_word_is_symbol: false,
+        },
+        lowering_heads: LoweringHeads::default(),
+        dispatch_policy: DispatchPolicy::default(),
+        command_heads: vec![
+            CommandHead {
+                head: "=".to_string(),
+                command: "defineEq".to_string(),
+                arity_min: 2,
+                arity_max: Some(2),
+            },
+            CommandHead {
+                head: ":".to_string(),
+                command: "defineType".to_string(),
+                arity_min: 2,
+                arity_max: Some(2),
+            },
+            CommandHead {
+                head: "add-atom!".to_string(),
+                command: "addAtom".to_string(),
+                arity_min: 1,
+                arity_max: Some(2),
+            },
+            CommandHead {
+                head: "remove-atom!".to_string(),
+                command: "removeAtom".to_string(),
+                arity_min: 1,
+                arity_max: Some(2),
+            },
+            CommandHead {
+                head: "new-space!".to_string(),
+                command: "newSpace".to_string(),
+                arity_min: 0,
+                arity_max: Some(1),
+            },
+            CommandHead {
+                head: "declare-memoized!".to_string(),
+                command: "declareMemoized".to_string(),
+                arity_min: 1,
+                arity_max: Some(2),
+            },
+            CommandHead {
+                head: "in-space".to_string(),
+                command: "inSpace".to_string(),
+                arity_min: 2,
+                arity_max: Some(2),
+            },
+        ],
+        head_aliases: vec![
+            crate::syntax_spec::SugarAlias {
+                alias: "add-atom".to_string(),
+                canonical: "add-atom!".to_string(),
+            },
+            crate::syntax_spec::SugarAlias {
+                alias: "remove-atom".to_string(),
+                canonical: "remove-atom!".to_string(),
+            },
+            crate::syntax_spec::SugarAlias {
+                alias: "new-space".to_string(),
+                canonical: "new-space!".to_string(),
+            },
+            crate::syntax_spec::SugarAlias {
+                alias: "declare-memoized".to_string(),
+                canonical: "declare-memoized!".to_string(),
+            },
+        ],
+        eval_space_aliases: vec![
+            crate::syntax_spec::EvalSpaceAlias {
+                head: "match".to_string(),
+                canonical_head: "match".to_string(),
+                arity: 2,
+            },
+            crate::syntax_spec::EvalSpaceAlias {
+                head: "unify".to_string(),
+                canonical_head: "unify".to_string(),
+                arity: 2,
+            },
+            crate::syntax_spec::EvalSpaceAlias {
+                head: "type-check".to_string(),
+                canonical_head: "type-check".to_string(),
+                arity: 2,
+            },
+            crate::syntax_spec::EvalSpaceAlias {
+                head: "cast".to_string(),
+                canonical_head: "cast".to_string(),
+                arity: 2,
+            },
+        ],
+        predicate_special_heads: vec![],
+    })
+}
+
+fn parser_backend_from_profile(_profile: SurfaceProfile) -> SurfaceParserBackend {
+    match std::env::var("METTAIL_PARSER_BACKEND") {
+        Ok(value) if value.eq_ignore_ascii_case("tree-sitter") => SurfaceParserBackend::TreeSitter,
+        _ => SurfaceParserBackend::LegacySExpr,
+    }
+}
+
+fn classify_surface_stmt_from_expr(
+    expr: SExpr,
+    force_eval: bool,
+    syntax_spec: Option<&SyntaxSpec>,
+) -> Result<Option<SurfaceStmt>> {
+    if force_eval {
+        if let Some(space_stmt) = parse_mutable_space_eval_stmt(&expr, syntax_spec) {
+            return Ok(Some(space_stmt));
+        }
+    }
+    if let Some(space_stmt) = parse_mutable_space_stmt(&expr, syntax_spec) {
+        return Ok(Some(space_stmt));
+    }
+    if let Some(space_stmt) = parse_in_space_mutable_stmt(&expr, syntax_spec) {
+        return Ok(Some(space_stmt));
+    }
+    if let Some((space, expr_in_space)) = parse_eval_space_stmt(&expr, syntax_spec) {
+        return Ok(Some(SurfaceStmt::EvalIn { space, expr: expr_in_space }));
+    }
+
+    if force_eval {
+        return Ok(Some(SurfaceStmt::Eval(expr)));
+    }
+
+    let syntax_spec = match syntax_spec {
+        Some(spec) => spec,
+        None => legacy_builtin_syntax_spec(),
+    };
+    if let SExpr::List(items) = &expr {
+        if items.len() == 3 {
+            if let SExpr::Atom(head) = &items[0] {
+                match command_for_head(head, syntax_spec) {
+                    Some(KnownCommand::DefineEq) => {
+                        return Ok(Some(SurfaceStmt::DefineEq(items[1].clone(), items[2].clone())));
+                    },
+                    Some(KnownCommand::DefineType) => {
+                        return Ok(Some(SurfaceStmt::DefineType(
+                            items[1].clone(),
+                            items[2].clone(),
+                        )));
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    Ok(Some(SurfaceStmt::Eval(expr)))
+}
+
+fn dialect_key_for_tree_sitter(
+    syntax_spec: Option<&SyntaxSpec>,
+    profile: SurfaceProfile,
+) -> String {
+    if let Some(spec) = syntax_spec {
+        let dialect = spec.dialect.to_ascii_lowercase();
+        if dialect.contains("petta") {
+            return "petta".to_string();
+        }
+        if dialect.contains("he") {
+            return "he".to_string();
+        }
+    }
+    match profile {
+        SurfaceProfile::HE => "he".to_string(),
+        SurfaceProfile::Legacy => "he".to_string(),
+    }
+}
+
+extern "C" {
+    fn tree_sitter_metta_he() -> TSLanguage;
+    fn tree_sitter_metta_petta() -> TSLanguage;
+}
+
+fn tree_sitter_language_for_dialect(dialect_key: &str) -> Result<TSLanguage> {
+    match dialect_key {
+        "he" => Ok(unsafe { tree_sitter_metta_he() }),
+        "petta" => Ok(unsafe { tree_sitter_metta_petta() }),
+        other => bail!("unsupported embedded tree-sitter dialect '{}'", other),
+    }
+}
+
+fn parse_sexpr_via_tree_sitter(dialect_key: &str, input: &str) -> Result<(bool, SExpr)> {
+    let mut parser = TSParser::new();
+    let language = tree_sitter_language_for_dialect(dialect_key)?;
+    parser.set_language(&language).map_err(|e| {
+        anyhow!("failed to set embedded tree-sitter language '{}': {e}", dialect_key)
+    })?;
+    let tree = parser
+        .parse(input, None)
+        .ok_or_else(|| anyhow!("embedded tree-sitter returned no parse tree"))?;
+    let root = tree.root_node();
+    if root.has_error() || root.is_error() {
+        bail!("embedded tree-sitter parse contains ERROR/MISSING nodes");
+    }
+    decode_tree_sitter_root(root, input)
+}
+
+fn decode_tree_sitter_root(root: TSNode<'_>, source: &str) -> Result<(bool, SExpr)> {
+    let mut tops = Vec::new();
+    for idx in 0..root.named_child_count() {
+        if let Some(child) = root.named_child(idx) {
+            if matches!(child.kind(), "eval_form" | "atom") {
+                tops.push(child);
+            }
+        }
+    }
+
+    if tops.is_empty() {
+        bail!("embedded tree-sitter parse produced no top-level form");
+    }
+    if tops.len() != 1 {
+        bail!(
+            "embedded tree-sitter parse produced {} top-level forms; expected exactly 1",
+            tops.len()
+        );
+    }
+
+    let top = tops[0];
+    if top.kind() == "eval_form" {
+        let atom = first_named_child_of_kind(top, "atom")
+            .ok_or_else(|| anyhow!("embedded tree-sitter eval_form missing atom child"))?;
+        return Ok((true, decode_tree_sitter_atom(atom, source)?));
+    }
+    Ok((false, decode_tree_sitter_atom(top, source)?))
+}
+
+fn first_named_child_of_kind<'a>(node: TSNode<'a>, kind: &str) -> Option<TSNode<'a>> {
+    (0..node.named_child_count())
+        .filter_map(|idx| node.named_child(idx))
+        .find(|child| child.kind() == kind)
+}
+
+fn decode_tree_sitter_atom(node: TSNode<'_>, source: &str) -> Result<SExpr> {
+    match node.kind() {
+        "atom" => {
+            let child = (0..node.named_child_count())
+                .filter_map(|idx| node.named_child(idx))
+                .find(|child| child.kind() != "comment")
+                .ok_or_else(|| anyhow!("embedded tree-sitter atom node has no concrete child"))?;
+            decode_tree_sitter_atom(child, source)
+        },
+        "symbol" | "variable" | "string" => {
+            let text = node
+                .utf8_text(source.as_bytes())
+                .map_err(|e| anyhow!("invalid utf8 span from embedded tree-sitter: {e}"))?;
+            Ok(SExpr::Atom(text.to_string()))
+        },
+        "list" => {
+            let mut items = Vec::new();
+            for idx in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(idx) {
+                    if child.kind() == "atom" {
+                        items.push(decode_tree_sitter_atom(child, source)?);
+                    }
+                }
+            }
+            Ok(SExpr::List(items))
+        },
+        other => bail!("unsupported embedded tree-sitter atom node kind '{}'", other),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownCommand {
+    DefineEq,
+    DefineType,
+    AddAtom,
+    RemoveAtom,
+    NewSpace,
+    DeclareMemoized,
+    InSpace,
+}
+
+fn known_command_from_name(name: &str) -> Option<KnownCommand> {
+    match name {
+        "defineEq" => Some(KnownCommand::DefineEq),
+        "defineType" => Some(KnownCommand::DefineType),
+        "addAtom" => Some(KnownCommand::AddAtom),
+        "removeAtom" => Some(KnownCommand::RemoveAtom),
+        "newSpace" => Some(KnownCommand::NewSpace),
+        "declareMemoized" => Some(KnownCommand::DeclareMemoized),
+        "inSpace" => Some(KnownCommand::InSpace),
+        _ => None,
+    }
+}
+
+fn command_for_head(head: &str, syntax_spec: &SyntaxSpec) -> Option<KnownCommand> {
+    let canonical_head: Cow<'_, str> = match syntax_spec
+        .head_aliases
+        .iter()
+        .find(|entry| entry.alias == head)
+    {
+        Some(alias) => Cow::Borrowed(alias.canonical.as_str()),
+        None => Cow::Borrowed(head),
+    };
+    syntax_spec
+        .command_heads
+        .iter()
+        .find(|entry| entry.head == canonical_head.as_ref())
+        .and_then(|entry| known_command_from_name(&entry.command))
+}
+
+fn parse_mutable_space_stmt(expr: &SExpr, syntax_spec: Option<&SyntaxSpec>) -> Option<SurfaceStmt> {
+    let syntax_spec = match syntax_spec {
+        Some(spec) => spec,
+        None => legacy_builtin_syntax_spec(),
+    };
     let SExpr::List(items) = expr else {
         return None;
     };
     let Some(SExpr::Atom(head)) = items.first() else {
         return None;
     };
-    match head.as_str() {
-        "add-atom!" | "add-atom" => match items.as_slice() {
+    match command_for_head(head, syntax_spec) {
+        Some(KnownCommand::AddAtom) => match items.as_slice() {
             [_op, atom_expr] => Some(SurfaceStmt::AddAtom {
                 space: DEFAULT_SPACE_IDENT.to_string(),
                 atom_expr: atom_expr.clone(),
@@ -1488,7 +2053,7 @@ fn parse_mutable_space_stmt(expr: &SExpr) -> Option<SurfaceStmt> {
             },
             _ => None,
         },
-        "remove-atom!" | "remove-atom" => match items.as_slice() {
+        Some(KnownCommand::RemoveAtom) => match items.as_slice() {
             [_op, atom_expr] => Some(SurfaceStmt::RemoveAtom {
                 space: DEFAULT_SPACE_IDENT.to_string(),
                 atom_expr: atom_expr.clone(),
@@ -1501,14 +2066,14 @@ fn parse_mutable_space_stmt(expr: &SExpr) -> Option<SurfaceStmt> {
             },
             _ => None,
         },
-        "new-space!" | "new-space" => match items.as_slice() {
+        Some(KnownCommand::NewSpace) => match items.as_slice() {
             [_op] => Some(SurfaceStmt::NewSpace { space: DEFAULT_SPACE_IDENT.to_string() }),
             [_op, SExpr::Atom(space)] if is_space_ident(space) => {
                 Some(SurfaceStmt::NewSpace { space: space.clone() })
             },
             _ => None,
         },
-        "declare-memoized!" | "declare-memoized" => match items.as_slice() {
+        Some(KnownCommand::DeclareMemoized) => match items.as_slice() {
             [_op, target] => {
                 extract_declared_memo_head(target).map(|head| SurfaceStmt::DeclareMemoized {
                     space: DEFAULT_SPACE_IDENT.to_string(),
@@ -1521,16 +2086,34 @@ fn parse_mutable_space_stmt(expr: &SExpr) -> Option<SurfaceStmt> {
             },
             _ => None,
         },
+        Some(KnownCommand::DefineEq) if items.len() == 3 => {
+            Some(SurfaceStmt::DefineEq(items[1].clone(), items[2].clone()))
+        },
+        Some(KnownCommand::DefineType) if items.len() == 3 => {
+            Some(SurfaceStmt::DefineType(items[1].clone(), items[2].clone()))
+        },
         _ => None,
     }
 }
 
-fn parse_mutable_space_eval_stmt(expr: &SExpr) -> Option<SurfaceStmt> {
+fn parse_mutable_space_eval_stmt(
+    expr: &SExpr,
+    syntax_spec: Option<&SyntaxSpec>,
+) -> Option<SurfaceStmt> {
+    let syntax_spec = match syntax_spec {
+        Some(spec) => spec,
+        None => legacy_builtin_syntax_spec(),
+    };
     let SExpr::List(items) = expr else {
         return None;
     };
     match items.as_slice() {
-        [SExpr::Atom(op)] if op == "new-space!" => Some(SurfaceStmt::AllocSpace),
+        [SExpr::Atom(op)]
+            if command_for_head(op, syntax_spec) == Some(KnownCommand::NewSpace)
+                && op.ends_with('!') =>
+        {
+            Some(SurfaceStmt::AllocSpace)
+        },
         _ => None,
     }
 }
@@ -1580,76 +2163,77 @@ fn retarget_surface_stmt(stmt: SurfaceStmt, default_space: &str) -> SurfaceStmt 
     }
 }
 
-fn parse_in_space_mutable_stmt(expr: &SExpr) -> Option<SurfaceStmt> {
+fn parse_in_space_mutable_stmt(
+    expr: &SExpr,
+    syntax_spec: Option<&SyntaxSpec>,
+) -> Option<SurfaceStmt> {
+    let syntax_spec = match syntax_spec {
+        Some(spec) => spec,
+        None => legacy_builtin_syntax_spec(),
+    };
     let SExpr::List(items) = expr else {
         return None;
     };
     let [SExpr::Atom(op), SExpr::Atom(space), inner] = items.as_slice() else {
         return None;
     };
-    if op != "in-space" || !is_space_ident(space) {
+    if command_for_head(op, syntax_spec) != Some(KnownCommand::InSpace) || !is_space_ident(space) {
         return None;
     }
 
-    if let Some(inner_stmt) = parse_mutable_space_stmt(inner) {
+    if let Some(inner_stmt) = parse_mutable_space_stmt(inner, Some(syntax_spec)) {
         return Some(retarget_surface_stmt(inner_stmt, space));
     }
 
     if let SExpr::List(inner_items) = inner {
-        if inner_items.len() == 3
-            && matches!(
-                inner_items.first(),
-                Some(SExpr::Atom(head)) if head == "=" || head == ":"
-            )
-        {
-            return Some(SurfaceStmt::AddAtom {
-                space: space.clone(),
-                atom_expr: inner.clone(),
-            });
+        if inner_items.len() == 3 {
+            if let Some(SExpr::Atom(head)) = inner_items.first() {
+                match command_for_head(head, syntax_spec) {
+                    Some(KnownCommand::DefineEq) | Some(KnownCommand::DefineType) => {
+                        return Some(SurfaceStmt::AddAtom {
+                            space: space.clone(),
+                            atom_expr: inner.clone(),
+                        });
+                    },
+                    _ => {},
+                }
+            }
         }
     }
 
     None
 }
 
-fn parse_eval_space_stmt(expr: &SExpr) -> Option<(String, SExpr)> {
+fn parse_eval_space_stmt(
+    expr: &SExpr,
+    syntax_spec: Option<&SyntaxSpec>,
+) -> Option<(String, SExpr)> {
+    let syntax_spec = match syntax_spec {
+        Some(spec) => spec,
+        None => legacy_builtin_syntax_spec(),
+    };
     let SExpr::List(items) = expr else {
         return None;
     };
     if let [SExpr::Atom(op), SExpr::Atom(space), expr] = items.as_slice() {
-        if op == "in-space" && is_space_ident(space) {
+        if command_for_head(op, syntax_spec) == Some(KnownCommand::InSpace) && is_space_ident(space)
+        {
             return Some((space.clone(), expr.clone()));
         }
     }
 
-    // HE-style explicit space argument aliases:
-    //   (match &tmp a b)      == (in-space &tmp (match a b))
-    //   (unify &tmp a b)      == (in-space &tmp (unify a b))
-    //   (type-check &tmp x T) == (in-space &tmp (type-check x T))
-    //   (cast &tmp x T)       == (in-space &tmp (cast x T))
     if let [SExpr::Atom(op), SExpr::Atom(space), rest @ ..] = items.as_slice() {
         if !is_space_ident(space) {
             return None;
         }
-        let lowered = match (op.as_str(), rest) {
-            ("match", [a, b]) => {
-                Some(SExpr::List(vec![SExpr::Atom("match".to_string()), a.clone(), b.clone()]))
-            },
-            ("unify", [a, b]) => {
-                Some(SExpr::List(vec![SExpr::Atom("unify".to_string()), a.clone(), b.clone()]))
-            },
-            ("type-check", [atom, ty]) => Some(SExpr::List(vec![
-                SExpr::Atom("type-check".to_string()),
-                atom.clone(),
-                ty.clone(),
-            ])),
-            ("cast", [atom, ty]) => {
-                Some(SExpr::List(vec![SExpr::Atom("cast".to_string()), atom.clone(), ty.clone()]))
-            },
-            _ => None,
-        };
-        if let Some(expr_in_space) = lowered {
-            return Some((space.clone(), expr_in_space));
+        // Spec-driven `(head &space ...)` aliases; keeps parser policy out of hardcoded Rust branches.
+        for alias in &syntax_spec.eval_space_aliases {
+            if op == &alias.head && rest.len() as u64 == alias.arity {
+                let mut lowered = Vec::with_capacity(rest.len() + 1);
+                lowered.push(SExpr::Atom(alias.canonical_head.clone()));
+                lowered.extend(rest.iter().cloned());
+                return Some((space.clone(), SExpr::List(lowered)));
+            }
         }
     }
 
@@ -2490,8 +3074,13 @@ fn split_top_level_args(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syntax_spec::{
+        CommandHead, DispatchPolicy, EvalPrefixPolicy, LexerSpec, LoweringHeads, SyntaxSpec,
+    };
+    use crate::test_env::acquire_env_lock;
     use mettail_languages::mettafull_legacy::MeTTaFullStateLanguage;
     use mettail_runtime::Language;
+    use std::fs;
 
     fn assert_any_term_contains(terms: &[String], needle: &str, message: &str) {
         assert!(terms.iter().any(|t| t.contains(needle)), "{}: {:?}", message, terms);
@@ -2524,6 +3113,121 @@ mod tests {
         displays
     }
 
+    fn make_test_syntax_spec(command_heads: Vec<CommandHead>) -> SyntaxSpec {
+        SyntaxSpec {
+            schema_version: 2,
+            dialect: "TestDialect".to_string(),
+            lexer: LexerSpec {
+                line_comment_start: Some(";".to_string()),
+                supports_string_literals: true,
+                string_delimiter: "\"".to_string(),
+                escape_char: "\\".to_string(),
+                sexpr_open: "(".to_string(),
+                sexpr_close: ")".to_string(),
+                allow_hash_in_symbol: true,
+                reserve_hash_in_variable: true,
+                trim_ascii_whitespace: true,
+            },
+            eval_prefix: EvalPrefixPolicy {
+                prefix: "!".to_string(),
+                allow_whitespace_after_prefix: true,
+                allow_newline_after_prefix: true,
+                bang_prefixed_word_is_symbol: false,
+            },
+            lowering_heads: LoweringHeads::default(),
+            dispatch_policy: DispatchPolicy::default(),
+            command_heads,
+            head_aliases: vec![],
+            eval_space_aliases: vec![],
+            predicate_special_heads: vec![],
+        }
+    }
+
+    fn policy_from_spec(spec: &SyntaxSpec) -> SurfaceSyntaxPolicy {
+        if spec.eval_prefix.bang_prefixed_word_is_symbol {
+            SurfaceSyntaxPolicy::HyperonCompat
+        } else {
+            SurfaceSyntaxPolicy::Strict
+        }
+    }
+
+    fn load_real_syntax_spec(dialect: &str) -> SyntaxSpec {
+        let loaded = try_load_syntax_spec(dialect)
+            .expect("syntax spec load should not fail")
+            .expect("syntax spec should be present in artifacts");
+        loaded.spec
+    }
+
+    fn fixture_path(path: &str) -> String {
+        let direct = std::path::PathBuf::from(path);
+        if direct.exists() {
+            return direct.display().to_string();
+        }
+        let from_manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+        if from_manifest.exists() {
+            return from_manifest.display().to_string();
+        }
+        let from_manifest_parent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(path);
+        from_manifest_parent.display().to_string()
+    }
+
+    fn coalesced_forms(path: &str) -> Vec<String> {
+        let resolved = fixture_path(path);
+        let content = fs::read_to_string(&resolved).expect("fixture file should be readable");
+        let forms =
+            crate::run_metta_file::coalesce_source_forms(&content, &resolved, DEFAULT_SPACE_IDENT)
+                .expect("coalesce should succeed");
+        forms
+            .into_iter()
+            .map(|entry| entry.text.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    fn assert_backend_parity_for_forms(spec: &SyntaxSpec, forms: &[String], label: &str) {
+        let policy = policy_from_spec(spec);
+        for input in forms {
+            let legacy =
+                MeTTaSurfaceSession::parse_line_with_legacy_syntax(input, policy, Some(spec));
+            let tree = MeTTaSurfaceSession::parse_line_with_tree_sitter(
+                input,
+                policy,
+                Some(spec),
+                SurfaceProfile::HE,
+            );
+            match (legacy, tree) {
+                (Ok(left), Ok(right)) => {
+                    assert_eq!(left, right, "backend mismatch for {label} input: {input}");
+                },
+                (Err(_), Err(_)) => {},
+                (left, right) => panic!(
+                    "backend mismatch for {label} input: {input}; legacy={left:?} tree={right:?}"
+                ),
+            }
+        }
+    }
+
+    fn assert_backend_parity_for_negative_cases(spec: &SyntaxSpec, label: &str, cases: &[&str]) {
+        let policy = policy_from_spec(spec);
+        for input in cases {
+            let legacy =
+                MeTTaSurfaceSession::parse_line_with_legacy_syntax(input, policy, Some(spec));
+            let tree = MeTTaSurfaceSession::parse_line_with_tree_sitter(
+                input,
+                policy,
+                Some(spec),
+                SurfaceProfile::HE,
+            );
+            assert_eq!(
+                legacy.is_err(),
+                tree.is_err(),
+                "negative-case parse mismatch for {label} input: {input}; legacy={legacy:?} tree={tree:?}"
+            );
+        }
+    }
+
     #[test]
     fn parse_eq_definition() {
         let stmt = MeTTaSurfaceSession::parse_line("(= (foo true) false)").expect("should parse");
@@ -2540,6 +3244,163 @@ mod tests {
             SurfaceStmt::Eval(_) => {},
             _ => panic!("expected Eval"),
         }
+    }
+
+    #[test]
+    fn parse_standalone_bang_hyperon_compat_is_noop() {
+        let parsed =
+            MeTTaSurfaceSession::parse_line_with_policy("!", SurfaceSyntaxPolicy::HyperonCompat)
+                .expect("compat parse should succeed");
+        assert!(parsed.is_none(), "standalone bang should be a no-op in compat mode");
+    }
+
+    #[test]
+    fn parse_standalone_bang_strict_is_error() {
+        let parsed = MeTTaSurfaceSession::parse_line_with_policy("!", SurfaceSyntaxPolicy::Strict);
+        assert!(parsed.is_err(), "standalone bang should error in strict mode");
+    }
+
+    #[test]
+    fn he_profile_defaults_to_hyperon_compat() {
+        let session = MeTTaSurfaceSession::with_profile(SurfaceProfile::HE);
+        assert_eq!(session.syntax_policy(), SurfaceSyntaxPolicy::HyperonCompat);
+    }
+
+    #[test]
+    fn he_profile_defaults_to_legacy_parser_backend() {
+        let _guard = acquire_env_lock();
+        std::env::remove_var("METTAIL_PARSER_BACKEND");
+        let session = MeTTaSurfaceSession::with_profile(SurfaceProfile::HE);
+        assert_eq!(session.parser_backend(), SurfaceParserBackend::LegacySExpr);
+    }
+
+    #[test]
+    fn env_can_select_tree_sitter_parser_backend() {
+        let _guard = acquire_env_lock();
+        std::env::set_var("METTAIL_PARSER_BACKEND", "tree-sitter");
+        let session = MeTTaSurfaceSession::with_profile(SurfaceProfile::HE);
+        std::env::remove_var("METTAIL_PARSER_BACKEND");
+        assert_eq!(session.parser_backend(), SurfaceParserBackend::TreeSitter);
+    }
+
+    #[test]
+    fn tree_sitter_backend_matches_legacy_parser_for_core_forms() {
+        let he_spec = load_real_syntax_spec("he");
+        let cases = [
+            "(= (double $x) (+ $x $x))",
+            "!(+ 1 2)",
+            "!(match &self (= (color) $x) $x)",
+            "(: Add (-> Nat Nat Nat))",
+        ];
+
+        for input in cases {
+            let legacy = MeTTaSurfaceSession::parse_line_with_legacy_syntax(
+                input,
+                SurfaceSyntaxPolicy::HyperonCompat,
+                Some(&he_spec),
+            )
+            .expect("legacy parse should succeed");
+            let tree = MeTTaSurfaceSession::parse_line_with_tree_sitter(
+                input,
+                SurfaceSyntaxPolicy::HyperonCompat,
+                Some(&he_spec),
+                SurfaceProfile::HE,
+            )
+            .expect("tree-sitter parse should succeed");
+            assert_eq!(
+                tree, legacy,
+                "embedded tree-sitter parse should match legacy parse for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn he_profile_requires_syntax_spec_when_missing() {
+        let _guard = acquire_env_lock();
+        let dir = format!(".artifacts/test-runtime/missing_he_spec_{}", std::process::id());
+        fs::create_dir_all(&dir).expect("artifact dir should be creatable");
+        std::env::set_var("METTAIL_SYNTAX_SPEC_DIR", &dir);
+        let session = MeTTaSurfaceSession::with_profile(SurfaceProfile::HE);
+        let err = session
+            .parse_line_for_session("!(foo)")
+            .expect_err("HE parse should fail when syntax spec is missing");
+        assert!(
+            err.to_string()
+                .contains("surface syntax spec required for HE profile"),
+            "unexpected error: {err}"
+        );
+        std::env::remove_var("METTAIL_SYNTAX_SPEC_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn he_profile_requires_lookup_plan_when_missing() {
+        let _guard = acquire_env_lock();
+        let lookup_dir =
+            format!(".artifacts/test-runtime/missing_he_lookup_plan_{}", std::process::id());
+        fs::create_dir_all(&lookup_dir).expect("artifact dir should be creatable");
+
+        let syntax_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts/syntax");
+        std::env::set_var("METTAIL_SYNTAX_SPEC_DIR", &syntax_dir);
+        std::env::set_var("METTAIL_LOOKUP_PLAN_DIR", &lookup_dir);
+
+        let session = MeTTaSurfaceSession::with_profile(SurfaceProfile::HE);
+        let err = session
+            .parse_line_for_session("!(foo)")
+            .expect_err("HE parse should fail when lookup plan is missing");
+        assert!(
+            err.to_string()
+                .contains("lookup-plan artifacts are required for HE profile"),
+            "unexpected error: {err}"
+        );
+
+        std::env::remove_var("METTAIL_SYNTAX_SPEC_DIR");
+        std::env::remove_var("METTAIL_LOOKUP_PLAN_DIR");
+        let _ = fs::remove_dir_all(&lookup_dir);
+    }
+
+    #[test]
+    fn backend_parity_he_fixture_file() {
+        let he_spec = load_real_syntax_spec("he");
+        let forms = coalesced_forms("repl/src/examples/petta_adapted/he_minimalmetta.metta");
+        assert!(!forms.is_empty(), "fixture should provide parse inputs");
+        assert_backend_parity_for_forms(&he_spec, &forms, "he_minimalmetta");
+    }
+
+    #[test]
+    fn backend_parity_petta_fixture_file() {
+        let petta_spec = load_real_syntax_spec("petta");
+        let forms = coalesced_forms("repl/src/examples/petta_adapted/comments.metta");
+        assert!(!forms.is_empty(), "fixture should provide parse inputs");
+        assert_backend_parity_for_forms(&petta_spec, &forms, "petta_comments");
+    }
+
+    #[test]
+    fn backend_parity_negative_cases_he_and_petta() {
+        let he_spec = load_real_syntax_spec("he");
+        let petta_spec = load_real_syntax_spec("petta");
+        let cases = ["(= (foo bar)", "!((", "!(foo))"];
+        assert_backend_parity_for_negative_cases(&he_spec, "he", &cases);
+        assert_backend_parity_for_negative_cases(&petta_spec, "petta", &cases);
+    }
+
+    #[test]
+    fn parse_uses_syntax_spec_command_heads_for_define_eq() {
+        let spec = make_test_syntax_spec(vec![CommandHead {
+            head: "eqdef".to_string(),
+            command: "defineEq".to_string(),
+            arity_min: 2,
+            arity_max: Some(2),
+        }]);
+        let parsed = MeTTaSurfaceSession::parse_line_with_legacy_syntax(
+            "(eqdef foo bar)",
+            SurfaceSyntaxPolicy::Strict,
+            Some(&spec),
+        )
+        .expect("parse should succeed")
+        .expect("statement should be produced");
+        assert!(matches!(parsed, SurfaceStmt::DefineEq(_, _)));
     }
 
     #[test]

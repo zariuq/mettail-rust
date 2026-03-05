@@ -7,7 +7,11 @@ use mettail_languages::mettahe_from_lean::MeTTaHELanguage;
 use mettail_runtime::Language;
 
 fn all_displays(results: &mettail_runtime::AscentResults) -> Vec<String> {
-    results.all_terms.iter().map(|t| t.display.clone()).collect()
+    results
+        .all_terms
+        .iter()
+        .map(|t| t.display.clone())
+        .collect()
 }
 
 fn run_he(input: &str) -> mettail_runtime::AscentResults {
@@ -22,12 +26,12 @@ fn run_he(input: &str) -> mettail_runtime::AscentResults {
 
 #[test]
 fn r16_return_reaches_done() {
-    let results = run_he(
-        "C_State(C_Return(C_SymAtom(hello)), C_Space(C_ExprNil), C_Empty)",
-    );
+    let results = run_he("C_State(C_Return(C_SymAtom(hello)), C_Space(C_ExprNil), C_Empty)");
     let displays = all_displays(&results);
     assert!(
-        displays.iter().any(|d| d.contains("C_Done") && d.contains("C_SymAtom(hello)")),
+        displays
+            .iter()
+            .any(|d| d.contains("C_Done") && d.contains("C_SymAtom(hello)")),
         "expected C_Done carrying C_SymAtom(hello), got: {displays:?}"
     );
 }
@@ -36,12 +40,12 @@ fn r16_return_reaches_done() {
 
 #[test]
 fn r0_r16_empty_atom_returns_immediately() {
-    let results = run_he(
-        "C_State(C_Metta(C_Empty, C_AtomType), C_Space(C_ExprNil), C_Empty)",
-    );
+    let results = run_he("C_State(C_Metta(C_Empty, C_AtomType), C_Space(C_ExprNil), C_Empty)");
     let displays = all_displays(&results);
     assert!(
-        displays.iter().any(|d| d.contains("C_Done") && d.contains("C_Empty")),
+        displays
+            .iter()
+            .any(|d| d.contains("C_Done") && d.contains("C_Empty")),
         "expected C_Done with C_Empty result, got: {displays:?}"
     );
 }
@@ -51,12 +55,13 @@ fn r0_r16_empty_atom_returns_immediately() {
 #[test]
 fn r2_r16_symbol_matches_atom_type() {
     // C_AtomType matches everything → R2 fires → Return → Done
-    let results = run_he(
-        "C_State(C_Metta(C_SymAtom(foo), C_AtomType), C_Space(C_ExprNil), C_Empty)",
-    );
+    let results =
+        run_he("C_State(C_Metta(C_SymAtom(foo), C_AtomType), C_Space(C_ExprNil), C_Empty)");
     let displays = all_displays(&results);
     assert!(
-        displays.iter().any(|d| d.contains("C_Done") && d.contains("C_SymAtom(foo)")),
+        displays
+            .iter()
+            .any(|d| d.contains("C_Done") && d.contains("C_SymAtom(foo)")),
         "expected C_Done with C_SymAtom(foo), got: {displays:?}"
     );
 }
@@ -66,12 +71,13 @@ fn r2_r16_symbol_matches_atom_type() {
 #[test]
 fn r3_symbol_undefined_type_goes_to_typecast() {
     // C_SymAtom has metaType=SymbolType ≠ UndefinedType → R3 fires
-    let results = run_he(
-        "C_State(C_Metta(C_SymAtom(foo), C_UndefinedType), C_Space(C_ExprNil), C_Empty)",
-    );
+    let results =
+        run_he("C_State(C_Metta(C_SymAtom(foo), C_UndefinedType), C_Space(C_ExprNil), C_Empty)");
     let displays = all_displays(&results);
     assert!(
-        displays.iter().any(|d| d.contains("C_TypeCast(C_SymAtom(foo)")),
+        displays
+            .iter()
+            .any(|d| d.contains("C_TypeCast(C_SymAtom(foo)")),
         "expected C_TypeCast for symbol with UndefinedType, got: {displays:?}"
     );
 }
@@ -84,26 +90,26 @@ fn eq_nondet_two_matching_equations() {
     // Start at MettaCall with (f a) — both R12 branches should fire.
     let results = run_he(concat!(
         "C_State(",
-          "C_MettaCall(",
-            "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
-            "C_AtomType",
-          "),",
-          "C_Space(",
-            "C_ExprCons(",
-              "C_EqAtom(",
-                "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
-                "C_SymAtom(result1)",
-              "),",
-              "C_ExprCons(",
-                "C_EqAtom(",
-                  "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
-                  "C_SymAtom(result2)",
-                "),",
-                "C_ExprNil",
-              ")",
-            ")",
-          "),",
-          "C_Empty",
+        "C_MettaCall(",
+        "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
+        "C_AtomType",
+        "),",
+        "C_Space(",
+        "C_ExprCons(",
+        "C_EqAtom(",
+        "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
+        "C_SymAtom(result1)",
+        "),",
+        "C_ExprCons(",
+        "C_EqAtom(",
+        "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
+        "C_SymAtom(result2)",
+        "),",
+        "C_ExprNil",
+        ")",
+        ")",
+        "),",
+        "C_Empty",
         ")"
     ));
     let displays = all_displays(&results);
@@ -128,26 +134,26 @@ fn eq_dedup_same_rhs_produces_one_result() {
     // Ascent should dedup → only one C_Metta(same, ...) branch
     let results = run_he(concat!(
         "C_State(",
-          "C_MettaCall(",
-            "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
-            "C_AtomType",
-          "),",
-          "C_Space(",
-            "C_ExprCons(",
-              "C_EqAtom(",
-                "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
-                "C_SymAtom(same)",
-              "),",
-              "C_ExprCons(",
-                "C_EqAtom(",
-                  "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
-                  "C_SymAtom(same)",
-                "),",
-                "C_ExprNil",
-              ")",
-            ")",
-          "),",
-          "C_Empty",
+        "C_MettaCall(",
+        "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
+        "C_AtomType",
+        "),",
+        "C_Space(",
+        "C_ExprCons(",
+        "C_EqAtom(",
+        "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
+        "C_SymAtom(same)",
+        "),",
+        "C_ExprCons(",
+        "C_EqAtom(",
+        "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
+        "C_SymAtom(same)",
+        "),",
+        "C_ExprNil",
+        ")",
+        ")",
+        "),",
+        "C_Empty",
         ")"
     ));
     let displays = all_displays(&results);
@@ -164,20 +170,20 @@ fn eq_no_match_falls_through_to_return() {
     // Space has (= (g b) result1) but we query (f a) — no match
     let results = run_he(concat!(
         "C_State(",
-          "C_MettaCall(",
-            "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
-            "C_AtomType",
-          "),",
-          "C_Space(",
-            "C_ExprCons(",
-              "C_EqAtom(",
-                "C_ExprCons(C_SymAtom(g), C_ExprCons(C_SymAtom(b), C_ExprNil)),",
-                "C_SymAtom(result1)",
-              "),",
-              "C_ExprNil",
-            ")",
-          "),",
-          "C_Empty",
+        "C_MettaCall(",
+        "C_ExprCons(C_SymAtom(f), C_ExprCons(C_SymAtom(a), C_ExprNil)),",
+        "C_AtomType",
+        "),",
+        "C_Space(",
+        "C_ExprCons(",
+        "C_EqAtom(",
+        "C_ExprCons(C_SymAtom(g), C_ExprCons(C_SymAtom(b), C_ExprNil)),",
+        "C_SymAtom(result1)",
+        "),",
+        "C_ExprNil",
+        ")",
+        "),",
+        "C_Empty",
         ")"
     ));
     let displays = all_displays(&results);
@@ -188,7 +194,9 @@ fn eq_no_match_falls_through_to_return() {
     );
     // The original atom (f a) should be returned unchanged
     assert!(
-        displays.iter().any(|d| d.contains("C_Done") && d.contains("C_SymAtom(f)")),
+        displays
+            .iter()
+            .any(|d| d.contains("C_Done") && d.contains("C_SymAtom(f)")),
         "expected original atom (f a) in Done result, got: {displays:?}"
     );
 }
@@ -261,7 +269,9 @@ fn grounded_add_via_mettacall_after_passthrough() {
     ));
     let displays = all_displays(&results);
     assert!(
-        displays.iter().any(|d| d.contains("C_Done") && d.contains("C_GInt(C_5)")),
+        displays
+            .iter()
+            .any(|d| d.contains("C_Done") && d.contains("C_GInt(C_5)")),
         "expected C_Done with C_GInt(C_5) for (+ 3 2), got: {displays:?}"
     );
 }
@@ -308,7 +318,9 @@ fn e2e_double_5_equals_10() {
     ));
     let displays = all_displays(&results);
     assert!(
-        displays.iter().any(|d| d.contains("C_Done") && d.contains("C_GInt(C_10)")),
+        displays
+            .iter()
+            .any(|d| d.contains("C_Done") && d.contains("C_GInt(C_10)")),
         "expected C_Done with C_GInt(C_10) for (double 5), got: {displays:?}"
     );
 }

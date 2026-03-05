@@ -7,7 +7,7 @@ use mettail_repl::{build_registry, Repl};
 #[command(name = "mettail")]
 #[command(about = "Interactive term exploration for programming languages", long_about = None)]
 #[command(
-    after_help = "Examples:\n  mettail --lang mettafullstate --run-metta-file repl/src/examples/mettafullstate_surface.metta --report jsonl --report-file .artifacts/ci/surface.jsonl\n  mettail --lang mettafullstate --run-metta-file .artifacts/tmp/fib10.metta --surface-fuel 1024 --surface-deterministic\n  mettail --run-mm2-file ../MORK/examples/fibonacci_unfold_fold/fibonacci_bottom_up.mm2 --mm2-max-steps 200\n  mettail --lang mettafullstate -c \"(= foo true)\" -c \"!foo\"\n  mettail mettafullstate --interactive"
+    after_help = "Examples:\n  mettail --lang mettafullstate --run-metta-file repl/src/examples/mettafullstate_surface.metta --report jsonl --report-file .artifacts/ci/surface.jsonl\n  mettail --lang mettahe --parser-backend tree-sitter --run-metta-file ../hyperon-experimental/python/tests/scripts/b4_nondeterm.metta\n  mettail --lang mettafullstate --run-metta-file .artifacts/tmp/fib10.metta --surface-fuel 1024 --surface-deterministic\n  mettail --run-mm2-file ../MORK/examples/fibonacci_unfold_fold/fibonacci_bottom_up.mm2 --mm2-max-steps 200\n  mettail --lang mettafullstate -c \"(= foo true)\" -c \"!foo\"\n  mettail mettafullstate --interactive"
 )]
 struct Args {
     /// Language to load on startup (positional form)
@@ -33,6 +33,10 @@ struct Args {
     /// Optional report output path for --run-metta-file
     #[arg(long, value_name = "PATH")]
     report_file: Option<String>,
+
+    /// Surface parser backend: legacy|tree-sitter
+    #[arg(long, value_name = "BACKEND", value_parser = ["legacy", "tree-sitter"])]
+    parser_backend: Option<String>,
 
     /// Run a REPL command non-interactively (repeatable)
     #[arg(short = 'c', long = "command", value_name = "CMD")]
@@ -93,6 +97,10 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(backend) = &args.parser_backend {
+        std::env::set_var("METTAIL_PARSER_BACKEND", backend);
+    }
 
     if args.report_file.is_some() && args.run_metta_file.is_none() {
         anyhow::bail!("--report-file requires --run-metta-file");

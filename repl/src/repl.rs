@@ -1,7 +1,8 @@
 use crate::examples::{Example, ExampleCategory};
+use crate::lookup_plan::{try_load_lookup_plan, validate_he_mork_backend_contract};
 use crate::metta_surface::{
     extract_state_out_atom, looks_like_surface_metta, MeTTaSurfaceSession, SurfaceOutcome,
-    SurfaceProfile, SurfaceStmt,
+    SurfaceProfile, SurfaceStmt, SurfaceSyntaxPolicy,
 };
 use crate::pretty::format_term_pretty;
 use crate::registry::LanguageRegistry;
@@ -79,10 +80,10 @@ fn is_identifier_char(b: u8) -> bool {
 
 use crate::run_metta_file::{
     expand_import_directive_from_source, expand_metta_file_with_imports, expected_surface_mismatch,
-    parse_batch_capture_assignment, parse_import_directive, retarget_surface_stmt,
-    run_metta_file_report_json, run_metta_file_report_jsonl, split_run_metta_file_line,
-    substitute_batch_bindings, BatchBindingEvent, ImportExpansionMeta, RunMettaFileEntry,
-    RunReportMode, RuntimeImportStats, DEFAULT_BATCH_SPACE_IDENT,
+    is_hyperon_compat_ignorable_prose_line, parse_batch_capture_assignment, parse_import_directive,
+    retarget_surface_stmt, run_metta_file_report_json, run_metta_file_report_jsonl,
+    split_run_metta_file_line, substitute_batch_bindings, BatchBindingEvent, ImportExpansionMeta,
+    RunMettaFileEntry, RunReportMode, RuntimeImportStats, DEFAULT_BATCH_SPACE_IDENT,
 };
 
 /// The main REPL
@@ -160,6 +161,61 @@ impl Repl {
             }
         }
         SurfaceProfile::Legacy
+    }
+
+    fn required_lookup_plan_dialect(&self) -> Option<&'static str> {
+        let language_name = self.state.language_name()?;
+        if language_name.eq_ignore_ascii_case("mettahe") {
+            return Some("he");
+        }
+        if language_name.to_ascii_lowercase().contains("petta") {
+            return Some("petta");
+        }
+        None
+    }
+
+    fn ensure_lookup_plan_contract_for_active_language(&self) -> Result<()> {
+        let Some(dialect_key) = self.required_lookup_plan_dialect() else {
+            return Ok(());
+        };
+        match try_load_lookup_plan(dialect_key) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => anyhow::bail!(
+                "lookup-plan artifacts are required for language '{}': missing {}.lookup_plan.json/checksum",
+                self.state.language_name().unwrap_or("<unknown>"),
+                dialect_key
+            ),
+            Err(e) => anyhow::bail!(
+                "failed to load lookup-plan artifacts for language '{}': {}",
+                self.state.language_name().unwrap_or("<unknown>"),
+                e
+            ),
+        }
+    }
+
+    fn ensure_core_backend_contract_for_active_language(
+        &self,
+        backend: RuntimeBackend,
+    ) -> Result<()> {
+        let Some(language_name) = self.state.language_name() else {
+            return Ok(());
+        };
+
+        if !language_name.eq_ignore_ascii_case("mettahe") {
+            return Ok(());
+        }
+        if !matches!(backend, RuntimeBackend::Mork) {
+            return Ok(());
+        }
+
+        let loaded = try_load_lookup_plan("he")?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "HE MORK backend requires Lean lookup-plan artifacts: missing he.lookup_plan.json/checksum"
+            )
+        })?;
+        validate_he_mork_backend_contract(&loaded.artifact).map_err(|e| {
+            anyhow::anyhow!("HE MORK backend contract check failed against Lean artifact: {e}")
+        })
     }
 
     fn ensure_metta_surface_session(&mut self) -> &mut MeTTaSurfaceSession {
@@ -1010,6 +1066,7 @@ impl Repl {
                 "run-metta-file is only available for languages that support surface .metta execution."
             );
         }
+        self.ensure_lookup_plan_contract_for_active_language()?;
         let language_name = self
             .state
             .language_name()
@@ -1276,11 +1333,21 @@ impl Repl {
             backend: Some(if mork_backend {
                 RuntimeBackend::Mork
             } else {
-                RuntimeBackend::Ascent
+                RuntimeBackend::Auto
             }),
             mork_rule_copies,
             mork_max_steps,
         };
+        let requested_backend = run_execution_policy.backend.unwrap_or(RuntimeBackend::Auto);
+        let resolved_backend = if matches!(requested_backend, RuntimeBackend::Auto)
+            && language.name() == "MeTTaHE"
+            && language.supports_backend(RuntimeBackend::Mork)
+        {
+            RuntimeBackend::Mork
+        } else {
+            requested_backend
+        };
+        self.ensure_core_backend_contract_for_active_language(resolved_backend)?;
         let runtime_hints = self.current_runtime_optimization_hints();
         let dispatch_contracts = resolve_runtime_dispatch_contracts(runtime_hints);
         let surface_policy = run_execution_policy.surface_policy_label(runtime_hints);
@@ -1290,6 +1357,12 @@ impl Repl {
             println!();
             println!("{} {}", "Running MeTTa file:".bold(), file_path.cyan());
         }
+
+        let surface_syntax_policy = if self.supports_surface_metta_runner() {
+            Some(self.ensure_metta_surface_session().syntax_policy())
+        } else {
+            None
+        };
 
         let mut logical_line_num = 0usize;
         while let Some(expanded_line) = pending_lines.pop_front() {
@@ -1317,6 +1390,15 @@ impl Repl {
             } else {
                 line_substituted.clone()
             };
+
+            if capture_binding.is_none()
+                && expected_surface.is_none()
+                && surface_syntax_policy == Some(SurfaceSyntaxPolicy::HyperonCompat)
+                && is_hyperon_compat_ignorable_prose_line(&run_line)
+            {
+                skipped += 1;
+                continue;
+            }
 
             if capture_binding.is_none() {
                 if let Some((source_space, import_path)) = parse_import_directive(&run_line) {
@@ -1459,14 +1541,19 @@ impl Repl {
             if quiet_run {
                 self.suppress_output = true;
             }
-            let run_result =
-                if self.supports_surface_metta_runner() && looks_like_surface_metta(&run_line)
+            let run_result = if self.supports_surface_metta_runner()
+                && looks_like_surface_metta(&run_line)
             {
-                match MeTTaSurfaceSession::parse_line(&run_line) {
-                    Ok(parsed_stmt) => {
+                let parsed = {
+                    let session = self.ensure_metta_surface_session();
+                    session.parse_line_for_session(&run_line)
+                };
+                match parsed {
+                    Ok(Some(parsed_stmt)) => {
                         let stmt = retarget_surface_stmt(parsed_stmt, &expanded_line.default_space);
                         self.exec_surface_stmt(stmt, /* step_mode: */ false)
                     },
+                    Ok(None) => Ok(()),
                     Err(e) => Err(anyhow::anyhow!(
                         "line {} invalid MeTTa surface statement after substitutions: {}",
                         line_num,
@@ -1652,13 +1739,11 @@ impl Repl {
 
                     // Check for language-level assertion errors in surface results.
                     // C_AError atoms indicate assertEqual/assertEqualToResult failures.
-                    let has_assertion_error = surface_results
-                        .as_ref()
-                        .is_some_and(|results| {
-                            results
-                                .iter()
-                                .any(|r| r.contains("C_AError(") || r.contains("AError("))
-                        });
+                    let has_assertion_error = surface_results.as_ref().is_some_and(|results| {
+                        results
+                            .iter()
+                            .any(|r| r.contains("C_AError(") || r.contains("AError("))
+                    });
 
                     if has_assertion_error {
                         failed += 1;
@@ -1757,6 +1842,11 @@ impl Repl {
 
         self.execution_policy_override = prev_execution_policy_override;
 
+        let lookup_relation_metadata = self
+            .metta_surface_session
+            .as_ref()
+            .and_then(|session| session.lookup_relation_metadata());
+
         let report_payload = match report_mode {
             RunReportMode::Text => {
                 println!();
@@ -1781,6 +1871,7 @@ impl Repl {
                 },
                 surface_policy,
                 dispatch_contracts,
+                lookup_relation_metadata,
             )),
             RunReportMode::Jsonl => Some(run_metta_file_report_jsonl(
                 file_path,
@@ -1796,6 +1887,7 @@ impl Repl {
                 },
                 surface_policy,
                 dispatch_contracts,
+                lookup_relation_metadata,
             )),
         };
 
@@ -2114,11 +2206,17 @@ impl Repl {
         self.last_surface_results = None;
         self.last_core_diagnostics = None;
         if self.supports_surface_metta_runner() && looks_like_surface_metta(term_str) {
-            let stmt = MeTTaSurfaceSession::parse_line(term_str)?;
-            return self.exec_surface_stmt(stmt, step_mode);
+            let parsed = {
+                let session = self.ensure_metta_surface_session();
+                session.parse_line_for_session(term_str)?
+            };
+            if let Some(stmt) = parsed {
+                return self.exec_surface_stmt(stmt, step_mode);
+            }
+            return Ok(());
         }
 
-        self.exec_or_step_core_term(term_str, step_mode)
+        self.exec_or_step_core_term(term_str, step_mode, self.execution_policy_override.backend)
     }
 
     fn exec_surface_stmt(&mut self, stmt: SurfaceStmt, step_mode: bool) -> Result<()> {
@@ -2129,10 +2227,11 @@ impl Repl {
         let surface_first_branch_only = effective_surface_policy.first_branch_only;
         let exact_priority_override = Some(effective_surface_policy.exact_priority);
         let recursive_memo_override = Some(effective_surface_policy.recursive_memo);
-        let mork_backend_override = match policy.backend {
-            Some(RuntimeBackend::Mork) => Some(true),
-            Some(RuntimeBackend::Ascent) => Some(false),
-            _ => None,
+        let core_backend_override = match policy.backend {
+            Some(RuntimeBackend::Mork) => Some(RuntimeBackend::Mork),
+            Some(RuntimeBackend::Ascent) => Some(RuntimeBackend::Ascent),
+            Some(RuntimeBackend::Auto) => Some(RuntimeBackend::Auto),
+            None => None,
         };
         let prev_limits = {
             let session = self.ensure_metta_surface_session();
@@ -2201,17 +2300,6 @@ impl Repl {
                 None
             }
         };
-        let prev_mork_backend = {
-            let session = self.ensure_metta_surface_session();
-            let prev = session.use_mork_backend();
-            if let Some(enabled) = mork_backend_override {
-                session.set_use_mork_backend(enabled);
-                Some(prev)
-            } else {
-                None
-            }
-        };
-
         let outcome_result = self.ensure_metta_surface_session().apply_stmt(stmt);
         if let Some(prev) = prev_limits {
             self.ensure_metta_surface_session().set_rewrite_limits(prev);
@@ -2226,10 +2314,6 @@ impl Repl {
         if let Some(prev) = prev_recursive_memo {
             self.ensure_metta_surface_session()
                 .set_recursive_memo_enabled(prev);
-        }
-        if let Some(prev) = prev_mork_backend {
-            self.ensure_metta_surface_session()
-                .set_use_mork_backend(prev);
         }
         let outcome = outcome_result?;
         match outcome {
@@ -2265,7 +2349,11 @@ impl Repl {
                             );
                         }
                     }
-                    self.exec_or_step_core_term(&core_terms[0], /* step_mode */ true)?;
+                    self.exec_or_step_core_term(
+                        &core_terms[0],
+                        /* step_mode */ true,
+                        core_backend_override,
+                    )?;
                     return Ok(());
                 }
                 if surface_first_branch_only {
@@ -2277,7 +2365,11 @@ impl Repl {
                             "using first lowered branch only".yellow()
                         );
                     }
-                    self.exec_or_step_core_term(&core_terms[0], /* step_mode */ false)?;
+                    self.exec_or_step_core_term(
+                        &core_terms[0],
+                        /* step_mode */ false,
+                        core_backend_override,
+                    )?;
                     return Ok(());
                 }
                 let mut merged_surface = Vec::new();
@@ -2294,7 +2386,11 @@ impl Repl {
                         );
                         println!("  {}", core_term.dimmed());
                     }
-                    self.exec_or_step_core_term(core_term, /* step_mode */ false)?;
+                    self.exec_or_step_core_term(
+                        core_term,
+                        /* step_mode */ false,
+                        core_backend_override,
+                    )?;
                     if let Some(diag) = self.last_core_diagnostics.clone() {
                         merged_diagnostics.push(diag);
                     }
@@ -2316,7 +2412,12 @@ impl Repl {
         }
     }
 
-    fn exec_or_step_core_term(&mut self, term_str: &str, step_mode: bool) -> Result<()> {
+    fn exec_or_step_core_term(
+        &mut self,
+        term_str: &str,
+        step_mode: bool,
+        backend_override: Option<RuntimeBackend>,
+    ) -> Result<()> {
         self.last_surface_results = None;
         self.last_core_diagnostics = None;
         let language_name = self
@@ -2400,17 +2501,52 @@ impl Repl {
             }
         }
 
+        let requested_backend = backend_override.unwrap_or(RuntimeBackend::Auto);
+        // Development default: prefer native MORK for HE whenever backend is Auto.
+        // Non-HE languages (and HE builds without mork-backend feature) remain unchanged.
+        let backend = if matches!(requested_backend, RuntimeBackend::Auto)
+            && language.name() == "MeTTaHE"
+            && language.supports_backend(RuntimeBackend::Mork)
+        {
+            RuntimeBackend::Mork
+        } else {
+            requested_backend
+        };
+        if !language.supports_backend(backend) {
+            anyhow::bail!(
+                "backend '{}' is not supported for language '{}'",
+                match backend {
+                    RuntimeBackend::Auto => "auto",
+                    RuntimeBackend::Ascent => "ascent",
+                    RuntimeBackend::Mork => "mork",
+                },
+                language.name()
+            );
+        }
+        self.ensure_core_backend_contract_for_active_language(backend)?;
         if !self.suppress_output {
-            print!("Running Ascent... ");
+            print!(
+                "Running {}... ",
+                match backend {
+                    RuntimeBackend::Auto => "core backend",
+                    RuntimeBackend::Ascent => "Ascent",
+                    RuntimeBackend::Mork => "MORK",
+                }
+            );
         }
         let start_time = Instant::now();
         let results = language
-            .run_ascent(term.as_ref())
+            .run_backend(term.as_ref(), backend)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         let end_time = Instant::now();
         let elapsed_ms = end_time.duration_since(start_time).as_secs_f64() * 1000.0;
+        let mode = match backend {
+            RuntimeBackend::Auto => "auto",
+            RuntimeBackend::Ascent => "ascent",
+            RuntimeBackend::Mork => "mork",
+        };
         self.last_core_diagnostics =
-            Some(build_core_eval_diagnostics(&results, term.term_id(), elapsed_ms, "ascent"));
+            Some(build_core_eval_diagnostics(&results, term.term_id(), elapsed_ms, mode));
         if !self.suppress_output {
             println!("Time taken: {:?}", end_time.duration_since(start_time));
             println!("{}", "Done!".green());
@@ -3160,6 +3296,45 @@ mod tests {
             "surface results should not leak C_add core token: {report}"
         );
 
+        let _ = fs::remove_file(&report_path);
+    }
+
+    #[test]
+    fn run_metta_file_mettahe_accepts_prose_and_spaced_bang_forms() {
+        let registry = build_registry().expect("registry should initialize");
+        let mut repl = Repl::new(registry).expect("repl should initialize");
+        repl.set_batch_quiet(true);
+        repl.load_language("mettahe").expect("mettahe should load");
+
+        let input_path = unique_artifact_path("mettahe_compat_input", "metta");
+        let report_path = unique_artifact_path("mettahe_compat_report", "json");
+        fs::create_dir_all(
+            input_path
+                .parent()
+                .expect("artifact path should have a parent directory"),
+        )
+        .expect("artifact directory should be creatable");
+        fs::write(
+            &input_path,
+            ";;;;;;;;;;;;;;;;;;;;;;;;\nAuto type-checking can be enabled\n(= (id $x) $x)\n! (id 5)\n!\n",
+        )
+        .expect("input file should be writable");
+
+        let cmd = format!(
+            "run-metta-file {} --report=json --report-file {}",
+            input_path.display(),
+            report_path.display()
+        );
+        repl.run_command(&cmd)
+            .expect("run-metta-file command should succeed");
+
+        let report = fs::read_to_string(&report_path).expect("report file should be readable");
+        assert!(
+            report.contains("\"failed\":0"),
+            "expected zero failures in report, got: {report}"
+        );
+
+        let _ = fs::remove_file(&input_path);
         let _ = fs::remove_file(&report_path);
     }
 

@@ -22,6 +22,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install tree-sitter CLI
+        shell: bash
+        run: npm install -g tree-sitter-cli@0.25.10
+
       - name: Install mold linker (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y mold
@@ -77,6 +81,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install tree-sitter CLI
+        run: npm install -g tree-sitter-cli@0.25.10
+
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
 
@@ -96,6 +103,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install tree-sitter CLI
+        run: npm install -g tree-sitter-cli@0.25.10
+
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
 
@@ -107,6 +117,27 @@ jobs:
         env:
           METTAIL_LOWMEM_USE_CRANELIFT: "1"
         run: ./tools/cargo_lowmem.sh test -p mettail-repl core_ground_eval_hint_is_disabled_when_contracts_missing_in_dispatch -- --nocapture
+
+  low-memory-he-transition-check:
+    name: Low Memory HE Transition Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tree-sitter CLI
+        run: npm install -g tree-sitter-cli@0.25.10
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustc-codegen-cranelift-preview
+
+      - name: Compile-check HE transition smoke target (no link-heavy test run)
+        env:
+          METTAIL_LOWMEM_USE_CRANELIFT: "1"
+        run: ./tools/cargo_lowmem.sh check -p mettail-languages --test mettahe_smoke
 
   fmt:
     name: Formatting
@@ -123,13 +154,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install tree-sitter CLI
+        run: npm install -g tree-sitter-cli@0.25.10
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./tools/check_metta_syntax_export_sync.sh
+      - name: Lean syntax/grammar/probe check commands (when algorithms checkout is available)
+        run: |
+          if [[ -d ../../lean-projects/algorithms ]] && [[ -f ../../lean-projects/algorithms/Algorithms/MeTTa/Simple/Main.lean ]]; then
+            cd ../../lean-projects/algorithms
+            ulimit -v 6291456 || true
+            ART_DIR="../../hyperon/mettail-rust/repl/artifacts/syntax"
+            lake exe simpleMeTTa syntax-spec check-all "${ART_DIR}"
+            lake exe simpleMeTTa syntax-spec check-grammar-all "${ART_DIR}"
+            lake exe simpleMeTTa syntax-spec check-parser-drift-all "${ART_DIR}"
+          else
+            echo "algorithms checkout unavailable; skipped direct Lean check-* commands"
+          fi
+      - name: Rust syntax/grammar/lookup loader contract tests
+        run: |
+          cargo test -p mettail-repl syntax_spec::tests:: -- --test-threads=1
+          cargo test -p mettail-repl grammar_spec::tests:: -- --test-threads=1
+          cargo test -p mettail-repl lookup_plan::tests:: -- --test-threads=1
       - run: ./tools/check_mettafull_export_sync.sh
+      - name: HE export sync (when Lean source or artifact is available)
+        run: |
+          if [[ -d ../../lean-projects/mettapedia ]] || [[ -f .artifacts/mettahe.generated.rs ]]; then
+            ./tools/check_mettahe_export_sync.sh
+          else
+            echo "skipping mettahe export sync (no mettapedia checkout and no artifact)"
+          fi
 
   metta-surface-suites:
     name: MeTTa Surface Suites
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install tree-sitter CLI
+        run: npm install -g tree-sitter-cli@0.25.10
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: dtolnay/rust-toolchain@nightly
@@ -142,6 +203,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install tree-sitter CLI
+        run: npm install -g tree-sitter-cli@0.25.10
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: dtolnay/rust-toolchain@nightly
@@ -154,6 +217,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install tree-sitter CLI
+        run: npm install -g tree-sitter-cli@0.25.10
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: dtolnay/rust-toolchain@nightly
