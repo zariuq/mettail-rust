@@ -146,8 +146,10 @@ pub struct MeTTaSurfaceSession {
     recursive_memo_enabled: bool,
     ground_call_memo: ReentrantMemo<GroundCallMemoKey, Vec<SExpr>>,
     last_surface_diagnostics: Option<SurfaceEvalDiagnostics>,
-    /// When true, dispatch evaluation through the MORK forward-chaining backend
-    /// instead of the surface rewriter. Requires feature "mork-backend".
+    /// Compatibility flag from legacy surface-mode wiring.
+    ///
+    /// Surface-level MORK execution is intentionally disabled; when this flag is
+    /// set, evaluation must route through core `Language::run_backend`.
     use_mork_backend: bool,
     mork_limits: MorkExecutionLimits,
 }
@@ -894,41 +896,13 @@ impl MeTTaSurfaceSession {
         let mut profile = SurfaceRewriteProfile::default();
         let space_state = self.space_state(space);
 
-        // MORK backend dispatch (feature-gated).
+        // Surface-level MORK rewriting is intentionally disabled.
+        //
+        // Core backend execution must route through `Language::run_backend` so
+        // semantics stay artifact-driven and shared across languages.
         #[cfg(feature = "mork-backend")]
-        if self.use_mork_backend && self.profile != SurfaceProfile::HE {
-            use mettail_languages::mork_backend::{mork_eval, SExpr as MorkSExpr};
-            fn to_mork(e: &SExpr) -> MorkSExpr {
-                match e {
-                    SExpr::Atom(s) => MorkSExpr::Atom(s.clone()),
-                    SExpr::List(items) => MorkSExpr::List(items.iter().map(to_mork).collect()),
-                }
-            }
-            fn from_mork(e: &MorkSExpr) -> SExpr {
-                match e {
-                    MorkSExpr::Atom(s) => SExpr::Atom(s.clone()),
-                    MorkSExpr::List(items) => SExpr::List(items.iter().map(from_mork).collect()),
-                }
-            }
-            let mork_eqs: Vec<(MorkSExpr, MorkSExpr)> = space_state
-                .eq_patterns
-                .iter()
-                .map(|(lhs, rhs)| (to_mork(lhs), to_mork(rhs)))
-                .collect();
-            let mork_query = to_mork(&expr);
-            let results =
-                mork_eval::run_mork_query_with_limits(&mork_eqs, &mork_query, self.mork_limits)
-                    .map_err(|e| anyhow!("MORK backend error: {e}"))?;
-            let surface_results: Vec<SExpr> = results.iter().map(from_mork).collect();
-            profile.normal_forms = surface_results.len();
-            profile.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-            return Ok((surface_results, profile));
-        }
-        #[cfg(feature = "mork-backend")]
-        if self.use_mork_backend && self.profile == SurfaceProfile::HE {
-            bail!(
-                "HE MORK must execute through core backend dispatch (run_backend), not surface-only rewrite path"
-            );
+        if self.use_mork_backend {
+            bail!("surface MORK rewrite path is disabled; use core backend dispatch (run_backend)");
         }
         let index = RuleIndex::from_pattern_keys(
             space_state

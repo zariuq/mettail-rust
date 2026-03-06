@@ -9,6 +9,10 @@ use crate::registry::LanguageRegistry;
 use crate::state::ReplState;
 use anyhow::Result;
 use colored::Colorize;
+#[cfg(feature = "mork-backend")]
+use mettail_languages::mm0lite_from_lean::{
+    parse_mm0_theorem_facts, run_mm0lite_mork_backend_with_limits, with_mm0_theorem_facts,
+};
 use mettail_query::run_query as query_run_query;
 use mettail_runtime::{
     aggregate_core_eval_diagnostics, build_core_eval_diagnostics,
@@ -409,6 +413,7 @@ impl Repl {
             "lang" => self.cmd_lang(&parts[1..]),
             "load-env" => self.cmd_load_env(&parts[1..]),
             "run-metta-file" => self.cmd_run_metta_file(&parts[1..]),
+            "run-mm0lite-file" => self.cmd_run_mm0lite_file(&parts[1..]),
             "run-mm2-file" => self.cmd_run_mm2_file(&parts[1..]),
             "oracles" => self.cmd_oracles(),
             "oracle-query" => self.cmd_oracle_query(&parts[1..]),
@@ -551,6 +556,10 @@ impl Repl {
         println!(
             "    {} Execute raw MM2 file in MORK (feature-gated)",
             "run-mm2-file <file> [--mork-max-steps <n>]".green()
+        );
+        println!(
+            "    {} Execute MM0 theorem DB + MM0Lite state file (feature-gated)",
+            "run-mm0lite-file <db.mm0> <state.mm0lite> [--mork-max-steps <n>]".green()
         );
         println!(
             "    {} Expectations in file comments: {}, {}",
@@ -1338,15 +1347,10 @@ impl Repl {
             mork_rule_copies,
             mork_max_steps,
         };
-        let requested_backend = run_execution_policy.backend.unwrap_or(RuntimeBackend::Auto);
-        let resolved_backend = if matches!(requested_backend, RuntimeBackend::Auto)
-            && language.name() == "MeTTaHE"
-            && language.supports_backend(RuntimeBackend::Mork)
-        {
-            RuntimeBackend::Mork
-        } else {
-            requested_backend
-        };
+        // Keep backend choice feature/capability-driven:
+        // Auto-resolution to native MORK (when available) is handled centrally by
+        // `Language::run_backend` via registered backend adapters.
+        let resolved_backend = run_execution_policy.backend.unwrap_or(RuntimeBackend::Auto);
         self.ensure_core_backend_contract_for_active_language(resolved_backend)?;
         let runtime_hints = self.current_runtime_optimization_hints();
         let dispatch_contracts = resolve_runtime_dispatch_contracts(runtime_hints);
@@ -1995,6 +1999,166 @@ impl Repl {
         }
     }
 
+    fn cmd_run_mm0lite_file(&mut self, args: &[&str]) -> Result<()> {
+        if args.is_empty() {
+            anyhow::bail!(
+                "Usage: run-mm0lite-file <db.mm0> <state.mm0lite> [--mork-max-steps <n>]"
+            );
+        }
+
+        #[cfg(not(feature = "mork-backend"))]
+        {
+            let _ = args;
+            anyhow::bail!("run-mm0lite-file requires the 'mork-backend' feature flag");
+        }
+
+        #[cfg(feature = "mork-backend")]
+        {
+            let language_name = self
+                .state
+                .language_name()
+                .ok_or_else(|| anyhow::anyhow!("No language loaded."))?;
+            let language = self.registry.get(language_name)?;
+            if language.name() != "MM0Lite" {
+                anyhow::bail!(
+                    "run-mm0lite-file requires active language 'mm0lite' (loaded '{}')",
+                    language_name
+                );
+            }
+
+            let mut db_path: Option<&str> = None;
+            let mut state_path: Option<&str> = None;
+            let mut mork_max_steps: Option<usize> = None;
+            let mut i = 0usize;
+            while i < args.len() {
+                let arg = args[i];
+                if arg == "--mork-max-steps" {
+                    i += 1;
+                    if i >= args.len() {
+                        anyhow::bail!("missing integer after --mork-max-steps");
+                    }
+                    mork_max_steps = Some(args[i].parse::<usize>().map_err(|_| {
+                        anyhow::anyhow!("invalid --mork-max-steps value '{}'", args[i])
+                    })?);
+                    i += 1;
+                    continue;
+                }
+                if let Some(raw) = arg.strip_prefix("--mork-max-steps=") {
+                    if raw.is_empty() {
+                        anyhow::bail!("empty value in --mork-max-steps option");
+                    }
+                    mork_max_steps = Some(raw.parse::<usize>().map_err(|_| {
+                        anyhow::anyhow!("invalid --mork-max-steps value '{}'", raw)
+                    })?);
+                    i += 1;
+                    continue;
+                }
+                if db_path.is_none() {
+                    db_path = Some(arg);
+                    i += 1;
+                    continue;
+                }
+                if state_path.is_none() {
+                    state_path = Some(arg);
+                    i += 1;
+                    continue;
+                }
+                anyhow::bail!(
+                    "unexpected argument '{arg}', usage: run-mm0lite-file <db.mm0> <state.mm0lite> [--mork-max-steps <n>]"
+                );
+            }
+
+            let db_path = db_path.ok_or_else(|| anyhow::anyhow!("missing db.mm0 path"))?;
+            let state_path =
+                state_path.ok_or_else(|| anyhow::anyhow!("missing state.mm0lite path"))?;
+
+            let db_src = std::fs::read_to_string(db_path)
+                .map_err(|e| anyhow::anyhow!("failed to read MM0 file '{}': {}", db_path, e))?;
+            let theorem_facts = parse_mm0_theorem_facts(&db_src).map_err(|e| {
+                anyhow::anyhow!("failed to parse theorem facts from '{}': {}", db_path, e)
+            })?;
+
+            let state_raw = std::fs::read_to_string(state_path).map_err(|e| {
+                anyhow::anyhow!("failed to read MM0Lite state file '{}': {}", state_path, e)
+            })?;
+            let state_src = state_raw
+                .lines()
+                .map(|line| line.split("--").next().unwrap_or_default().trim())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if state_src.is_empty() {
+                anyhow::bail!(
+                    "state file '{}' has no parseable MM0Lite state expression",
+                    state_path
+                );
+            }
+
+            mettail_runtime::clear_var_cache();
+            let term = language
+                .parse_term(&state_src)
+                .map_err(|e| anyhow::anyhow!("MM0Lite state parse failed: {}", e))?;
+
+            let mut limits = mettail_runtime::MorkExecutionLimits::default();
+            if let Some(max_steps) = mork_max_steps {
+                limits.max_steps = max_steps;
+            }
+
+            let started = Instant::now();
+            let results = with_mm0_theorem_facts(&theorem_facts, || {
+                run_mm0lite_mork_backend_with_limits(term.as_ref(), limits)
+            })
+            .map_err(|e| anyhow::anyhow!("MM0Lite MORK backend failed: {}", e))?;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let normal_forms = results
+                .normal_forms()
+                .into_iter()
+                .map(|nf| nf.display.clone())
+                .collect::<Vec<_>>();
+            let has_verified = normal_forms.iter().any(|nf| nf.contains("verified"));
+
+            if self.batch_quiet {
+                for nf in &normal_forms {
+                    println!("{nf}");
+                }
+                return Ok(());
+            }
+
+            println!();
+            println!(
+                "{} {}",
+                "Running MM0Lite files:".bold(),
+                format!("{db_path} + {state_path}").cyan()
+            );
+            println!(
+                "{} {}",
+                "Theorem facts loaded:".bold(),
+                theorem_facts.len().to_string().green()
+            );
+            println!("{} {}", "Transitions:".bold(), results.rewrites.len().to_string().green());
+            println!("{} {:.2}", "Elapsed ms:".bold(), elapsed_ms);
+            println!(
+                "{} {}",
+                "Verified:".bold(),
+                if has_verified {
+                    "yes".green()
+                } else {
+                    "no".red()
+                }
+            );
+            println!();
+            println!("{}", "Normal forms:".bold());
+            if normal_forms.is_empty() {
+                println!("  {}", "(none)".dimmed());
+            } else {
+                for nf in &normal_forms {
+                    println!("  {}", nf);
+                }
+            }
+            Ok(())
+        }
+    }
+
     /// Helper to load environment from a file, returns count of loaded declarations
     fn load_env_from_file(&mut self, file_path: &str) -> Result<usize> {
         let language_name = self
@@ -2501,17 +2665,10 @@ impl Repl {
             }
         }
 
-        let requested_backend = backend_override.unwrap_or(RuntimeBackend::Auto);
-        // Development default: prefer native MORK for HE whenever backend is Auto.
-        // Non-HE languages (and HE builds without mork-backend feature) remain unchanged.
-        let backend = if matches!(requested_backend, RuntimeBackend::Auto)
-            && language.name() == "MeTTaHE"
-            && language.supports_backend(RuntimeBackend::Mork)
-        {
-            RuntimeBackend::Mork
-        } else {
-            requested_backend
-        };
+        // Keep backend choice feature/capability-driven:
+        // Auto-resolution to native MORK (when available) is handled centrally by
+        // `Language::run_backend` via registered backend adapters.
+        let backend = backend_override.unwrap_or(RuntimeBackend::Auto);
         if !language.supports_backend(backend) {
             anyhow::bail!(
                 "backend '{}' is not supported for language '{}'",
@@ -3342,6 +3499,50 @@ mod tests {
 
         let _ = fs::remove_file(&input_path);
         let _ = fs::remove_file(&report_path);
+    }
+
+    #[cfg(feature = "mork-backend")]
+    #[test]
+    fn run_mm0lite_file_ingests_mm0_db_and_executes_state() {
+        let registry = build_registry().expect("registry should initialize");
+        let mut repl = Repl::new(registry).expect("repl should initialize");
+        repl.set_batch_quiet(true);
+        repl.load_language("mm0lite")
+            .expect("mm0lite language should load");
+
+        let db_path = unique_artifact_path("mm0lite_demo_db", "mm0");
+        let state_path = unique_artifact_path("mm0lite_demo_state", "mm0lite");
+        fs::create_dir_all(
+            db_path
+                .parent()
+                .expect("artifact path should have a parent directory"),
+        )
+        .expect("artifact directory should be creatable");
+        fs::write(
+            &db_path,
+            r#"
+delimiter $ ( ) $;
+provable sort wff;
+term P: wff; term Q: wff;
+term imp: wff > wff > wff;
+infixr imp: $->$ prec 25;
+axiom thm_imp_p_q: $ P -> Q $;
+"#,
+        )
+        .expect("MM0 db fixture should be writable");
+        fs::write(&state_path, "state [ use thm_imp_p_q :: [ mp :: [] ] ] Q { P ; {} } pending\n")
+            .expect("MM0Lite state fixture should be writable");
+
+        let cmd = format!(
+            "run-mm0lite-file {} {} --mork-max-steps 64",
+            db_path.display(),
+            state_path.display()
+        );
+        repl.run_command(&cmd)
+            .expect("run-mm0lite-file command should succeed");
+
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(&state_path);
     }
 
     struct MissingContractsMetadata;

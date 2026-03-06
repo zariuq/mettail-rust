@@ -1,0 +1,28 @@
+[package]
+name = "codex-he-harness"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[features]
+mork-backend = ["dep:mork"]
+
+[dependencies]
+mettail-macros = { path = "../macros" }
+mettail-runtime = { path = "../runtime" }
+moniker = { version = "0.5", features = ["moniker-derive"] }
+rand = "0.8"
+indexmap = "2.0"
+ascent = "0.8"
+ascent-byods-rels = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+mork = { path = "../../MORK/kernel", optional = true }
+
+[profile.dev]
+codegen-backend = "llvm"
+debug = "line-tables-only"
+
+[profile.test]
+inherits = "dev"

@@ -46,12 +46,7 @@ where
     where
         F: FnOnce(&A) -> I,
     {
-        if let Some(hit) = self
-            .by_atoms
-            .lock()
-            .ok()
-            .and_then(|guard| guard.get(atoms))
-        {
+        if let Some(hit) = self.by_atoms.lock().ok().and_then(|guard| guard.get(atoms)) {
             return hit;
         }
 

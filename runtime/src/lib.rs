@@ -79,6 +79,10 @@ pub use oracle::*;
 mod matchings;
 pub use matchings::*;
 
+// Shared bounded transition-graph runner for native backends.
+mod transition_runner;
+pub use transition_runner::*;
+
 /// Wrapper that provides `Display` for slices/Vecs of `Display` items.
 ///
 /// Renders as a comma-separated list, e.g. `a, b, c`.

@@ -732,8 +732,8 @@ fn write_prefix_phase(
 ) {
     let cat = &config.category;
 
-    // The prefix match block: produces `lhs` or pushes frame + continues
-    buf.push_str("let mut lhs: ");
+    // The prefix match block: produces `node` or pushes frame + continues
+    buf.push_str("let mut node: ");
     buf.push_str(cat);
     buf.push_str(" = 'prefix: {");
 
@@ -1756,7 +1756,7 @@ fn write_infix_loop(
                 if l_bp < cur_bp {{ break; }} \
                 let op_token = token.clone(); \
                 *pos += 1; \
-                lhs = make_postfix_{cat}(&op_token, lhs); \
+                node = make_postfix_{cat}(&op_token, node); \
             }}",
         )
         .unwrap();
@@ -1783,7 +1783,7 @@ fn write_infix_loop(
                 if l_bp < cur_bp {{ break; }} \
                 let op_pos = *pos; \
                 *pos += 1; \
-                stack.push({enum_name}::InfixRHS {{ lhs, op_pos, saved_bp: cur_bp }}); \
+                stack.push({enum_name}::InfixRHS {{ lhs: node, op_pos, saved_bp: cur_bp }}); \
                 cur_bp = r_bp; \
                 continue 'drive; \
             }}",
@@ -1827,7 +1827,7 @@ fn write_mixfix_led(
         // Single mixfix operator — no match needed
         write!(
             buf,
-            "stack.push({enum_name}::Mixfix_{label}_0 {{ lhs, saved_bp: cur_bp }}); \
+            "stack.push({enum_name}::Mixfix_{label}_0 {{ lhs: node, saved_bp: cur_bp }}); \
             cur_bp = 0; \
             continue 'drive;",
             enum_name = frame_info.enum_name,
@@ -1842,7 +1842,7 @@ fn write_mixfix_led(
             write!(
                 buf,
                 "Token::{} => {{ \
-                    stack.push({enum_name}::Mixfix_{label}_0 {{ lhs, saved_bp: cur_bp }}); \
+                    stack.push({enum_name}::Mixfix_{label}_0 {{ lhs: node, saved_bp: cur_bp }}); \
                     cur_bp = 0; \
                     continue 'drive; \
                 }},",
@@ -1869,14 +1869,14 @@ fn write_unwind_handlers(
 ) {
     let cat = &config.category;
 
-    write!(buf, "match stack.pop() {{ None => return Ok(lhs),").unwrap();
+    write!(buf, "match stack.pop() {{ None => return Ok(node),").unwrap();
 
     // ── InfixRHS ──
     if config.has_infix {
         write!(
             buf,
             "Some({enum_name}::InfixRHS {{ lhs: prev, op_pos, saved_bp }}) => {{ \
-                lhs = make_infix_{cat}(&tokens[op_pos].0, prev, lhs); \
+                node = make_infix_{cat}(&tokens[op_pos].0, prev, node); \
                 cur_bp = saved_bp; \
             }},",
             enum_name = frame_info.enum_name,
@@ -1903,7 +1903,7 @@ fn write_unwind_handlers(
         write!(
             buf,
             "Some({enum_name}::UnaryPrefix_{label} {{ saved_bp }}) => {{ \
-                lhs = {cat}::{label}(Box::new(lhs)); \
+                node = {cat}::{label}(Box::new(node)); \
                 cur_bp = saved_bp; \
             }},",
             enum_name = frame_info.enum_name,
@@ -1955,7 +1955,7 @@ fn write_unwind_handlers(
             .unwrap();
 
             // Assign the parsed nonterminal result to its param name
-            write!(buf, "let {} = lhs;", nt.param_name).unwrap();
+            write!(buf, "let {} = node;", nt.param_name).unwrap();
 
             // Check if there's a next segment with more items to process
             if let Some(next) = next_segment {
@@ -1974,7 +1974,7 @@ fn write_unwind_handlers(
                             | SegmentCapture::Ident { name }
                             | SegmentCapture::Binder { name }
                             | SegmentCapture::Collection { name, .. } => {
-                                write!(buf, "{},", name).unwrap();
+                                write!(buf, "{}: {},", name, name).unwrap();
                             },
                         }
                     }
@@ -1991,7 +1991,7 @@ fn write_unwind_handlers(
                             next_nt.param_name, next_nt.category, next_nt.bp
                         )
                         .unwrap();
-                        write!(buf, "lhs = {};", next_nt.param_name).unwrap();
+                        write!(buf, "node = {};", next_nt.param_name).unwrap();
                         // Will be handled by the NEXT unwind iteration
                     }
                 } else {
@@ -2042,7 +2042,7 @@ fn write_unwind_handlers(
             label = rd_rule.label,
         ).unwrap();
 
-        write!(buf, "elements.{}(lhs);", insert_method).unwrap();
+        write!(buf, "elements.{}(node);", insert_method).unwrap();
 
         if let Some(ref sep) = sep_info {
             let sep_variant = terminal_to_variant_name(sep);
@@ -2074,7 +2074,7 @@ fn write_unwind_handlers(
             .unwrap();
         }
 
-        write!(buf, "lhs = {}::{}(elements);", cat, rd_rule.label).unwrap();
+        write!(buf, "node = {}::{}(elements);", cat, rd_rule.label).unwrap();
         buf.push_str("cur_bp = saved_bp;");
         buf.push_str("},");
     }
@@ -2082,8 +2082,8 @@ fn write_unwind_handlers(
     // ── Mixfix step variants ──
     // Each mixfix operator (e.g., Tern: c "?" t ":" e) generates N-1 frame variants.
     // The frame stores the original lhs (c) as `lhs`, plus accumulated operands.
-    // We destructure `lhs: orig_lhs` to avoid shadowing the outer `lhs` variable
-    // (which holds the just-parsed operand result).
+    // We destructure `lhs: orig_lhs` to avoid shadowing the parser accumulator
+    // `node`, which holds the just-parsed operand result.
     for op in bp_table.mixfix_operators_for_category(cat) {
         for (i, part) in op.mixfix_parts.iter().enumerate() {
             let is_last = i == op.mixfix_parts.len() - 1;
@@ -2102,9 +2102,9 @@ fn write_unwind_handlers(
             )
             .unwrap();
 
-            // Assign current lhs (outer variable) as this operand's result
+            // Assign the current accumulator as this operand's result.
             let param_ident = format!("param_{}", part.param_name);
-            write!(buf, "let {} = lhs;", param_ident).unwrap();
+            write!(buf, "let {} = node;", param_ident).unwrap();
 
             if let Some(ref terminal) = part.following_terminal {
                 // Expect the separator terminal
@@ -2119,7 +2119,7 @@ fn write_unwind_handlers(
 
             if is_last {
                 // Construct the AST node: Cat::Label(Box::new(orig_lhs), Box::new(param_0), ..., Box::new(param_N))
-                write!(buf, "lhs = {}::{}(Box::new(orig_lhs)", cat, op.label).unwrap();
+                write!(buf, "node = {}::{}(Box::new(orig_lhs)", cat, op.label).unwrap();
                 for j in 0..op.mixfix_parts.len() {
                     write!(buf, ", Box::new(param_{})", op.mixfix_parts[j].param_name).unwrap();
                 }
@@ -2182,12 +2182,12 @@ fn write_unwind_handlers(
             buf,
             "Some({enum_name}::LambdaBody_Single {{ binder_name, saved_bp }}) => {{ \
                 expect_token(tokens, pos, |t| matches!(t, Token::RBrace), \"}}\")?; \
-                let inferred = lhs.infer_var_type(&binder_name); \
+                let inferred = node.infer_var_type(&binder_name); \
                 let scope = mettail_runtime::Scope::new( \
                     mettail_runtime::Binder(mettail_runtime::get_or_create_var(binder_name)), \
-                    Box::new(lhs), \
+                    Box::new(node), \
                 ); \
-                lhs = match inferred {{ \
+                node = match inferred {{ \
                     {lam_match_arms} \
                     _ => {cat}::{default_lam_variant}(scope) \
                 }}; \
@@ -2202,7 +2202,7 @@ fn write_unwind_handlers(
             "Some({enum_name}::LambdaBody_Multi {{ binder_names, saved_bp }}) => {{ \
                 expect_token(tokens, pos, |t| matches!(t, Token::RBrace), \"}}\")?; \
                 let inferred = if let Some(name) = binder_names.first() {{ \
-                    lhs.infer_var_type(name) \
+                    node.infer_var_type(name) \
                 }} else {{ \
                     None \
                 }}; \
@@ -2210,8 +2210,8 @@ fn write_unwind_handlers(
                     binder_names.into_iter() \
                         .map(|s| mettail_runtime::Binder(mettail_runtime::get_or_create_var(s))) \
                         .collect(); \
-                let scope = mettail_runtime::Scope::new(binders, Box::new(lhs)); \
-                lhs = match inferred {{ \
+                let scope = mettail_runtime::Scope::new(binders, Box::new(node)); \
+                node = match inferred {{ \
                     {mlam_match_arms} \
                     _ => {cat}::{default_mlam_variant}(scope) \
                 }}; \
@@ -2251,11 +2251,11 @@ fn write_dollar_unwind_handlers(
         write!(
             buf,
             "Some({enum_name}::DollarF_{dom_cap} {{ saved_bp }}) => {{ \
-                let f = lhs; \
+                let f = node; \
                 expect_token(tokens, pos, |t| matches!(t, Token::Comma), \",\")?; \
                 let x = parse_{dom}(tokens, pos, 0)?; \
                 expect_token(tokens, pos, |t| matches!(t, Token::RParen), \")\")?; \
-                lhs = {cat}::{apply_variant}(Box::new(f), Box::new(x)); \
+                node = {cat}::{apply_variant}(Box::new(f), Box::new(x)); \
                 cur_bp = saved_bp; \
             }},",
             enum_name = frame_info.enum_name,
@@ -2266,7 +2266,7 @@ fn write_dollar_unwind_handlers(
         write!(
             buf,
             "Some({enum_name}::DdollarF_{dom_cap} {{ saved_bp }}) => {{ \
-                let f = lhs; \
+                let f = node; \
                 expect_token(tokens, pos, |t| matches!(t, Token::Comma), \",\")?; \
                 let mut args: Vec<{dom}> = Vec::with_capacity(4); \
                 loop {{ \
@@ -2279,7 +2279,7 @@ fn write_dollar_unwind_handlers(
                     }} \
                 }} \
                 expect_token(tokens, pos, |t| matches!(t, Token::RParen), \")\")?; \
-                lhs = {cat}::{mapply_variant}(Box::new(f), args); \
+                node = {cat}::{mapply_variant}(Box::new(f), args); \
                 cur_bp = saved_bp; \
             }},",
             enum_name = frame_info.enum_name,
@@ -2409,11 +2409,7 @@ fn write_collection_error_catch_inline(
 }
 
 /// Write the RD constructor from accumulated segment captures.
-fn write_rd_constructor_from_segments(
-    buf: &mut String,
-    rule: &RDRuleInfo,
-    segments: &[HandlerSegment],
-) {
+fn write_rd_constructor_from_segments(buf: &mut String, rule: &RDRuleInfo, segments: &[HandlerSegment]) {
     let cat = &rule.category;
     let label = &rule.label;
 
@@ -2471,7 +2467,7 @@ fn write_rd_constructor_from_segments(
                 })
                 .collect();
 
-            write!(buf, "lhs = {cat}::{label}(").unwrap();
+            write!(buf, "node = {cat}::{label}(").unwrap();
             for c in &extra_caps {
                 write_segment_capture_as_arg(buf, c);
                 buf.push(',');
@@ -2482,7 +2478,8 @@ fn write_rd_constructor_from_segments(
                     mettail_runtime::Binder(mettail_runtime::get_or_create_var({})), \
                     Box::new({}), \
                 ));",
-                binder_name, body_name,
+                rd_capture_expr_name(binder_name),
+                rd_capture_expr_name(body_name),
             )
             .unwrap();
         }
@@ -2518,11 +2515,11 @@ fn write_rd_constructor_from_segments(
                 "let binders: Vec<mettail_runtime::Binder<String>> = {}.into_iter() \
                     .map(|s| mettail_runtime::Binder(mettail_runtime::get_or_create_var(s))) \
                     .collect();",
-                binder_name,
+                rd_capture_expr_name(binder_name),
             )
             .unwrap();
 
-            write!(buf, "lhs = {cat}::{label}(").unwrap();
+            write!(buf, "node = {cat}::{label}(").unwrap();
             for c in &extra_caps {
                 write_segment_capture_as_arg(buf, c);
                 buf.push(',');
@@ -2533,14 +2530,14 @@ fn write_rd_constructor_from_segments(
                     binders, \
                     Box::new({}), \
                 ));",
-                body_name,
+                rd_capture_expr_name(body_name),
             )
             .unwrap();
         }
     } else if unique_captures.is_empty() {
-        write!(buf, "lhs = {cat}::{label};").unwrap();
+        write!(buf, "node = {cat}::{label};").unwrap();
     } else {
-        write!(buf, "lhs = {cat}::{label}(").unwrap();
+        write!(buf, "node = {cat}::{label}(").unwrap();
         for (i, c) in unique_captures.iter().enumerate() {
             if i > 0 {
                 buf.push(',');
@@ -2552,10 +2549,13 @@ fn write_rd_constructor_from_segments(
 }
 
 /// Write a segment capture as a constructor argument.
-fn write_segment_capture_as_arg(buf: &mut String, capture: &SegmentCapture) {
+fn write_segment_capture_as_arg(
+    buf: &mut String,
+    capture: &SegmentCapture,
+) {
     match capture {
         SegmentCapture::NonTerminal { name, .. } => {
-            write!(buf, "Box::new({})", name).unwrap();
+            write!(buf, "Box::new({})", rd_capture_expr_name(name)).unwrap();
         },
         SegmentCapture::Ident { name } => {
             write!(
@@ -2563,18 +2563,22 @@ fn write_segment_capture_as_arg(buf: &mut String, capture: &SegmentCapture) {
                 "mettail_runtime::OrdVar(mettail_runtime::Var::Free(\
                     mettail_runtime::get_or_create_var({})\
                 ))",
-                name,
+                rd_capture_expr_name(name),
             )
             .unwrap();
         },
         SegmentCapture::Binder { name } => {
             // Binders are handled specially in the constructor
-            buf.push_str(name);
+            buf.push_str(&rd_capture_expr_name(name));
         },
         SegmentCapture::Collection { name, .. } => {
-            buf.push_str(name);
+            buf.push_str(&rd_capture_expr_name(name));
         },
     }
+}
+
+fn rd_capture_expr_name(name: &str) -> String {
+    name.to_string()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

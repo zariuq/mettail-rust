@@ -29,26 +29,30 @@
 
 use mettail_macros::language;
 use mettail_runtime::{
-    metta_pattern_contains_var, metta_pattern_index_key, MettaBinaryKind,
-    MettaEqEntry, MettaEqMatches, MettaFamilyListForm, MettaFamilyPattern, MettaFamilySpaceIndex,
+    metta_pattern_contains_var, metta_pattern_index_key, MettaBinaryKind, MettaEqEntry,
+    MettaEqMatches, MettaFamilyListForm, MettaFamilyPattern, MettaFamilySpaceIndex,
     MettaFamilySpaceIndexCache, MettaTypeEntry,
 };
 use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "mork-backend")]
+use crate::mettahe_artifacts::{
+    load_mettahe_lookup_artifact, load_mettahe_rewrite_ir_artifact,
+    load_mettahe_transition_artifact, LookupArtifact, RewriteIRArtifact, TransitionArtifact,
+};
+#[cfg(feature = "mork-backend")]
 use crate::mork_backend::{mork_eval, SExpr as MorkSExpr};
 #[cfg(feature = "mork-backend")]
-use mettail_runtime::{AscentResults, Language, MorkExecutionLimits, Rewrite, Term, TermInfo};
+use crate::native_transition_contract::{
+    build_native_transition_contract, NativeTransitionContract, NativeTransitionRuleMeta,
+};
 #[cfg(feature = "mork-backend")]
-use serde::Deserialize;
+use mettail_runtime::{
+    dispatch_ordered_rules, run_transition_graph, AscentResults, Language, MorkExecutionLimits,
+    Term,
+};
 #[cfg(feature = "mork-backend")]
-use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(feature = "mork-backend")]
-use std::fs;
-#[cfg(feature = "mork-backend")]
-use std::hash::{Hash, Hasher};
-#[cfg(feature = "mork-backend")]
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "mork-backend")]
 use std::time::Instant;
 
@@ -610,13 +614,6 @@ fn mork_atom_to_he_atom(sexpr: &MorkSExpr) -> Atom {
 }
 
 #[cfg(feature = "mork-backend")]
-fn hash_display_id(display: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    display.hash(&mut hasher);
-    hasher.finish()
-}
-
-#[cfg(feature = "mork-backend")]
 fn mk_state(instr: Instr, space: Space, out: Atom) -> State {
     State::C_State(Box::new(instr), Box::new(space), Box::new(out))
 }
@@ -799,98 +796,78 @@ fn extract_space_equations(space: &Space) -> Result<Vec<(MorkSExpr, MorkSExpr)>,
 }
 
 #[cfg(feature = "mork-backend")]
-#[derive(Debug, Default)]
-struct HeRewriteTransitionSpec {
-    by_source_instr: HashMap<String, Vec<String>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeRuleSemantics {
+    MettaEmpty,
+    MettaError,
+    MettaTypeMatch,
+    MettaTypeCast,
+    MettaExpression,
+    InterpExprFuncType,
+    InterpExprTupleType,
+    InterpExprNotExpr,
+    InterpFuncStart,
+    InterpFuncNil,
+    InterpFuncNotExpr,
+    ReturnAfterOpEmpty,
+    ReturnAfterOpError,
+    ReturnAfterOpNoArgs,
+    ReturnAfterOpEvalArgs,
+    ReturnAfterArgsEmpty,
+    ReturnAfterArgsError,
+    ReturnAfterArgsCall,
+    InterpArgsTyped,
+    InterpArgsUndef,
+    ReturnArgHeadEmpty,
+    ReturnArgHeadError,
+    ReturnArgHeadRestNil,
+    ReturnArgHeadRecurse,
+    ReturnArgTailEmpty,
+    ReturnArgTailError,
+    ReturnArgTailCons,
+    InterpTupleNil,
+    InterpTupleStartCons,
+    ReturnTupleHeadEmpty,
+    ReturnTupleHeadError,
+    ReturnTupleHeadTailNil,
+    ReturnTupleHeadRecurse,
+    ReturnTupleTailEmpty,
+    ReturnTupleTailError,
+    ReturnTupleTailCons,
+    MettaCallError,
+    MettaCallGrounded,
+    MettaCallEquation,
+    MettaCallNoMatch,
+    TypeCastMatch,
+    TypeCastMismatch,
+    ReturnFinalize,
 }
 
 #[cfg(feature = "mork-backend")]
-impl HeRewriteTransitionSpec {
-    fn ordered_rules_for(&self, source_instr: &str) -> Option<&[String]> {
-        self.by_source_instr
-            .get(source_instr)
-            .map(|rules| rules.as_slice())
-    }
-}
-
-#[cfg(feature = "mork-backend")]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeTransitionSourceArtifact {
+#[derive(Debug, Clone)]
+struct HeRewriteIRRule {
     source_instr: String,
-    source_label: String,
-    ordered_rules: Vec<String>,
-}
-
-#[cfg(feature = "mork-backend")]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeTransitionSemKeyArtifact {
-    source_instr_class: String,
-    transition_kind: String,
-    guard_family: String,
-    effect_kind: String,
-    dialect_ext: Option<String>,
-    contracts: Vec<String>,
-}
-
-#[cfg(feature = "mork-backend")]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeTransitionRuleArtifact {
-    logical_transition_id: String,
-    source_instr: String,
-    source_label: String,
-    rule_id: String,
-    sem_key: HeTransitionSemKeyArtifact,
     priority: u64,
 }
 
 #[cfg(feature = "mork-backend")]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HeTransitionSpecArtifact {
-    schema_version: u64,
-    dialect: String,
-    sources: Vec<HeTransitionSourceArtifact>,
-    rules: Vec<HeTransitionRuleArtifact>,
+#[derive(Debug, Default, Clone)]
+struct HeRewriteIRSpec {
+    by_rule_id: HashMap<String, HeRewriteIRRule>,
 }
 
 #[cfg(feature = "mork-backend")]
-const EXPECTED_HE_TRANSITION_SCHEMA_VERSION: u64 = 2;
-
-#[cfg(feature = "mork-backend")]
-fn fnv1a64(text: &str) -> u64 {
-    const FNV64_OFFSET: u64 = 14_695_981_039_346_656_037;
-    const FNV64_PRIME: u64 = 1_099_511_628_211;
-    text.bytes()
-        .fold(FNV64_OFFSET, |h, b| (h ^ (b as u64)).wrapping_mul(FNV64_PRIME))
-}
-
-#[cfg(feature = "mork-backend")]
-fn transition_spec_paths(base_dir: &Path) -> (PathBuf, PathBuf) {
-    (
-        base_dir.join("he.transition_spec.json"),
-        base_dir.join("he.transition_spec.checksum"),
-    )
-}
-
-#[cfg(feature = "mork-backend")]
-fn candidate_transition_spec_dirs() -> Vec<PathBuf> {
-    if let Ok(from_env) = std::env::var("METTAIL_TRANSITION_SPEC_DIR") {
-        return vec![PathBuf::from(from_env)];
+impl HeRewriteIRSpec {
+    fn rule(&self, rule_id: &str) -> Option<&HeRewriteIRRule> {
+        self.by_rule_id.get(rule_id)
     }
-    let mut dirs = Vec::new();
-    dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts/transition"));
-    dirs.push(PathBuf::from("artifacts/transition"));
-    for prefix in ["..", "../..", "../../.."] {
-        dirs.push(PathBuf::from(prefix).join("lean-projects/mettapedia/artifacts/transition"));
-    }
-    dirs.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../lean-projects/mettapedia/artifacts/transition"),
-    );
-    dirs
+}
+
+#[cfg(feature = "mork-backend")]
+#[derive(Debug)]
+struct HeRewriteContract {
+    transition: NativeTransitionContract,
+    rewrite_ir: HeRewriteIRSpec,
 }
 
 #[cfg(feature = "mork-backend")]
@@ -902,67 +879,90 @@ fn is_rule_id(rule: &str) -> bool {
 }
 
 #[cfg(feature = "mork-backend")]
-fn validate_and_index_transition_artifact(
-    artifact: HeTransitionSpecArtifact,
-    json_path: &Path,
-) -> Result<HeRewriteTransitionSpec, String> {
-    if !artifact.dialect.eq_ignore_ascii_case("he") {
-        return Err(format!(
-            "invalid HE transition spec at {}: expected dialect 'he', got '{}'",
-            json_path.display(),
-            artifact.dialect
-        ));
+fn he_semantics_for(logical_transition_id: &str) -> Result<HeRuleSemantics, String> {
+    match logical_transition_id {
+        "C_Metta:M_Empty" => Ok(HeRuleSemantics::MettaEmpty),
+        "C_Metta:M_Error" => Ok(HeRuleSemantics::MettaError),
+        "C_Metta:M_TypeMatch" => Ok(HeRuleSemantics::MettaTypeMatch),
+        "C_Metta:M_SymbolOrGrounded" => Ok(HeRuleSemantics::MettaTypeCast),
+        "C_Metta:M_Expression" => Ok(HeRuleSemantics::MettaExpression),
+        "C_InterpExpr:IE_FuncType" => Ok(HeRuleSemantics::InterpExprFuncType),
+        "C_InterpExpr:IE_TupleType" => Ok(HeRuleSemantics::InterpExprTupleType),
+        "C_InterpExpr:IE_NotExpr" => Ok(HeRuleSemantics::InterpExprNotExpr),
+        "C_InterpFunc:IF_Start" => Ok(HeRuleSemantics::InterpFuncStart),
+        "C_InterpFunc:IF_Nil" => Ok(HeRuleSemantics::InterpFuncNil),
+        "C_InterpFunc:IF_NotExpr" => Ok(HeRuleSemantics::InterpFuncNotExpr),
+        "C_Return:IF_AfterOp_Empty" => Ok(HeRuleSemantics::ReturnAfterOpEmpty),
+        "C_Return:IF_AfterOp_Error" => Ok(HeRuleSemantics::ReturnAfterOpError),
+        "C_Return:IF_AfterOp_NoArgs" => Ok(HeRuleSemantics::ReturnAfterOpNoArgs),
+        "C_Return:IF_AfterOp_EvalArgs" => Ok(HeRuleSemantics::ReturnAfterOpEvalArgs),
+        "C_Return:IF_AfterArgs_Empty" => Ok(HeRuleSemantics::ReturnAfterArgsEmpty),
+        "C_Return:IF_AfterArgs_Error" => Ok(HeRuleSemantics::ReturnAfterArgsError),
+        "C_Return:IF_AfterArgs_Call" => Ok(HeRuleSemantics::ReturnAfterArgsCall),
+        "C_InterpArgs:IA_Start_Typed" => Ok(HeRuleSemantics::InterpArgsTyped),
+        "C_InterpArgs:IA_Start_Undef" => Ok(HeRuleSemantics::InterpArgsUndef),
+        "C_Return:IA_Head_Empty" => Ok(HeRuleSemantics::ReturnArgHeadEmpty),
+        "C_Return:IA_Head_Error" => Ok(HeRuleSemantics::ReturnArgHeadError),
+        "C_Return:IA_Head_RestNil" => Ok(HeRuleSemantics::ReturnArgHeadRestNil),
+        "C_Return:IA_Head_Recurse" => Ok(HeRuleSemantics::ReturnArgHeadRecurse),
+        "C_Return:IA_Tail_Empty" => Ok(HeRuleSemantics::ReturnArgTailEmpty),
+        "C_Return:IA_Tail_Error" => Ok(HeRuleSemantics::ReturnArgTailError),
+        "C_Return:IA_Tail_Cons" => Ok(HeRuleSemantics::ReturnArgTailCons),
+        "C_InterpTuple:IT_Nil" => Ok(HeRuleSemantics::InterpTupleNil),
+        "C_InterpTuple:IT_StartCons" => Ok(HeRuleSemantics::InterpTupleStartCons),
+        "C_Return:IT_Head_Empty" => Ok(HeRuleSemantics::ReturnTupleHeadEmpty),
+        "C_Return:IT_Head_Error" => Ok(HeRuleSemantics::ReturnTupleHeadError),
+        "C_Return:IT_Head_TailNil" => Ok(HeRuleSemantics::ReturnTupleHeadTailNil),
+        "C_Return:IT_Head_Recurse" => Ok(HeRuleSemantics::ReturnTupleHeadRecurse),
+        "C_Return:IT_Tail_Empty" => Ok(HeRuleSemantics::ReturnTupleTailEmpty),
+        "C_Return:IT_Tail_Error" => Ok(HeRuleSemantics::ReturnTupleTailError),
+        "C_Return:IT_Tail_Cons" => Ok(HeRuleSemantics::ReturnTupleTailCons),
+        "C_MettaCall:MC_Error" => Ok(HeRuleSemantics::MettaCallError),
+        "C_MettaCall:MC_Grounded" => Ok(HeRuleSemantics::MettaCallGrounded),
+        "C_MettaCall:MC_Equation" => Ok(HeRuleSemantics::MettaCallEquation),
+        "C_MettaCall:MC_NoMatch" => Ok(HeRuleSemantics::MettaCallNoMatch),
+        "C_TypeCast:TC_Match" => Ok(HeRuleSemantics::TypeCastMatch),
+        "C_TypeCast:TC_Mismatch" => Ok(HeRuleSemantics::TypeCastMismatch),
+        "C_Return:R_Done" => Ok(HeRuleSemantics::ReturnFinalize),
+        _ => Err(format!(
+            "unknown HE logical transition id '{}' in transition artifact",
+            logical_transition_id
+        )),
     }
-    if artifact.sources.is_empty() {
-        return Err(format!(
-            "invalid HE transition spec at {}: sources cannot be empty",
-            json_path.display()
-        ));
-    }
-    if artifact.rules.is_empty() {
-        return Err(format!(
-            "invalid HE transition spec at {}: rules cannot be empty",
-            json_path.display()
-        ));
-    }
+}
 
-    let mut rule_to_source: HashMap<String, String> = HashMap::new();
+#[cfg(feature = "mork-backend")]
+fn validate_he_transition_artifact(artifact: &TransitionArtifact) -> Result<(), String> {
     let mut seen_transition_ids: HashSet<&str> = HashSet::new();
+    let mut seen_rule_sources: HashMap<String, String> = HashMap::new();
     for rule in &artifact.rules {
         if rule.logical_transition_id.trim().is_empty() {
-            return Err(format!(
-                "invalid HE transition spec at {}: logical_transition_id must be non-empty",
-                json_path.display()
-            ));
+            return Err(
+                "invalid HE transition spec: logical_transition_id must be non-empty".to_string()
+            );
         }
         if !seen_transition_ids.insert(rule.logical_transition_id.as_str()) {
             return Err(format!(
-                "invalid HE transition spec at {}: duplicate logical_transition_id '{}'",
-                json_path.display(),
+                "invalid HE transition spec: duplicate logical_transition_id '{}'",
                 rule.logical_transition_id
             ));
         }
         if rule.source_instr.trim().is_empty() || rule.source_label.trim().is_empty() {
             return Err(format!(
-                "invalid HE transition spec at {}: rule '{}' has empty source_instr/source_label",
-                json_path.display(),
+                "invalid HE transition spec: rule '{}' has empty source_instr/source_label",
                 rule.logical_transition_id
             ));
         }
         if !rule.source_instr.starts_with("C_") {
             return Err(format!(
-                "invalid HE transition spec at {}: rule '{}' source_instr '{}' must start with C_",
-                json_path.display(),
-                rule.logical_transition_id,
-                rule.source_instr
+                "invalid HE transition spec: rule '{}' source_instr '{}' must start with C_",
+                rule.logical_transition_id, rule.source_instr
             ));
         }
         if !is_rule_id(&rule.rule_id) {
             return Err(format!(
-                "invalid HE transition spec at {}: rule '{}' has invalid rule_id '{}'",
-                json_path.display(),
-                rule.logical_transition_id,
-                rule.rule_id
+                "invalid HE transition spec: rule '{}' has invalid rule_id '{}'",
+                rule.logical_transition_id, rule.rule_id
             ));
         }
         if rule.sem_key.source_instr_class.trim().is_empty()
@@ -971,15 +971,13 @@ fn validate_and_index_transition_artifact(
             || rule.sem_key.effect_kind.trim().is_empty()
         {
             return Err(format!(
-                "invalid HE transition spec at {}: rule '{}' has incomplete sem_key",
-                json_path.display(),
+                "invalid HE transition spec: rule '{}' has incomplete sem_key",
                 rule.logical_transition_id
             ));
         }
         if rule.sem_key.contracts.is_empty() {
             return Err(format!(
-                "invalid HE transition spec at {}: rule '{}' sem_key.contracts cannot be empty",
-                json_path.display(),
+                "invalid HE transition spec: rule '{}' sem_key.contracts cannot be empty",
                 rule.logical_transition_id
             ));
         }
@@ -987,21 +985,17 @@ fn validate_and_index_transition_artifact(
         for contract in &rule.sem_key.contracts {
             if contract.trim().is_empty() {
                 return Err(format!(
-                    "invalid HE transition spec at {}: rule '{}' has empty sem_key contract",
-                    json_path.display(),
+                    "invalid HE transition spec: rule '{}' has empty sem_key contract",
                     rule.logical_transition_id
                 ));
             }
             if !seen_contracts.insert(contract.as_str()) {
                 return Err(format!(
-                    "invalid HE transition spec at {}: rule '{}' has duplicate sem_key contract '{}'",
-                    json_path.display(),
-                    rule.logical_transition_id,
-                    contract
+                    "invalid HE transition spec: rule '{}' has duplicate sem_key contract '{}'",
+                    rule.logical_transition_id, contract
                 ));
             }
         }
-        // Present for schema compatibility; allow null or a non-empty string.
         if rule
             .sem_key
             .dialect_ext
@@ -1009,46 +1003,38 @@ fn validate_and_index_transition_artifact(
             .is_some_and(|s| s.trim().is_empty())
         {
             return Err(format!(
-                "invalid HE transition spec at {}: rule '{}' has empty sem_key.dialect_ext",
-                json_path.display(),
+                "invalid HE transition spec: rule '{}' has empty sem_key.dialect_ext",
                 rule.logical_transition_id
             ));
         }
-        let _priority = rule.priority;
+        let _ = he_semantics_for(&rule.logical_transition_id)?;
         if let Some(prev_source) =
-            rule_to_source.insert(rule.rule_id.clone(), rule.source_instr.clone())
+            seen_rule_sources.insert(rule.rule_id.clone(), rule.source_instr.clone())
         {
             if prev_source != rule.source_instr {
                 return Err(format!(
-                    "invalid HE transition spec at {}: rule_id '{}' mapped to multiple sources ('{}', '{}')",
-                    json_path.display(),
-                    rule.rule_id,
-                    prev_source,
-                    rule.source_instr
+                    "invalid HE transition spec: rule_id '{}' mapped to multiple sources ('{}', '{}')",
+                    rule.rule_id, prev_source, rule.source_instr
                 ));
             }
         }
     }
 
-    let mut by_source_instr: HashMap<String, Vec<String>> = HashMap::new();
-    for source in artifact.sources {
+    let mut seen_source_instrs: HashSet<&str> = HashSet::new();
+    for source in &artifact.sources {
         if source.source_instr.trim().is_empty() || source.source_label.trim().is_empty() {
-            return Err(format!(
-                "invalid HE transition spec at {}: source_instr/source_label must be non-empty",
-                json_path.display()
-            ));
+            return Err("invalid HE transition spec: source_instr/source_label must be non-empty"
+                .to_string());
         }
         if !source.source_instr.starts_with("C_") {
             return Err(format!(
-                "invalid HE transition spec at {}: source_instr '{}' must start with C_",
-                json_path.display(),
+                "invalid HE transition spec: source_instr '{}' must start with C_",
                 source.source_instr
             ));
         }
         if source.ordered_rules.is_empty() {
             return Err(format!(
-                "invalid HE transition spec at {}: '{}' must have at least one ordered rule",
-                json_path.display(),
+                "invalid HE transition spec: '{}' must have at least one ordered rule",
                 source.source_instr
             ));
         }
@@ -1056,48 +1042,35 @@ fn validate_and_index_transition_artifact(
         for rule in &source.ordered_rules {
             if !is_rule_id(rule) {
                 return Err(format!(
-                    "invalid HE transition spec at {}: '{}' includes invalid rule id '{}'",
-                    json_path.display(),
-                    source.source_instr,
-                    rule
+                    "invalid HE transition spec: '{}' includes invalid rule id '{}'",
+                    source.source_instr, rule
                 ));
             }
             if !seen_rules.insert(rule.as_str()) {
                 return Err(format!(
-                    "invalid HE transition spec at {}: '{}' has duplicate rule '{}'",
-                    json_path.display(),
-                    source.source_instr,
-                    rule
+                    "invalid HE transition spec: '{}' has duplicate rule '{}'",
+                    source.source_instr, rule
                 ));
             }
-            match rule_to_source.get(rule) {
+            match seen_rule_sources.get(rule) {
                 Some(mapped_source) if mapped_source == &source.source_instr => {},
                 Some(mapped_source) => {
                     return Err(format!(
-                        "invalid HE transition spec at {}: '{}' lists rule '{}' but semantic rule source is '{}'",
-                        json_path.display(),
-                        source.source_instr,
-                        rule,
-                        mapped_source
+                        "invalid HE transition spec: '{}' lists rule '{}' but semantic rule source is '{}'",
+                        source.source_instr, rule, mapped_source
                     ));
                 },
                 None => {
                     return Err(format!(
-                        "invalid HE transition spec at {}: '{}' lists unknown rule '{}' (missing from rules[])",
-                        json_path.display(),
-                        source.source_instr,
-                        rule
+                        "invalid HE transition spec: '{}' lists unknown rule '{}' (missing from rules[])",
+                        source.source_instr, rule
                     ));
                 },
             }
         }
-        if by_source_instr
-            .insert(source.source_instr.clone(), source.ordered_rules)
-            .is_some()
-        {
+        if !seen_source_instrs.insert(source.source_instr.as_str()) {
             return Err(format!(
-                "invalid HE transition spec at {}: duplicate source_instr '{}'",
-                json_path.display(),
+                "invalid HE transition spec: duplicate source_instr '{}'",
                 source.source_instr
             ));
         }
@@ -1113,114 +1086,189 @@ fn validate_and_index_transition_artifact(
         "C_TypeCast",
         "C_Return",
     ] {
-        if !by_source_instr.contains_key(required) {
+        if !seen_source_instrs.contains(required) {
             return Err(format!(
-                "invalid HE transition spec at {}: missing required source '{}'",
-                json_path.display(),
+                "invalid HE transition spec: missing required source '{}'",
                 required
             ));
         }
     }
-    for (rule_id, source_instr) in &rule_to_source {
-        let Some(ordered) = by_source_instr.get(source_instr) else {
+    Ok(())
+}
+
+#[cfg(feature = "mork-backend")]
+fn validate_and_index_rewrite_ir_artifact(
+    artifact: RewriteIRArtifact,
+) -> Result<HeRewriteIRSpec, String> {
+    let mut by_rule_id: HashMap<String, HeRewriteIRRule> = HashMap::new();
+    for rule in artifact.rules {
+        if !is_rule_id(&rule.rule_id) {
+            return Err(format!("invalid HE rewrite-ir: invalid rule_id '{}'", rule.rule_id));
+        }
+        if rule.rule_name.trim().is_empty() {
             return Err(format!(
-                "invalid HE transition spec at {}: rule '{}' points to missing source '{}'",
-                json_path.display(),
-                rule_id,
-                source_instr
+                "invalid HE rewrite-ir: rule '{}' has empty rule_name",
+                rule.rule_id
             ));
+        }
+        if !rule.source_instr.starts_with("C_") {
+            return Err(format!(
+                "invalid HE rewrite-ir: rule '{}' source_instr '{}' must start with C_",
+                rule.rule_id, rule.source_instr
+            ));
+        }
+        if rule.source_label.trim().is_empty() {
+            return Err(format!(
+                "invalid HE rewrite-ir: rule '{}' has empty source_label",
+                rule.rule_id
+            ));
+        }
+        if rule.left_repr.trim().is_empty() || rule.right_repr.trim().is_empty() {
+            return Err(format!(
+                "invalid HE rewrite-ir: rule '{}' has empty left_repr/right_repr",
+                rule.rule_id
+            ));
+        }
+        let mut seen_premises: HashSet<&str> = HashSet::new();
+        for rel in &rule.premise_relations {
+            if rel.trim().is_empty() {
+                return Err(format!(
+                    "invalid HE rewrite-ir: rule '{}' has empty premise relation",
+                    rule.rule_id
+                ));
+            }
+            if !seen_premises.insert(rel.as_str()) {
+                return Err(format!(
+                    "invalid HE rewrite-ir: rule '{}' has duplicate premise relation '{}'",
+                    rule.rule_id, rel
+                ));
+            }
+        }
+
+        let indexed = HeRewriteIRRule {
+            source_instr: rule.source_instr,
+            priority: rule.priority,
         };
-        if !ordered.contains(rule_id) {
-            return Err(format!(
-                "invalid HE transition spec at {}: rule '{}' is not referenced in ordered_rules for '{}'",
-                json_path.display(),
-                rule_id,
+        if by_rule_id.insert(rule.rule_id.clone(), indexed).is_some() {
+            return Err(format!("invalid HE rewrite-ir: duplicate rule_id '{}'", rule.rule_id));
+        }
+    }
+
+    Ok(HeRewriteIRSpec { by_rule_id })
+}
+
+#[cfg(feature = "mork-backend")]
+fn validate_transition_rewrite_alignment(
+    transition: &NativeTransitionContract,
+    rewrite_ir: &HeRewriteIRSpec,
+) -> Result<(), String> {
+    for (source_instr, ordered_rules) in transition.ordered_rule_map() {
+        for rule_id in ordered_rules {
+            let Some(meta) = rewrite_ir.rule(rule_id) else {
+                return Err(format!(
+                    "HE rewrite contract mismatch: transition source '{}' references missing rewrite_ir rule '{}'",
+                    source_instr, rule_id
+                ));
+            };
+            if meta.source_instr != *source_instr {
+                return Err(format!(
+                    "HE rewrite contract mismatch: transition source '{}' references rule '{}' but rewrite_ir maps it to '{}'",
+                    source_instr, rule_id, meta.source_instr
+                ));
+            }
+        }
+    }
+
+    let mut by_source_from_ir: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+    for (rule_id, meta) in &rewrite_ir.by_rule_id {
+        by_source_from_ir
+            .entry(meta.source_instr.clone())
+            .or_default()
+            .push((meta.priority, rule_id.clone()));
+    }
+    for rules in by_source_from_ir.values_mut() {
+        rules.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    }
+
+    for (source_instr, ordered_rules) in transition.ordered_rule_map() {
+        let ir_rules = by_source_from_ir.get(source_instr).ok_or_else(|| {
+            format!(
+                "HE rewrite contract mismatch: transition source '{}' missing from rewrite_ir",
                 source_instr
+            )
+        })?;
+        let ir_ordered: Vec<String> = ir_rules.iter().map(|(_, rid)| rid.clone()).collect();
+        if ir_ordered != *ordered_rules {
+            return Err(format!(
+                "HE rewrite contract mismatch: ordered rules differ for '{}': transition={:?} rewrite_ir={:?}",
+                source_instr, ordered_rules, ir_ordered
             ));
         }
     }
-
-    Ok(HeRewriteTransitionSpec { by_source_instr })
+    Ok(())
 }
 
 #[cfg(feature = "mork-backend")]
-fn load_transition_spec_from_paths(
-    json_path: &Path,
-    checksum_path: &Path,
-) -> Result<HeRewriteTransitionSpec, String> {
-    let json_text_raw = fs::read_to_string(json_path).map_err(|e| {
-        format!("failed reading HE transition spec json {}: {}", json_path.display(), e)
-    })?;
-    let checksum_text_raw = fs::read_to_string(checksum_path).map_err(|e| {
-        format!("failed reading HE transition spec checksum {}: {}", checksum_path.display(), e)
-    })?;
-    let json_text = json_text_raw.trim();
-    let checksum_text = checksum_text_raw.trim();
-    let expected_checksum: u64 = checksum_text.parse().map_err(|e| {
-        format!(
-            "invalid HE transition spec checksum '{}' at {}: {}",
-            checksum_text,
-            checksum_path.display(),
-            e
-        )
-    })?;
-    let actual_checksum = fnv1a64(json_text);
-    if actual_checksum != expected_checksum {
-        return Err(format!(
-            "HE transition spec checksum mismatch for {}: expected {}, got {}",
-            json_path.display(),
-            expected_checksum,
-            actual_checksum
-        ));
-    }
-
-    let artifact: HeTransitionSpecArtifact = serde_json::from_str(json_text).map_err(|e| {
-        format!("invalid HE transition spec json payload at {}: {}", json_path.display(), e)
-    })?;
-    if artifact.schema_version != EXPECTED_HE_TRANSITION_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported HE transition spec schema_version {} at {} (expected {})",
-            artifact.schema_version,
-            json_path.display(),
-            EXPECTED_HE_TRANSITION_SCHEMA_VERSION
-        ));
-    }
-    validate_and_index_transition_artifact(artifact, json_path)
+fn load_he_rewrite_contract_from_artifacts() -> Result<HeRewriteContract, String> {
+    let transition_artifact = load_mettahe_transition_artifact()?;
+    validate_he_transition_artifact(&transition_artifact)?;
+    let lookup_artifact = load_mettahe_lookup_artifact()?;
+    let rewrite_ir_artifact = load_mettahe_rewrite_ir_artifact()?;
+    let rewrite_ir = validate_and_index_rewrite_ir_artifact(rewrite_ir_artifact.clone())?;
+    let transition = build_native_transition_contract(
+        "MeTTaHE",
+        transition_artifact,
+        lookup_artifact,
+        rewrite_ir_artifact,
+        |lookup| {
+            let Some(eq_query) = lookup.families.iter().find(|f| f.family == "eqQuery") else {
+                return Err("HE lookup-plan missing required eqQuery family".to_string());
+            };
+            if eq_query.raw_relation != "eqQueryRaw"
+                || eq_query.has_relation != "eqQueryHas"
+                || eq_query.result_relation.as_deref() != Some("eqQueryResult")
+            {
+                return Err(format!(
+                    "HE lookup-plan eqQuery family has unexpected relation names: raw='{}' has='{}' result={:?}",
+                    eq_query.raw_relation, eq_query.has_relation, eq_query.result_relation
+                ));
+            }
+            if !eq_query.contracts.no_false_negatives
+                || !eq_query.contracts.stratified_negation_safe
+            {
+                return Err(
+                    "HE lookup-plan eqQuery family must be no-false-negatives and stratified-negation-safe"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        },
+    )?;
+    validate_transition_rewrite_alignment(&transition, &rewrite_ir)?;
+    Ok(HeRewriteContract { transition, rewrite_ir })
 }
 
 #[cfg(feature = "mork-backend")]
-fn load_he_rewrite_transition_spec_from_artifacts() -> Result<HeRewriteTransitionSpec, String> {
-    let mut first_error: Option<String> = None;
-    for dir in candidate_transition_spec_dirs() {
-        let (json_path, checksum_path) = transition_spec_paths(&dir);
-        if !json_path.exists() || !checksum_path.exists() {
-            continue;
-        }
-        match load_transition_spec_from_paths(&json_path, &checksum_path) {
-            Ok(spec) => return Ok(spec),
-            Err(err) => {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            },
-        }
-    }
-    match first_error {
-        Some(err) => Err(err),
-        None => Err(
-            "missing HE transition-spec artifact: expected he.transition_spec.json/checksum (set METTAIL_TRANSITION_SPEC_DIR or run `lake env lean --run Mettapedia/Languages/MeTTa/HE/TransitionSpec.lean export <out-dir>`)"
-                .to_string(),
-        ),
-    }
-}
-
-#[cfg(feature = "mork-backend")]
-fn he_rewrite_transition_spec() -> Result<&'static HeRewriteTransitionSpec, String> {
-    static SPEC: OnceLock<Result<HeRewriteTransitionSpec, String>> = OnceLock::new();
-    match SPEC.get_or_init(load_he_rewrite_transition_spec_from_artifacts) {
-        Ok(spec) => Ok(spec),
+fn he_rewrite_contract() -> Result<&'static HeRewriteContract, String> {
+    static CONTRACT: OnceLock<Result<HeRewriteContract, String>> = OnceLock::new();
+    match CONTRACT.get_or_init(load_he_rewrite_contract_from_artifacts) {
+        Ok(contract) => Ok(contract),
         Err(err) => Err(err.clone()),
     }
+}
+
+#[cfg(feature = "mork-backend")]
+pub fn he_transition_artifact_rule_ids() -> Result<Vec<String>, String> {
+    let contract = he_rewrite_contract()?;
+    let mut ids: Vec<String> = contract
+        .transition
+        .ordered_rule_map()
+        .values()
+        .flat_map(|rules| rules.iter().cloned())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 #[cfg(feature = "mork-backend")]
@@ -1262,118 +1310,256 @@ fn he_native_step_state(
         }
     }
 
-    type HeRuleHandler =
-        fn(&HeStepContext<'_>, MorkExecutionLimits, &mut f64) -> Result<Vec<State>, String>;
+    fn he_rule_metta_empty(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_Metta(atom, _) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if he_is_empty(atom) {
+            return Ok(vec![ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone())]);
+        }
+        Ok(Vec::new())
+    }
 
-    fn he_rule_group_metta(
-        rule: &str,
-        ctx: &HeStepContext<'_>,
-        _limits: MorkExecutionLimits,
-        _mork_eval_ms: &mut f64,
-    ) -> Result<Vec<State>, String> {
-        let mut out = Vec::new();
+    fn he_rule_metta_error(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_Metta(atom, _) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if he_is_error(atom) {
+            return Ok(vec![ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone())]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_metta_type_match(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
         let Instr::C_Metta(atom, ty) = ctx.instr else {
-            return Ok(out);
+            return Ok(Vec::new());
         };
-        match rule {
-            "R0" if he_is_empty(atom) => {
-                out.push(ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone()))
-            },
-            "R1" if he_is_error(atom) => {
-                out.push(ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone()))
-            },
-            "R2" if he_type_matches_meta_or_atom(atom, ty) => {
-                out.push(ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone()))
-            },
-            "R3" if he_needs_type_cast(atom, ty) => out.push(
-                ctx.mk_state(he_instr_type_cast((**atom).clone(), (**ty).clone()), ctx.out.clone()),
-            ),
-            "R4" if he_needs_interp_expr(atom, ty) => {
-                out.push(ctx.mk_state(
-                    he_instr_interp_expr((**atom).clone(), (**ty).clone()),
-                    ctx.out.clone(),
-                ))
-            },
-            _ => {},
+        if he_type_matches_meta_or_atom(atom, ty) {
+            return Ok(vec![ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone())]);
         }
-        Ok(out)
+        Ok(Vec::new())
     }
 
-    fn he_rule_group_interp_expr(
-        rule: &str,
-        ctx: &HeStepContext<'_>,
-        _limits: MorkExecutionLimits,
-        _mork_eval_ms: &mut f64,
-    ) -> Result<Vec<State>, String> {
-        let mut out = Vec::new();
+    fn he_rule_metta_type_cast(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_Metta(atom, ty) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if he_needs_type_cast(atom, ty) {
+            return Ok(vec![ctx.mk_state(
+                he_instr_type_cast((**atom).clone(), (**ty).clone()),
+                ctx.out.clone(),
+            )]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_metta_expression(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_Metta(atom, ty) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if he_needs_interp_expr(atom, ty) {
+            return Ok(vec![ctx.mk_state(
+                he_instr_interp_expr((**atom).clone(), (**ty).clone()),
+                ctx.out.clone(),
+            )]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_interp_expr_func_type(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
         let Instr::C_InterpExpr(atom, ty) = ctx.instr else {
-            return Ok(out);
+            return Ok(Vec::new());
         };
-        match rule {
-            "R5" => {
-                if let Some(op_type_ret_type) = find_applicable_func_type(ctx.space, atom, ty) {
-                    if let Atom::C_ExprCons(op_type, ret_type) = op_type_ret_type {
-                        out.push(ctx.mk_state(
-                            he_instr_interp_func(
-                                (**atom).clone(),
-                                (*op_type).clone(),
-                                (*ret_type).clone(),
-                            ),
-                            ctx.out.clone(),
-                        ));
-                    }
-                }
-            },
-            "R6" => {
-                if let Some(non_func_ty) = has_non_func_types(ctx.space, atom) {
-                    if find_applicable_func_type(ctx.space, atom, &non_func_ty).is_none() {
-                        out.push(
-                            ctx.mk_state(he_instr_interp_tuple((**atom).clone()), ctx.out.clone()),
-                        );
-                    }
-                }
-            },
-            "R7" if he_not_expression(atom) => {
-                out.push(ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone()))
-            },
-            _ => {},
+        if let Some(op_type_ret_type) = find_applicable_func_type(ctx.space, atom, ty) {
+            if let Atom::C_ExprCons(op_type, ret_type) = op_type_ret_type {
+                return Ok(vec![ctx.mk_state(
+                    he_instr_interp_func((**atom).clone(), (*op_type).clone(), (*ret_type).clone()),
+                    ctx.out.clone(),
+                )]);
+            }
         }
-        Ok(out)
+        Ok(Vec::new())
     }
 
-    fn he_rule_group_interp_func(
-        rule: &str,
-        ctx: &HeStepContext<'_>,
-        _limits: MorkExecutionLimits,
-        _mork_eval_ms: &mut f64,
-    ) -> Result<Vec<State>, String> {
-        let mut out = Vec::new();
-        let Instr::C_InterpFunc(atom, op_type, ret_type) = ctx.instr else {
-            return Ok(out);
+    fn he_rule_interp_expr_tuple_type(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_InterpExpr(atom, _) = ctx.instr else {
+            return Ok(Vec::new());
         };
-        match rule {
-            "R8" => {
-                if let Atom::C_ExprCons(op, args_tail) = atom.as_ref() {
-                    out.push(ctx.mk_state(
-                        he_instr_metta((**op).clone(), (**op_type).clone()),
-                        Atom::C_KAfterOp(
-                            args_tail.clone(),
-                            Box::new((**op_type).clone()),
-                            Box::new((**ret_type).clone()),
-                            Box::new(ctx.out.clone()),
-                        ),
-                    ));
-                }
-            },
-            "R9" if atom.as_ref() == &Atom::C_ExprNil => {
-                out.push(ctx.mk_state(he_instr_return(Atom::C_ExprNil), ctx.out.clone()))
-            },
-            "R10" if he_not_expression(atom) => {
-                out.push(ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone()))
-            },
-            _ => {},
+        if let Some(non_func_ty) = has_non_func_types(ctx.space, atom) {
+            if find_applicable_func_type(ctx.space, atom, &non_func_ty).is_none() {
+                return Ok(vec![ctx.mk_state(
+                    he_instr_interp_tuple((**atom).clone()),
+                    ctx.out.clone(),
+                )]);
+            }
         }
-        Ok(out)
+        Ok(Vec::new())
+    }
+
+    fn he_rule_interp_expr_not_expr(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_InterpExpr(atom, _) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if he_not_expression(atom) {
+            return Ok(vec![ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone())]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_interp_func_start(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_InterpFunc(atom, op_type, ret_type) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if let Atom::C_ExprCons(op, args_tail) = atom.as_ref() {
+            return Ok(vec![ctx.mk_state(
+                he_instr_metta((**op).clone(), (**op_type).clone()),
+                Atom::C_KAfterOp(
+                    args_tail.clone(),
+                    Box::new((**op_type).clone()),
+                    Box::new((**ret_type).clone()),
+                    Box::new(ctx.out.clone()),
+                ),
+            )]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_interp_func_nil(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_InterpFunc(atom, _, _) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if atom.as_ref() == &Atom::C_ExprNil {
+            return Ok(vec![ctx.mk_state(he_instr_return(Atom::C_ExprNil), ctx.out.clone())]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_interp_func_not_expr(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_InterpFunc(atom, _, _) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if he_not_expression(atom) {
+            return Ok(vec![ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone())]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_metta_call_error(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_MettaCall(atom, _) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if he_is_error(atom) {
+            return Ok(vec![ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone())]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_metta_call_grounded(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_MettaCall(atom, ty) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if let Atom::C_ExprCons(op, args_tail) = atom.as_ref() {
+            if ty.as_ref() != &Atom::C_AtomType && is_executable_grounded(op.as_ref()).is_some() {
+                if let Some(result) = eval_grounded_dispatch((**op).clone(), (**args_tail).clone())
+                {
+                    return Ok(vec![ctx.mk_state(
+                        he_instr_metta(result, (**ty).clone()),
+                        ctx.out.clone(),
+                    )]);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_metta_call_equation(
+        ctx: &HeStepContext<'_>,
+        limits: MorkExecutionLimits,
+        mork_eval_ms: &mut f64,
+    ) -> Result<Vec<State>, String> {
+        let Instr::C_MettaCall(atom, ty) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if is_not_executable_grounded(atom).is_none() {
+            return Ok(Vec::new());
+        }
+        let equations = extract_space_equations(ctx.space)?;
+        let query = atom_to_mork_sexpr(atom)?;
+        let eval_started = Instant::now();
+        let mork_results = mork_eval::run_mork_query_with_limits(&equations, &query, limits)?;
+        *mork_eval_ms += eval_started.elapsed().as_secs_f64() * 1000.0;
+
+        Ok(mork_results
+            .into_iter()
+            .map(|rhs| {
+                ctx.mk_state(
+                    he_instr_metta(mork_atom_to_he_atom(&rhs), (**ty).clone()),
+                    ctx.out.clone(),
+                )
+            })
+            .collect())
+    }
+
+    fn he_rule_metta_call_no_match(
+        ctx: &HeStepContext<'_>,
+        limits: MorkExecutionLimits,
+        mork_eval_ms: &mut f64,
+    ) -> Result<Vec<State>, String> {
+        let Instr::C_MettaCall(atom, _) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if is_not_executable_grounded(atom).is_none() {
+            return Ok(Vec::new());
+        }
+        let equations = extract_space_equations(ctx.space)?;
+        let query = atom_to_mork_sexpr(atom)?;
+        let eval_started = Instant::now();
+        let mork_results = mork_eval::run_mork_query_with_limits(&equations, &query, limits)?;
+        *mork_eval_ms += eval_started.elapsed().as_secs_f64() * 1000.0;
+        if mork_results.is_empty() {
+            return Ok(vec![ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone())]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_type_cast_match(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_TypeCast(atom, ty) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if let Some(actual) = he_type_of(ctx.space, atom) {
+            if actual == **ty {
+                return Ok(vec![ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone())]);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_type_cast_mismatch(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_TypeCast(atom, ty) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if let Some(actual) = he_type_of(ctx.space, atom) {
+            if actual != **ty {
+                return Ok(vec![ctx.mk_state(
+                    he_instr_return(Atom::C_ErrorAtom(
+                        Box::new((**atom).clone()),
+                        Box::new(Atom::C_BadType(Box::new((**ty).clone()), Box::new(actual))),
+                    )),
+                    ctx.out.clone(),
+                )]);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn he_rule_return_finalize(ctx: &HeStepContext<'_>) -> Result<Vec<State>, String> {
+        let Instr::C_Return(result) = ctx.instr else {
+            return Ok(Vec::new());
+        };
+        if he_is_empty(ctx.out) {
+            return Ok(vec![ctx.mk_state(Instr::C_Done, (**result).clone())]);
+        }
+        Ok(Vec::new())
     }
 
     fn he_rule_group_interp_args(
@@ -1429,93 +1615,6 @@ fn he_native_step_state(
                 Atom::C_KTupleTail(Box::new((**tail).clone()), Box::new(ctx.out.clone())),
             )),
             _ => {},
-        }
-        Ok(out)
-    }
-
-    fn he_rule_group_metta_call(
-        rule: &str,
-        ctx: &HeStepContext<'_>,
-        limits: MorkExecutionLimits,
-        mork_eval_ms: &mut f64,
-    ) -> Result<Vec<State>, String> {
-        let mut out = Vec::new();
-        let Instr::C_MettaCall(atom, ty) = ctx.instr else {
-            return Ok(out);
-        };
-        match rule {
-            "R36" if he_is_error(atom) => {
-                out.push(ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone()))
-            },
-            "R37" => {
-                if let Atom::C_ExprCons(op, args_tail) = atom.as_ref() {
-                    if ty.as_ref() != &Atom::C_AtomType
-                        && is_executable_grounded(op.as_ref()).is_some()
-                    {
-                        if let Some(result) =
-                            eval_grounded_dispatch((**op).clone(), (**args_tail).clone())
-                        {
-                            out.push(
-                                ctx.mk_state(
-                                    he_instr_metta(result, (**ty).clone()),
-                                    ctx.out.clone(),
-                                ),
-                            );
-                        }
-                    }
-                }
-            },
-            "R38" | "R39" => {
-                if is_not_executable_grounded(atom).is_some() {
-                    let equations = extract_space_equations(ctx.space)?;
-                    let query = atom_to_mork_sexpr(atom)?;
-                    let eval_started = Instant::now();
-                    let mork_results =
-                        mork_eval::run_mork_query_with_limits(&equations, &query, limits)?;
-                    *mork_eval_ms += eval_started.elapsed().as_secs_f64() * 1000.0;
-
-                    if rule == "R39" && mork_results.is_empty() {
-                        out.push(ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone()));
-                    }
-                    if rule == "R38" {
-                        for rhs in mork_results {
-                            out.push(ctx.mk_state(
-                                he_instr_metta(mork_atom_to_he_atom(&rhs), (**ty).clone()),
-                                ctx.out.clone(),
-                            ));
-                        }
-                    }
-                }
-            },
-            _ => {},
-        }
-        Ok(out)
-    }
-
-    fn he_rule_group_type_cast(
-        rule: &str,
-        ctx: &HeStepContext<'_>,
-        _limits: MorkExecutionLimits,
-        _mork_eval_ms: &mut f64,
-    ) -> Result<Vec<State>, String> {
-        let mut out = Vec::new();
-        let Instr::C_TypeCast(atom, ty) = ctx.instr else {
-            return Ok(out);
-        };
-        if let Some(actual) = he_type_of(ctx.space, atom) {
-            match rule {
-                "R40" if actual == **ty => {
-                    out.push(ctx.mk_state(he_instr_return((**atom).clone()), ctx.out.clone()))
-                },
-                "R41" if actual != **ty => out.push(ctx.mk_state(
-                    he_instr_return(Atom::C_ErrorAtom(
-                        Box::new((**atom).clone()),
-                        Box::new(Atom::C_BadType(Box::new((**ty).clone()), Box::new(actual))),
-                    )),
-                    ctx.out.clone(),
-                )),
-                _ => {},
-            }
         }
         Ok(out)
     }
@@ -1765,111 +1864,111 @@ fn he_native_step_state(
         Ok(out)
     }
 
-    macro_rules! he_rule_wrapper {
-        ($name:ident, $group:ident, $rule:literal) => {
-            fn $name(
-                ctx: &HeStepContext<'_>,
-                limits: MorkExecutionLimits,
-                mork_eval_ms: &mut f64,
-            ) -> Result<Vec<State>, String> {
-                $group($rule, ctx, limits, mork_eval_ms)
-            }
-        };
-    }
-
-    he_rule_wrapper!(he_rule_r0, he_rule_group_metta, "R0");
-    he_rule_wrapper!(he_rule_r1, he_rule_group_metta, "R1");
-    he_rule_wrapper!(he_rule_r2, he_rule_group_metta, "R2");
-    he_rule_wrapper!(he_rule_r3, he_rule_group_metta, "R3");
-    he_rule_wrapper!(he_rule_r4, he_rule_group_metta, "R4");
-    he_rule_wrapper!(he_rule_r5, he_rule_group_interp_expr, "R5");
-    he_rule_wrapper!(he_rule_r6, he_rule_group_interp_expr, "R6");
-    he_rule_wrapper!(he_rule_r7, he_rule_group_interp_expr, "R7");
-    he_rule_wrapper!(he_rule_r8, he_rule_group_interp_func, "R8");
-    he_rule_wrapper!(he_rule_r9, he_rule_group_interp_func, "R9");
-    he_rule_wrapper!(he_rule_r10, he_rule_group_interp_func, "R10");
-    he_rule_wrapper!(he_rule_r11, he_rule_group_return, "R11");
-    he_rule_wrapper!(he_rule_r12, he_rule_group_return, "R12");
-    he_rule_wrapper!(he_rule_r13, he_rule_group_return, "R13");
-    he_rule_wrapper!(he_rule_r14, he_rule_group_return, "R14");
-    he_rule_wrapper!(he_rule_r15, he_rule_group_return, "R15");
-    he_rule_wrapper!(he_rule_r16, he_rule_group_return, "R16");
-    he_rule_wrapper!(he_rule_r17, he_rule_group_return, "R17");
-    he_rule_wrapper!(he_rule_r18, he_rule_group_interp_args, "R18");
-    he_rule_wrapper!(he_rule_r19, he_rule_group_interp_args, "R19");
-    he_rule_wrapper!(he_rule_r20, he_rule_group_return, "R20");
-    he_rule_wrapper!(he_rule_r21, he_rule_group_return, "R21");
-    he_rule_wrapper!(he_rule_r22, he_rule_group_return, "R22");
-    he_rule_wrapper!(he_rule_r23, he_rule_group_return, "R23");
-    he_rule_wrapper!(he_rule_r24, he_rule_group_return, "R24");
-    he_rule_wrapper!(he_rule_r25, he_rule_group_return, "R25");
-    he_rule_wrapper!(he_rule_r26, he_rule_group_return, "R26");
-    he_rule_wrapper!(he_rule_r27, he_rule_group_interp_tuple, "R27");
-    he_rule_wrapper!(he_rule_r28, he_rule_group_interp_tuple, "R28");
-    he_rule_wrapper!(he_rule_r29, he_rule_group_return, "R29");
-    he_rule_wrapper!(he_rule_r30, he_rule_group_return, "R30");
-    he_rule_wrapper!(he_rule_r31, he_rule_group_return, "R31");
-    he_rule_wrapper!(he_rule_r32, he_rule_group_return, "R32");
-    he_rule_wrapper!(he_rule_r33, he_rule_group_return, "R33");
-    he_rule_wrapper!(he_rule_r34, he_rule_group_return, "R34");
-    he_rule_wrapper!(he_rule_r35, he_rule_group_return, "R35");
-    he_rule_wrapper!(he_rule_r36, he_rule_group_metta_call, "R36");
-    he_rule_wrapper!(he_rule_r37, he_rule_group_metta_call, "R37");
-    he_rule_wrapper!(he_rule_r38, he_rule_group_metta_call, "R38");
-    he_rule_wrapper!(he_rule_r39, he_rule_group_metta_call, "R39");
-    he_rule_wrapper!(he_rule_r40, he_rule_group_type_cast, "R40");
-    he_rule_wrapper!(he_rule_r41, he_rule_group_type_cast, "R41");
-    he_rule_wrapper!(he_rule_r42, he_rule_group_return, "R42");
-
-    fn he_rule_handler_table() -> &'static HashMap<&'static str, HeRuleHandler> {
-        static TABLE: OnceLock<HashMap<&'static str, HeRuleHandler>> = OnceLock::new();
-        TABLE.get_or_init(|| {
-            let mut m: HashMap<&'static str, HeRuleHandler> = HashMap::new();
-            m.insert("R0", he_rule_r0 as HeRuleHandler);
-            m.insert("R1", he_rule_r1 as HeRuleHandler);
-            m.insert("R2", he_rule_r2 as HeRuleHandler);
-            m.insert("R3", he_rule_r3 as HeRuleHandler);
-            m.insert("R4", he_rule_r4 as HeRuleHandler);
-            m.insert("R5", he_rule_r5 as HeRuleHandler);
-            m.insert("R6", he_rule_r6 as HeRuleHandler);
-            m.insert("R7", he_rule_r7 as HeRuleHandler);
-            m.insert("R8", he_rule_r8 as HeRuleHandler);
-            m.insert("R9", he_rule_r9 as HeRuleHandler);
-            m.insert("R10", he_rule_r10 as HeRuleHandler);
-            m.insert("R11", he_rule_r11 as HeRuleHandler);
-            m.insert("R12", he_rule_r12 as HeRuleHandler);
-            m.insert("R13", he_rule_r13 as HeRuleHandler);
-            m.insert("R14", he_rule_r14 as HeRuleHandler);
-            m.insert("R15", he_rule_r15 as HeRuleHandler);
-            m.insert("R16", he_rule_r16 as HeRuleHandler);
-            m.insert("R17", he_rule_r17 as HeRuleHandler);
-            m.insert("R18", he_rule_r18 as HeRuleHandler);
-            m.insert("R19", he_rule_r19 as HeRuleHandler);
-            m.insert("R20", he_rule_r20 as HeRuleHandler);
-            m.insert("R21", he_rule_r21 as HeRuleHandler);
-            m.insert("R22", he_rule_r22 as HeRuleHandler);
-            m.insert("R23", he_rule_r23 as HeRuleHandler);
-            m.insert("R24", he_rule_r24 as HeRuleHandler);
-            m.insert("R25", he_rule_r25 as HeRuleHandler);
-            m.insert("R26", he_rule_r26 as HeRuleHandler);
-            m.insert("R27", he_rule_r27 as HeRuleHandler);
-            m.insert("R28", he_rule_r28 as HeRuleHandler);
-            m.insert("R29", he_rule_r29 as HeRuleHandler);
-            m.insert("R30", he_rule_r30 as HeRuleHandler);
-            m.insert("R31", he_rule_r31 as HeRuleHandler);
-            m.insert("R32", he_rule_r32 as HeRuleHandler);
-            m.insert("R33", he_rule_r33 as HeRuleHandler);
-            m.insert("R34", he_rule_r34 as HeRuleHandler);
-            m.insert("R35", he_rule_r35 as HeRuleHandler);
-            m.insert("R36", he_rule_r36 as HeRuleHandler);
-            m.insert("R37", he_rule_r37 as HeRuleHandler);
-            m.insert("R38", he_rule_r38 as HeRuleHandler);
-            m.insert("R39", he_rule_r39 as HeRuleHandler);
-            m.insert("R40", he_rule_r40 as HeRuleHandler);
-            m.insert("R41", he_rule_r41 as HeRuleHandler);
-            m.insert("R42", he_rule_r42 as HeRuleHandler);
-            m
-        })
+    fn he_apply_rule_semantics(
+        meta: &NativeTransitionRuleMeta,
+        ctx: &HeStepContext<'_>,
+        limits: MorkExecutionLimits,
+        mork_eval_ms: &mut f64,
+    ) -> Result<Vec<State>, String> {
+        match he_semantics_for(&meta.logical_transition_id)? {
+            HeRuleSemantics::MettaEmpty => he_rule_metta_empty(ctx),
+            HeRuleSemantics::MettaError => he_rule_metta_error(ctx),
+            HeRuleSemantics::MettaTypeMatch => he_rule_metta_type_match(ctx),
+            HeRuleSemantics::MettaTypeCast => he_rule_metta_type_cast(ctx),
+            HeRuleSemantics::MettaExpression => he_rule_metta_expression(ctx),
+            HeRuleSemantics::InterpExprFuncType => he_rule_interp_expr_func_type(ctx),
+            HeRuleSemantics::InterpExprTupleType => he_rule_interp_expr_tuple_type(ctx),
+            HeRuleSemantics::InterpExprNotExpr => he_rule_interp_expr_not_expr(ctx),
+            HeRuleSemantics::InterpFuncStart => he_rule_interp_func_start(ctx),
+            HeRuleSemantics::InterpFuncNil => he_rule_interp_func_nil(ctx),
+            HeRuleSemantics::InterpFuncNotExpr => he_rule_interp_func_not_expr(ctx),
+            HeRuleSemantics::ReturnAfterOpEmpty => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnAfterOpError => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnAfterOpNoArgs => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnAfterOpEvalArgs => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnAfterArgsEmpty => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnAfterArgsError => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnAfterArgsCall => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::InterpArgsTyped => {
+                he_rule_group_interp_args(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::InterpArgsUndef => {
+                he_rule_group_interp_args(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnArgHeadEmpty => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnArgHeadError => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnArgHeadRestNil => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnArgHeadRecurse => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnArgTailEmpty => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnArgTailError => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnArgTailCons => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::InterpTupleNil => {
+                he_rule_group_interp_tuple(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::InterpTupleStartCons => {
+                he_rule_group_interp_tuple(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnTupleHeadEmpty => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnTupleHeadError => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnTupleHeadTailNil => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnTupleHeadRecurse => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnTupleTailEmpty => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnTupleTailError => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::ReturnTupleTailCons => {
+                he_rule_group_return(meta.rule_id.as_str(), ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::MettaCallError => he_rule_metta_call_error(ctx),
+            HeRuleSemantics::MettaCallGrounded => he_rule_metta_call_grounded(ctx),
+            HeRuleSemantics::MettaCallEquation => {
+                he_rule_metta_call_equation(ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::MettaCallNoMatch => {
+                he_rule_metta_call_no_match(ctx, limits, mork_eval_ms)
+            },
+            HeRuleSemantics::TypeCastMatch => he_rule_type_cast_match(ctx),
+            HeRuleSemantics::TypeCastMismatch => he_rule_type_cast_mismatch(ctx),
+            HeRuleSemantics::ReturnFinalize => he_rule_return_finalize(ctx),
+        }
     }
 
     let (instr, space, out) = match state {
@@ -1886,34 +1985,44 @@ fn he_native_step_state(
         return Ok(Vec::new());
     }
 
-    let spec = he_rewrite_transition_spec()?;
-    let ordered_rules = spec.ordered_rules_for(source_tag).ok_or_else(|| {
-        format!(
+    let contract = he_rewrite_contract()?;
+    let ordered_rules = contract
+        .transition
+        .ordered_rules_for(source_tag)
+        .ok_or_else(|| {
+            format!(
             "HE MORK transition spec missing source instruction '{}' from Lean-generated artifact",
             source_tag
         )
-    })?;
-
-    let handlers = he_rule_handler_table();
-    let ctx = HeStepContext { instr, space, out };
-    let mut dedup: HashSet<(String, String)> = HashSet::new();
-    let mut next: Vec<(String, State)> = Vec::new();
-
-    for rule in ordered_rules {
-        let handler = handlers.get(rule.as_str()).ok_or_else(|| {
-            format!(
-                "HE MORK transition handler table missing rule '{}' required by Lean artifact",
-                rule
-            )
         })?;
-        for st in handler(&ctx, limits, mork_eval_ms)? {
-            if dedup.insert((rule.clone(), format!("{}", st))) {
-                next.push((rule.clone(), st));
-            }
-        }
-    }
 
-    Ok(next)
+    let ctx = HeStepContext { instr, space, out };
+    dispatch_ordered_rules(
+        ordered_rules,
+        |rule| {
+            let transition_meta = contract.transition.rule(rule).cloned().ok_or_else(|| {
+                format!("HE transition-spec is missing rule metadata for '{}'", rule)
+            })?;
+            if transition_meta.source_instr != source_tag {
+                return Err(format!(
+                    "HE transition-spec mismatch: rule '{}' maps to '{}' but active source is '{}'",
+                    rule, transition_meta.source_instr, source_tag
+                ));
+            }
+
+            let rewrite_meta = contract.rewrite_ir.rule(rule).ok_or_else(|| {
+                format!("HE rewrite-ir is missing rule '{}' required by transition spec", rule)
+            })?;
+            if rewrite_meta.source_instr != source_tag {
+                return Err(format!(
+                    "HE rewrite-ir mismatch: rule '{}' maps to '{}' but active source is '{}'",
+                    rule, rewrite_meta.source_instr, source_tag
+                ));
+            }
+            Ok(transition_meta)
+        },
+        |_rule, meta| he_apply_rule_semantics(meta, &ctx, limits, mork_eval_ms),
+    )
 }
 
 #[cfg(feature = "mork-backend")]
@@ -1937,82 +2046,14 @@ fn run_mettahe_native_state_graph(
     let start_display = format!("{}", term);
     let start_id = term.term_id();
 
-    let mut results = AscentResults::empty();
-    results.all_terms.push(TermInfo {
-        term_id: start_id,
-        display: start_display.clone(),
-        is_normal_form: false,
-    });
-
-    let mut ids_by_display: HashMap<String, u64> = HashMap::new();
-    ids_by_display.insert(start_display.clone(), start_id);
-
-    let mut queue: VecDeque<State> = VecDeque::new();
-    queue.push_back(start_state);
-    let mut processed: HashSet<String> = HashSet::new();
-    let mut steps = 0usize;
     let mut mork_eval_ms = 0.0f64;
-
-    while let Some(cur_state) = queue.pop_front() {
-        if steps >= limits.max_steps {
-            break;
-        }
-        let cur_display = format!("{}", cur_state);
-        if !processed.insert(cur_display.clone()) {
-            continue;
-        }
-        let cur_id = *ids_by_display
-            .entry(cur_display.clone())
-            .or_insert_with(|| hash_display_id(&cur_display));
-
-        steps = steps.saturating_add(1);
-        let transitions = he_native_step_state(&cur_state, limits, &mut mork_eval_ms)?;
-        for (rule_name, next_state) in transitions {
-            let next_display = format!("{}", next_state);
-            let next_id = *ids_by_display
-                .entry(next_display.clone())
-                .or_insert_with(|| hash_display_id(&next_display));
-
-            results.rewrites.push(Rewrite {
-                from_id: cur_id,
-                to_id: next_id,
-                rule_name: Some(rule_name),
-            });
-
-            if results.all_terms.iter().all(|t| t.term_id != next_id) {
-                results.all_terms.push(TermInfo {
-                    term_id: next_id,
-                    display: next_display.clone(),
-                    is_normal_form: false,
-                });
-            }
-
-            if !processed.contains(&next_display) {
-                queue.push_back(next_state);
-            }
-        }
-    }
-
-    let mut outgoing: HashSet<u64> = HashSet::new();
-    for rw in &results.rewrites {
-        outgoing.insert(rw.from_id);
-    }
-    for term_info in &mut results.all_terms {
-        term_info.is_normal_form = !outgoing.contains(&term_info.term_id);
-    }
-
-    results
-        .phase_timings_ms
-        .insert("mork_native_steps".to_string(), steps as f64);
+    let mut results =
+        run_transition_graph(start_state, &start_display, start_id, limits, |state| {
+            he_native_step_state(state, limits, &mut mork_eval_ms)
+        })?;
     results
         .phase_timings_ms
         .insert("mork_eval_ms".to_string(), mork_eval_ms);
-    if steps >= limits.max_steps {
-        results
-            .phase_timings_ms
-            .insert("mork_native_step_cap_hit".to_string(), 1.0);
-    }
-
     Ok(results)
 }
 
@@ -2035,8 +2076,9 @@ mod tests {
 
     #[test]
     fn he_rewrite_transition_spec_tracks_generated_rule_sources() {
-        let spec =
-            he_rewrite_transition_spec().expect("transition spec should parse from Lean export");
+        let contract =
+            he_rewrite_contract().expect("rewrite contract should parse from Lean exports");
+        let spec = &contract.transition;
         assert_eq!(
             spec.ordered_rules_for("C_Metta")
                 .expect("C_Metta rules should be present")
@@ -2070,5 +2112,10 @@ mod tests {
                 .contains(&"R38".to_string()),
             "C_MettaCall-only rule should not be allowed for C_Metta source states"
         );
+        let r38 = contract
+            .rewrite_ir
+            .rule("R38")
+            .expect("rewrite-ir should include rule R38");
+        assert_eq!(r38.source_instr, "C_MettaCall");
     }
 }

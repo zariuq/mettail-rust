@@ -10,15 +10,58 @@
 )]
 
 pub mod ambient;
+pub mod artifact_contract;
 pub mod calculator;
+pub mod imp_artifacts;
+pub mod imp_from_lean;
 pub mod lambda;
 pub mod mettafull_legacy;
+pub mod mettahe_artifacts;
 pub mod mettahe_from_lean;
+pub mod minskylite_artifacts;
+pub mod minskylite_from_lean;
+pub mod mm0lite_artifacts;
+pub mod mm0lite_from_lean;
+pub mod native_transition_contract;
 pub mod pyashcore_from_lean;
 pub mod rhocalc;
 
 #[cfg(feature = "mork-backend")]
 pub mod mork_backend;
+
+/// Register native core backend adapters exported by this language bundle.
+///
+/// This keeps backend wiring language-agnostic at runtime: dispatch resolves by
+/// `(language_name, backend)` registration, not REPL-level special cases.
+#[cfg(feature = "mork-backend")]
+pub fn register_default_core_backends() -> Result<(), String> {
+    mettail_runtime::register_mork_backend_runner(
+        "IMP",
+        imp_from_lean::run_imp_mork_backend,
+        true,
+    )?;
+    mettail_runtime::register_mork_backend_runner(
+        "MeTTaHE",
+        mettahe_from_lean::run_mettahe_mork_backend,
+        true,
+    )?;
+    mettail_runtime::register_mork_backend_runner(
+        "MM0Lite",
+        mm0lite_from_lean::run_mm0lite_mork_backend,
+        true,
+    )?;
+    mettail_runtime::register_mork_backend_runner(
+        "MinskyLite",
+        minskylite_from_lean::run_minskylite_mork_backend,
+        true,
+    )?;
+    Ok(())
+}
+
+#[cfg(not(feature = "mork-backend"))]
+pub fn register_default_core_backends() -> Result<(), String> {
+    Ok(())
+}
 
 // Re-export eqrel for the generated Ascent code
 // The generated code uses `#[ds(crate::eqrel)]` which expects eqrel at crate root

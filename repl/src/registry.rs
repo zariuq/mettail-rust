@@ -10,8 +10,11 @@ use std::process::Command;
 // Import generated language implementations directly
 use mettail_languages::ambient::AmbientLanguage;
 use mettail_languages::calculator::CalculatorLanguage;
+use mettail_languages::imp_from_lean::IMPLanguage;
 use mettail_languages::lambda::LambdaLanguage;
 use mettail_languages::mettahe_from_lean::MeTTaHELanguage;
+use mettail_languages::minskylite_from_lean::MinskyLiteLanguage;
+use mettail_languages::mm0lite_from_lean::MM0LiteLanguage;
 use mettail_languages::rhocalc::RhoCalcLanguage;
 
 /// Registry of available languages
@@ -114,16 +117,6 @@ impl Language for OracleAugmentedLanguage {
     }
 
     fn supports_backend(&self, backend: RuntimeBackend) -> bool {
-        if matches!(backend, RuntimeBackend::Mork) && self.inner.name() == "MeTTaHE" {
-            #[cfg(feature = "mork-backend")]
-            {
-                return true;
-            }
-            #[cfg(not(feature = "mork-backend"))]
-            {
-                return false;
-            }
-        }
         self.inner.supports_backend(backend)
     }
 
@@ -132,23 +125,6 @@ impl Language for OracleAugmentedLanguage {
         term: &dyn Term,
         backend: RuntimeBackend,
     ) -> Result<AscentResults, String> {
-        if self.inner.name() == "MeTTaHE"
-            && matches!(backend, RuntimeBackend::Mork | RuntimeBackend::Auto)
-        {
-            #[cfg(feature = "mork-backend")]
-            {
-                return mettail_languages::mettahe_from_lean::run_mettahe_mork_backend(term);
-            }
-            #[cfg(not(feature = "mork-backend"))]
-            {
-                if matches!(backend, RuntimeBackend::Mork) {
-                    return Err(
-                        "MORK backend for MeTTaHE requires mettail-repl built with --features mork-backend"
-                            .to_string(),
-                    );
-                }
-            }
-        }
         self.inner.run_backend(term, backend)
     }
 
@@ -398,12 +374,16 @@ impl Default for LanguageRegistry {
 /// Build the default registry with all available languages
 pub fn build_registry() -> Result<LanguageRegistry> {
     let mut registry = LanguageRegistry::new();
+    mettail_languages::register_default_core_backends().map_err(anyhow::Error::msg)?;
 
     // Register auto-generated language implementations
     registry.register(Box::new(AmbientLanguage));
     registry.register(Box::new(CalculatorLanguage));
+    registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(IMPLanguage))));
     registry.register(Box::new(LambdaLanguage));
     registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(MeTTaHELanguage))));
+    registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(MinskyLiteLanguage))));
+    registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(MM0LiteLanguage))));
     registry.register(Box::new(RhoCalcLanguage));
 
     if registry.languages.is_empty() {
@@ -423,14 +403,19 @@ mod tests {
     #[test]
     fn default_registry_contains_mettahe() {
         let registry = build_registry().expect("registry should build");
+        assert!(registry.contains("imp"));
         assert!(registry.contains("mettahe"));
+        assert!(registry.contains("minskylite"));
+        assert!(registry.contains("mm0lite"));
         assert!(!registry.contains("mettafullstate"));
     }
 
     #[test]
     fn mettahe_exposes_meta_oracle() {
         let registry = build_registry().expect("registry should build");
-        let lang = registry.get("mettahe").expect("mettahe should be registered");
+        let lang = registry
+            .get("mettahe")
+            .expect("mettahe should be registered");
 
         let descriptors = lang.list_oracles();
         assert!(descriptors.iter().any(|d| d.name == "meta"));
@@ -517,6 +502,160 @@ mod tests {
                 .iter()
                 .map(|t| t.display.clone())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "mork-backend")]
+    #[test]
+    fn mm0lite_registry_supports_core_mork_backend() {
+        let registry = build_registry().expect("registry should build");
+        let lang = registry
+            .get("mm0lite")
+            .expect("mm0lite should be registered");
+
+        assert!(
+            lang.supports_backend(RuntimeBackend::Mork),
+            "registry should expose native MM0Lite MORK backend"
+        );
+
+        let term = lang
+            .parse_term("state [ push P :: [] ] P {} pending")
+            .expect("parse should succeed");
+        let mork = lang
+            .run_backend(term.as_ref(), RuntimeBackend::Mork)
+            .expect("MM0Lite MORK backend should execute");
+
+        assert!(
+            mork.all_terms
+                .iter()
+                .any(|t| t.display.contains("verified")),
+            "expected MM0Lite MORK to reach verified, got {:?}",
+            mork.all_terms
+                .iter()
+                .map(|t| t.display.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "mork-backend")]
+    #[test]
+    fn mm0lite_registry_auto_uses_native_mork_backend() {
+        let registry = build_registry().expect("registry should build");
+        let lang = registry
+            .get("mm0lite")
+            .expect("mm0lite should be registered");
+
+        let term = lang
+            .parse_term("state [ push P :: [] ] P {} pending")
+            .expect("parse should succeed");
+        let auto = lang
+            .run_backend(term.as_ref(), RuntimeBackend::Auto)
+            .expect("MM0Lite Auto backend should execute");
+
+        assert!(
+            auto.phase_timings_ms.contains_key("mork_native_state_ms"),
+            "expected MM0Lite Auto backend to route through native MORK; phase timings: {:?}",
+            auto.phase_timings_ms
+        );
+    }
+
+    #[cfg(feature = "mork-backend")]
+    #[test]
+    fn minskylite_registry_supports_core_mork_backend() {
+        let registry = build_registry().expect("registry should build");
+        let lang = registry
+            .get("minskylite")
+            .expect("minskylite should be registered");
+
+        assert!(
+            lang.supports_backend(RuntimeBackend::Mork),
+            "registry should expose native MinskyLite MORK backend"
+        );
+
+        let term = lang
+            .parse_term("state incA halt Z Z running")
+            .expect("parse should succeed");
+        let mork = lang
+            .run_backend(term.as_ref(), RuntimeBackend::Mork)
+            .expect("MinskyLite MORK backend should execute");
+
+        assert!(
+            mork.all_terms.iter().any(|t| t.display.contains("done")),
+            "expected MinskyLite MORK to reach done, got {:?}",
+            mork.all_terms
+                .iter()
+                .map(|t| t.display.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "mork-backend")]
+    #[test]
+    fn minskylite_registry_auto_uses_native_mork_backend() {
+        let registry = build_registry().expect("registry should build");
+        let lang = registry
+            .get("minskylite")
+            .expect("minskylite should be registered");
+
+        let term = lang
+            .parse_term("state incA halt Z Z running")
+            .expect("parse should succeed");
+        let auto = lang
+            .run_backend(term.as_ref(), RuntimeBackend::Auto)
+            .expect("MinskyLite Auto backend should execute");
+
+        assert!(
+            auto.phase_timings_ms.contains_key("mork_native_state_ms"),
+            "expected MinskyLite Auto backend to route through native MORK; phase timings: {:?}",
+            auto.phase_timings_ms
+        );
+    }
+
+    #[cfg(feature = "mork-backend")]
+    #[test]
+    fn imp_registry_supports_core_mork_backend() {
+        let registry = build_registry().expect("registry should build");
+        let lang = registry.get("imp").expect("imp should be registered");
+
+        assert!(
+            lang.supports_backend(RuntimeBackend::Mork),
+            "registry should expose native IMP MORK backend"
+        );
+
+        let term = lang
+            .parse_term("run skip with store ( 0 , 0 , 0 )")
+            .expect("parse should succeed");
+        let mork = lang
+            .run_backend(term.as_ref(), RuntimeBackend::Mork)
+            .expect("IMP MORK backend should execute");
+
+        assert!(
+            mork.all_terms.iter().any(|t| t.display.contains("done")),
+            "expected IMP MORK to reach done, got {:?}",
+            mork.all_terms
+                .iter()
+                .map(|t| t.display.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "mork-backend")]
+    #[test]
+    fn imp_registry_auto_uses_native_mork_backend() {
+        let registry = build_registry().expect("registry should build");
+        let lang = registry.get("imp").expect("imp should be registered");
+
+        let term = lang
+            .parse_term("run skip with store ( 0 , 0 , 0 )")
+            .expect("parse should succeed");
+        let auto = lang
+            .run_backend(term.as_ref(), RuntimeBackend::Auto)
+            .expect("IMP Auto backend should execute");
+
+        assert!(
+            auto.phase_timings_ms.contains_key("mork_native_state_ms"),
+            "expected IMP Auto backend to route through native MORK; phase timings: {:?}",
+            auto.phase_timings_ms
         );
     }
 }
