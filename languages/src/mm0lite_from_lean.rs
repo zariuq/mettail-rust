@@ -227,12 +227,12 @@ use crate::mm0lite_artifacts::{
 };
 #[cfg(feature = "mork-backend")]
 use crate::native_transition_contract::{
-    build_native_transition_contract, NativeTransitionContract, NativeTransitionRuleMeta,
+    build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
+    NativeTransitionContract, NativeTransitionRuleMeta,
 };
 #[cfg(feature = "mork-backend")]
 use mettail_runtime::{
-    dispatch_ordered_rules, run_transition_graph, AscentResults, LookupFamilyIndex,
-    MorkExecutionLimits, Term,
+    run_native_term_graph_with_timing, AscentResults, LookupFamilyIndex, MorkExecutionLimits, Term,
 };
 #[cfg(feature = "mork-backend")]
 use std::cell::RefCell;
@@ -240,8 +240,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(feature = "mork-backend")]
 use std::sync::OnceLock;
-#[cfg(feature = "mork-backend")]
-use std::time::Instant;
 
 #[cfg(feature = "mork-backend")]
 type MM0ThmLookup = LookupFamilyIndex<String, Formula, ()>;
@@ -286,7 +284,7 @@ pub fn with_mm0_theorem_facts<T>(facts: &[(String, Formula)], f: impl FnOnce() -
 #[cfg(feature = "mork-backend")]
 fn mm0_rewrite_contract() -> Result<&'static NativeTransitionContract, String> {
     static CONTRACT: OnceLock<Result<NativeTransitionContract, String>> = OnceLock::new();
-    match CONTRACT.get_or_init(|| {
+    cached_contract_result(&CONTRACT, || {
         let dir = mm0lite_artifact_dir();
         let transition = load_mm0lite_transition_artifact(&dir)?;
         let lookup = load_mm0lite_lookup_artifact(&dir)?;
@@ -298,10 +296,7 @@ fn mm0_rewrite_contract() -> Result<&'static NativeTransitionContract, String> {
                 Err("MM0Lite lookup-plan missing required thmConcl family".to_string())
             }
         })
-    }) {
-        Ok(contract) => Ok(contract),
-        Err(err) => Err(err.clone()),
-    }
+    })
 }
 
 #[cfg(feature = "mork-backend")]
@@ -414,39 +409,17 @@ fn mm0_native_step_state(state: &ProofState) -> Result<Vec<(String, ProofState)>
         return Err(format!("MM0Lite native backend expects C_MMState(...), got {}", state));
     };
 
-    if out.as_ref() != &ProofResult::C_Pending {
-        return Ok(Vec::new());
-    }
-
-    let source_instr = mm0_source_instr(prog.as_ref()).ok_or_else(|| {
-        format!("MM0Lite native backend does not support source program shape '{}'", prog)
-    })?;
     let contract = mm0_rewrite_contract()?;
-    let ordered = contract.ordered_rules_for(source_instr).ok_or_else(|| {
-        format!("MM0Lite transition artifact missing source instruction '{}'", source_instr)
-    })?;
-
-    dispatch_ordered_rules(
-        ordered,
-        |rule| {
-            let meta = contract.rule(rule).cloned().ok_or_else(|| {
-                format!(
-                    "MM0Lite rewrite contract missing metadata for rule '{}' listed under source '{}'",
-                    rule, source_instr
-                )
-            })?;
-            if meta.source_instr != source_instr {
-                return Err(format!(
-                    "MM0Lite rewrite contract mismatch: rule '{}' expected source '{}', got '{}'",
-                    rule, source_instr, meta.source_instr
-                ));
-            }
-            Ok(meta)
-        },
-        |_rule, meta| {
-            mm0_apply_rule_by_transition_kind(meta, prog.as_ref(), goal.as_ref(), stack.as_ref())
-        },
-    )
+    let active_source = if out.as_ref() == &ProofResult::C_Pending {
+        mm0_source_instr(prog.as_ref()).map(Some).ok_or_else(|| {
+            format!("MM0Lite native backend does not support source program shape '{}'", prog)
+        })
+    } else {
+        Ok(None)
+    };
+    dispatch_active_source_step("MM0Lite", contract, active_source, |_rule, meta| {
+        mm0_apply_rule_by_transition_kind(meta, prog.as_ref(), goal.as_ref(), stack.as_ref())
+    })
 }
 
 #[cfg(feature = "mork-backend")]
@@ -467,9 +440,7 @@ fn run_mm0lite_native_state_graph(
         },
     };
 
-    let start_display = format!("{}", term);
-    let start_id = term.term_id();
-    run_transition_graph(start_state, &start_display, start_id, limits, |state| {
+    run_native_term_graph_with_timing(term, start_state, limits, |state| {
         mm0_native_step_state(state)
     })
 }
@@ -484,10 +455,5 @@ pub fn run_mm0lite_mork_backend_with_limits(
     term: &dyn Term,
     limits: MorkExecutionLimits,
 ) -> Result<AscentResults, String> {
-    let started = Instant::now();
-    let mut results = run_mm0lite_native_state_graph(term, limits)?;
-    results
-        .phase_timings_ms
-        .insert("mork_native_state_ms".to_string(), started.elapsed().as_secs_f64() * 1000.0);
-    Ok(results)
+    run_mm0lite_native_state_graph(term, limits)
 }

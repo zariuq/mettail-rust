@@ -1,33 +1,40 @@
 use crate::examples::{Example, ExampleCategory};
 use crate::lookup_plan::{try_load_lookup_plan, validate_he_mork_backend_contract};
 use crate::metta_surface::{
-    extract_state_out_atom, looks_like_surface_metta, MeTTaSurfaceSession, SurfaceOutcome,
-    SurfaceProfile, SurfaceStmt, SurfaceSyntaxPolicy,
+    looks_like_surface_metta, MeTTaSurfaceSession, SurfaceOutcome, SurfaceProfile, SurfaceStmt,
+    SurfaceSyntaxPolicy,
 };
+use crate::surface_lowering::create_surface_lowering;
 use crate::pretty::format_term_pretty;
 use crate::registry::LanguageRegistry;
 use crate::state::ReplState;
 use anyhow::Result;
 use colored::Colorize;
 #[cfg(feature = "mork-backend")]
+#[cfg(feature = "lang-mm0lite")]
 use mettail_languages::mm0lite_from_lean::{
     parse_mm0_theorem_facts, run_mm0lite_mork_backend_with_limits, with_mm0_theorem_facts,
 };
+#[cfg(feature = "query-support")]
 use mettail_query::run_query as query_run_query;
 use mettail_runtime::{
     aggregate_core_eval_diagnostics, build_core_eval_diagnostics,
     resolve_core_ground_eval_enabled_with_contracts, resolve_runtime_dispatch_contracts,
-    AscentResults, CoreEvalDiagnostics, Language, OracleQuery,
+    AscentResults, CoreEvalDiagnostics, OracleQuery,
     RewriteEvalDiagnostics as SurfaceEvalDiagnostics, RuntimeBackend, RuntimeExecutionPolicy,
     RuntimeOptimizationHints, TermInfo,
 };
+#[cfg(feature = "query-support")]
+use mettail_runtime::Language;
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result as RustyResult};
+#[cfg(feature = "query-support")]
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(feature = "query-support")]
 /// Replace whole-word occurrences of env-bound identifiers in the input with their display form.
 /// This allows `x && true` to work when `x = true`, even though the grammar requires `bool:x` for
 /// Bool variables (only Int gets bare Ident to avoid reduce-reduce conflicts).
@@ -47,6 +54,7 @@ fn pre_substitute_env(input: &str, language: &dyn Language, env: &dyn Any) -> St
     result
 }
 
+#[cfg(feature = "query-support")]
 /// Replace whole-word occurrences of `needle` with `replacement`.
 /// Word boundary: preceded/followed by non-identifier char or start/end.
 fn replace_whole_word(haystack: &str, needle: &str, replacement: &str) -> String {
@@ -78,6 +86,7 @@ fn replace_whole_word(haystack: &str, needle: &str, replacement: &str) -> String
     result
 }
 
+#[cfg(feature = "query-support")]
 fn is_identifier_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -152,10 +161,9 @@ impl Repl {
         let Some(language_name) = self.state.language_name() else {
             return false;
         };
-        let Ok(language) = self.registry.get(language_name) else {
-            return false;
-        };
-        language.metadata().supports_surface_metta_runner()
+        // Trait-based gate: a language supports the surface runner if and only if
+        // a SurfaceLowering implementation exists for it.
+        create_surface_lowering(language_name).is_some()
     }
 
     fn detect_surface_profile(&self) -> SurfaceProfile {
@@ -163,8 +171,18 @@ impl Repl {
             if name.eq_ignore_ascii_case("mettahe") {
                 return SurfaceProfile::HE;
             }
+            if name.eq_ignore_ascii_case("petta") {
+                return SurfaceProfile::PeTTa;
+            }
         }
         SurfaceProfile::Legacy
+    }
+
+    fn create_lowering_for_active_language(
+        &self,
+    ) -> Option<Box<dyn crate::surface_lowering::SurfaceLowering>> {
+        let language_name = self.state.language_name()?;
+        create_surface_lowering(language_name)
     }
 
     fn required_lookup_plan_dialect(&self) -> Option<&'static str> {
@@ -225,7 +243,11 @@ impl Repl {
     fn ensure_metta_surface_session(&mut self) -> &mut MeTTaSurfaceSession {
         if self.metta_surface_session.is_none() {
             let profile = self.detect_surface_profile();
-            let mut session = MeTTaSurfaceSession::with_profile(profile);
+            let mut session = if let Some(lowering) = self.create_lowering_for_active_language() {
+                MeTTaSurfaceSession::with_lowering(profile, lowering)
+            } else {
+                MeTTaSurfaceSession::with_profile(profile)
+            };
             session.set_core_ground_eval_enabled(self.effective_core_ground_eval_enabled());
             self.metta_surface_session = Some(session);
         }
@@ -274,7 +296,7 @@ impl Repl {
         let mut seen = HashSet::new();
         let mut decoded = Vec::new();
         for nf in Self::reachable_normal_forms(results, start_id) {
-            if let Some(out_atom) = extract_state_out_atom(&nf.display) {
+            if let Some(out_atom) = session.extract_result(&nf.display) {
                 let surface = session.decode_atom_to_surface(&out_atom);
                 if seen.insert(surface.clone()) {
                     decoded.push(surface);
@@ -399,7 +421,6 @@ impl Repl {
             return self.cmd_assign(&name, &term_str);
         }
 
-        // Query: single rule in Ascent form, e.g. query(result) <-- path(term, result), !rw_proc(result, _).
         if line.contains(" <-- ") {
             return self.cmd_query(line);
         }
@@ -593,13 +614,16 @@ impl Repl {
         println!("    {}         List all computed relations", "relations".green());
         println!("    {} Show tuples in a relation", "relation <name>".green());
         println!();
-        println!("{}", "  Query:".yellow());
-        println!(
-            "    {}  Run a Datalog rule over step results (e.g. {}).",
-            "head(args) <-- body.".green(),
-            "query(result) <-- path(current_term, result), !rw_proc(result, _)".dimmed()
-        );
-        println!();
+        #[cfg(feature = "query-support")]
+        {
+            println!("{}", "  Query:".yellow());
+            println!(
+                "    {}  Run a Datalog rule over step results (e.g. {}).",
+                "head(args) <-- body.".green(),
+                "query(result) <-- path(current_term, result), !rw_proc(result, _)".dimmed()
+            );
+            println!();
+        }
         println!("{}", "  Oracles:".yellow());
         println!("    {}       List oracle endpoints exposed by the language", "oracles".green());
         println!(
@@ -660,9 +684,9 @@ impl Repl {
 
         // Store the theory name in state
         self.state.load_language(language.name());
-        if language.metadata().supports_surface_metta_runner() {
+        if let Some(lowering) = create_surface_lowering(language.name()) {
             let profile = self.detect_surface_profile();
-            let mut session = MeTTaSurfaceSession::with_profile(profile);
+            let mut session = MeTTaSurfaceSession::with_lowering(profile, lowering);
             session.set_core_ground_eval_enabled(hinted_core_ground_eval);
             self.metta_surface_session = Some(session);
         } else {
@@ -2006,13 +2030,15 @@ impl Repl {
             );
         }
 
-        #[cfg(not(feature = "mork-backend"))]
+        #[cfg(not(all(feature = "mork-backend", feature = "lang-mm0lite")))]
         {
             let _ = args;
-            anyhow::bail!("run-mm0lite-file requires the 'mork-backend' feature flag");
+            anyhow::bail!(
+                "run-mm0lite-file requires the 'mork-backend' and 'lang-mm0lite' feature flags"
+            );
         }
 
-        #[cfg(feature = "mork-backend")]
+        #[cfg(all(feature = "mork-backend", feature = "lang-mm0lite"))]
         {
             let language_name = self
                 .state
@@ -2637,7 +2663,7 @@ impl Repl {
                 if self.supports_surface_metta_runner() {
                     if let Some(session) = self.metta_surface_session.as_ref() {
                         let rendered = format!("{}", result_term);
-                        if let Some(out_atom) = extract_state_out_atom(&rendered) {
+                        if let Some(out_atom) = session.extract_result(&rendered) {
                             let decoded = session.decode_atom_to_surface(&out_atom);
                             self.last_surface_results = Some(vec![decoded.clone()]);
                             if !self.suppress_output {
@@ -3211,6 +3237,7 @@ impl Repl {
     /// Run a single Datalog-style rule over the current Ascent results.
     /// Requires a loaded language, a prior step (so ascent_results exists), and a current term for env substitution.
     /// Environment substitution includes REPL bindings plus "current_term" (display of the current stepped term).
+    #[cfg(feature = "query-support")]
     fn cmd_query(&mut self, line: &str) -> Result<()> {
         let language_name = self
             .state
@@ -3274,6 +3301,13 @@ impl Repl {
                 Err(anyhow::anyhow!("{}", e))
             },
         }
+    }
+
+    #[cfg(not(feature = "query-support"))]
+    fn cmd_query(&mut self, _line: &str) -> Result<()> {
+        anyhow::bail!(
+            "query support is disabled in this build; rebuild mettail-repl with feature 'query-support'"
+        )
     }
 
     fn cmd_example(&mut self, args: &[&str]) -> Result<()> {
@@ -3345,13 +3379,18 @@ impl Repl {
 #[cfg(test)]
 mod tests {
     use super::Repl;
-    use crate::registry::{build_registry, LanguageRegistry};
+    use crate::registry::build_registry;
+    #[cfg(feature = "lang-mettafull-legacy")]
+    use crate::registry::LanguageRegistry;
+    #[cfg(feature = "lang-mettafull-legacy")]
     use mettail_languages::mettafull_legacy::MeTTaFullStateLanguage;
+    #[cfg(feature = "lang-mettafull-legacy")]
     use mettail_runtime::{
         AscentResults, EquationDef, Language, LanguageMetadata, LogicRelationDef, LogicRuleDef,
         OracleDescriptor, OracleQuery, OracleResponse, RewriteDef, RuntimeOptimizationContracts,
         RuntimeOptimizationHints, SurfacePolicyHint, Term, TermDef, TermType, TypeDef, VarTypeInfo,
     };
+    #[cfg(feature = "lang-mettafull-legacy")]
     use std::any::Any;
     use std::fs;
     use std::path::PathBuf;
@@ -3368,12 +3407,47 @@ mod tests {
         path
     }
 
+    #[cfg(feature = "lang-petta")]
+    fn run_petta_fixture_and_read_report(fixture: &str, report_stem: &str) -> String {
+        let registry = build_registry().expect("registry should initialize");
+        let mut repl = Repl::new(registry).expect("repl should initialize");
+        repl.set_batch_quiet(true);
+        repl.load_language("petta").expect("petta should load");
+
+        let report_path = unique_artifact_path(report_stem, "json");
+        fs::create_dir_all(
+            report_path
+                .parent()
+                .expect("artifact path should have a parent directory"),
+        )
+        .expect("artifact directory should be creatable");
+
+        let rel = PathBuf::from(format!("repl/src/examples/{fixture}"));
+        let local = PathBuf::from(format!("src/examples/{fixture}"));
+        let input_path = if rel.exists() { rel } else { local };
+        assert!(input_path.exists(), "fixture should exist: {}", input_path.display());
+
+        let cmd = format!(
+            "run-metta-file {} --report=json --report-file {}",
+            input_path.display(),
+            report_path.display()
+        );
+        repl.run_command(&cmd)
+            .expect("run-metta-file command should succeed");
+
+        let report = fs::read_to_string(&report_path).expect("report file should be readable");
+        let _ = fs::remove_file(&report_path);
+        report
+    }
+
+    #[cfg(feature = "lang-mettafull-legacy")]
     fn build_registry_with_legacy_mettafull() -> LanguageRegistry {
         let mut registry = build_registry().expect("registry should initialize");
         registry.register(Box::new(MeTTaFullStateLanguage));
         registry
     }
 
+    #[cfg(feature = "lang-mettafull-legacy")]
     #[test]
     fn run_metta_file_jsonl_uses_theory_deterministic_surface_policy_by_default() {
         let registry = build_registry_with_legacy_mettafull();
@@ -3415,6 +3489,7 @@ mod tests {
         let _ = fs::remove_file(&report_path);
     }
 
+    #[cfg(feature = "lang-mettafull-legacy")]
     #[test]
     fn run_metta_file_json_report_has_no_core_tokens_in_surface_results_for_pln_demo() {
         let registry = build_registry_with_legacy_mettafull();
@@ -3479,7 +3554,7 @@ mod tests {
         .expect("artifact directory should be creatable");
         fs::write(
             &input_path,
-            ";;;;;;;;;;;;;;;;;;;;;;;;\nAuto type-checking can be enabled\n(= (id $x) $x)\n! (id 5)\n!\n",
+            ";;;;;;;;;;;;;;;;;;;;;;;;\nAuto type-checking can be enabled\n(= (id $x) $x)\n! (id 5) ;=> 5\n!\n",
         )
         .expect("input file should be writable");
 
@@ -3496,12 +3571,212 @@ mod tests {
             report.contains("\"failed\":0"),
             "expected zero failures in report, got: {report}"
         );
+        assert!(
+            report.contains("\"lines_with_expectations\":1"),
+            "expected one surface expectation in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"expectation_failures\":0"),
+            "expected zero expectation failures in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"surface_results\":[\"5\"]"),
+            "expected decoded surface result 5 in report, got: {report}"
+        );
 
         let _ = fs::remove_file(&input_path);
         let _ = fs::remove_file(&report_path);
     }
 
     #[cfg(feature = "mork-backend")]
+    #[test]
+    fn run_metta_file_mettahe_surface_regression_fixture_passes() {
+        let registry = build_registry().expect("registry should initialize");
+        let mut repl = Repl::new(registry).expect("repl should initialize");
+        repl.set_batch_quiet(true);
+        repl.load_language("mettahe").expect("mettahe should load");
+
+        let report_path = unique_artifact_path("mettahe_surface_regression_report", "json");
+        fs::create_dir_all(
+            report_path
+                .parent()
+                .expect("artifact path should have a parent directory"),
+        )
+        .expect("artifact directory should be creatable");
+
+        let rel = PathBuf::from("repl/src/examples/mettahe_surface_regression.metta");
+        let local = PathBuf::from("src/examples/mettahe_surface_regression.metta");
+        let input_path = if rel.exists() { rel } else { local };
+        assert!(input_path.exists(), "fixture should exist: {}", input_path.display());
+
+        let cmd = format!(
+            "run-metta-file {} --report=json --report-file {}",
+            input_path.display(),
+            report_path.display()
+        );
+        repl.run_command(&cmd)
+            .expect("run-metta-file command should succeed");
+
+        let report = fs::read_to_string(&report_path).expect("report file should be readable");
+        assert!(
+            report.contains("\"failed\":0"),
+            "expected zero failures in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"lines_with_expectations\":6"),
+            "expected six surface expectations in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"expectation_failures\":0"),
+            "expected zero expectation failures in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"surface_results\":[\"5\"]"),
+            "expected id surface result 5 in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"surface_results\":[\"fixed\"]"),
+            "expected const surface result fixed in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"surface_results\":[\"10\"]"),
+            "expected double surface result 10 in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"input\":\"! (+ 2 3)\""),
+            "expected grounded add fixture entry in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"surface_results\":[\"yes\"]"),
+            "expected if-true surface result yes in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"surface_results\":[\"no\"]"),
+            "expected if-false surface result no in report, got: {report}"
+        );
+
+        let _ = fs::remove_file(&report_path);
+    }
+
+    #[cfg(feature = "mork-backend")]
+    #[test]
+    fn run_metta_file_mettahe_reports_only_terminal_double_result() {
+        let registry = build_registry().expect("registry should initialize");
+        let mut repl = Repl::new(registry).expect("repl should initialize");
+        repl.set_batch_quiet(true);
+        repl.load_language("mettahe").expect("mettahe should load");
+
+        let input_path = unique_artifact_path("mettahe_double_input", "metta");
+        let report_path = unique_artifact_path("mettahe_double_report", "json");
+        fs::create_dir_all(
+            input_path
+                .parent()
+                .expect("artifact path should have a parent directory"),
+        )
+        .expect("artifact directory should be creatable");
+        fs::write(&input_path, "(= (double $x) (+ $x $x))\n! (double 5) ;=> 10\n")
+            .expect("input file should be writable");
+
+        let cmd = format!(
+            "run-metta-file {} --report=json --report-file {}",
+            input_path.display(),
+            report_path.display()
+        );
+        repl.run_command(&cmd)
+            .expect("run-metta-file command should succeed");
+
+        let report = fs::read_to_string(&report_path).expect("report file should be readable");
+        assert!(
+            report.contains("\"failed\":0"),
+            "expected zero failures in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"surface_results\":[\"10\"]"),
+            "expected only the terminal double result 10, got: {report}"
+        );
+        assert!(
+            !report.contains("(+ 5 5)"),
+            "intermediate HE result should not leak into run-metta-file surface report: {report}"
+        );
+
+        let _ = fs::remove_file(&input_path);
+        let _ = fs::remove_file(&report_path);
+    }
+
+    #[cfg(feature = "lang-petta")]
+    #[test]
+    fn run_metta_file_petta_surface_runner_is_enabled() {
+        let registry = build_registry().expect("registry should initialize");
+        let mut repl = Repl::new(registry).expect("repl should initialize");
+        repl.set_batch_quiet(true);
+        repl.load_language("petta").expect("petta should load");
+
+        // PeTTa should now support the surface runner via SurfaceLowering trait
+        assert!(
+            repl.supports_surface_metta_runner(),
+            "PeTTa should support surface metta runner after SurfaceLowering trait refactor"
+        );
+    }
+
+    #[cfg(feature = "lang-petta")]
+    #[test]
+    fn run_metta_file_petta_surface_regression_fixture_passes() {
+        let report = run_petta_fixture_and_read_report(
+            "petta_surface_regression.metta",
+            "petta_surface_regression_report",
+        );
+        assert!(
+            report.contains("\"failed\":0"),
+            "expected zero failures in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"surface_results\":[\"a\"]"),
+            "expected identity result a in report, got: {report}"
+        );
+        assert!(
+            report.contains("\"surface_results\":[\"42\"]"),
+            "expected constant result 42 in report, got: {report}"
+        );
+    }
+
+    #[cfg(feature = "lang-petta")]
+    #[test]
+    fn run_metta_file_petta_comments_fixture_passes() {
+        let report = run_petta_fixture_and_read_report(
+            "petta_adapted/comments.metta",
+            "petta_comments_report",
+        );
+        assert!(
+            report.contains("\"failed\":0"),
+            "expected zero failures in report, got: {report}"
+        );
+    }
+
+    #[cfg(feature = "lang-petta")]
+    #[test]
+    fn run_metta_file_petta_constanthead_fixture_passes() {
+        let report = run_petta_fixture_and_read_report(
+            "petta_adapted/constanthead.metta",
+            "petta_constanthead_report",
+        );
+        assert!(
+            report.contains("\"failed\":0"),
+            "expected zero failures in report, got: {report}"
+        );
+    }
+
+    #[cfg(feature = "lang-petta")]
+    #[test]
+    fn run_metta_file_petta_case_fixture_passes() {
+        let report =
+            run_petta_fixture_and_read_report("petta_adapted/case.metta", "petta_case_report");
+        assert!(
+            report.contains("\"failed\":0"),
+            "expected zero failures in report, got: {report}"
+        );
+    }
+
+    #[cfg(all(feature = "mork-backend", feature = "lang-mm0lite"))]
     #[test]
     fn run_mm0lite_file_ingests_mm0_db_and_executes_state() {
         let registry = build_registry().expect("registry should initialize");
@@ -3545,15 +3820,19 @@ axiom thm_imp_p_q: $ P -> Q $;
         let _ = fs::remove_file(&state_path);
     }
 
+    #[cfg(feature = "lang-mettafull-legacy")]
     struct MissingContractsMetadata;
 
+    #[cfg(feature = "lang-mettafull-legacy")]
     static MISSING_CONTRACTS_METADATA: MissingContractsMetadata = MissingContractsMetadata;
 
+    #[cfg(feature = "lang-mettafull-legacy")]
     fn base_metadata() -> &'static dyn LanguageMetadata {
         let inner = MeTTaFullStateLanguage;
         inner.metadata()
     }
 
+    #[cfg(feature = "lang-mettafull-legacy")]
     impl LanguageMetadata for MissingContractsMetadata {
         fn name(&self) -> &'static str {
             base_metadata().name()
@@ -3592,8 +3871,10 @@ axiom thm_imp_p_q: $ P -> Q $;
         }
     }
 
+    #[cfg(feature = "lang-mettafull-legacy")]
     struct MissingContractsLanguage;
 
+    #[cfg(feature = "lang-mettafull-legacy")]
     impl Language for MissingContractsLanguage {
         fn name(&self) -> &'static str {
             let inner = MeTTaFullStateLanguage;
@@ -3714,6 +3995,7 @@ axiom thm_imp_p_q: $ P -> Q $;
         }
     }
 
+    #[cfg(feature = "lang-mettafull-legacy")]
     #[test]
     fn core_ground_eval_hint_is_disabled_when_contracts_missing_in_dispatch() {
         if std::env::var_os("METTAIL_CORE_GROUND_EVAL").is_some() {

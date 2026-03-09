@@ -1,9 +1,10 @@
 /// Smoke tests for the MeTTaHE language backend.
 ///
-/// Tests exercise the core rewrite+datalog engine at the language layer,
-/// bypassing the REPL surface layer entirely.  Each test constructs a
-/// core HE state term, runs Ascent, and checks the normal-form output.
-use mettail_languages::mettahe_from_lean::MeTTaHELanguage;
+/// Tests exercise the core MORK-first HE runtime at the language layer,
+/// bypassing the REPL surface layer entirely. Each test constructs a
+/// core HE state term, runs the native MORK backend, and checks the
+/// normal-form output.
+use mettail_languages::mettahe_from_lean::{run_mettahe_mork_backend, MeTTaHELanguage};
 use mettail_runtime::Language;
 
 fn all_displays(results: &mettail_runtime::AscentResults) -> Vec<String> {
@@ -18,8 +19,7 @@ fn run_he(input: &str) -> mettail_runtime::AscentResults {
     mettail_runtime::clear_var_cache();
     let lang = MeTTaHELanguage;
     let term = lang.parse_term(input).expect("parse should succeed");
-    lang.run_ascent(term.as_ref())
-        .expect("Ascent execution should succeed")
+    run_mettahe_mork_backend(term.as_ref()).expect("MORK execution should succeed")
 }
 
 // ─── R16: C_Return → C_Done (unconditional) ───────────────────────────
@@ -325,24 +325,58 @@ fn e2e_double_5_equals_10() {
     );
 }
 
-// ─── R4 + R7 + R16: expression → InterpExpr → notExpression for non-expr head
+// ─── Full E2E: untyped equation-defined head (id 5) → 5 ───────────────
 
 #[test]
-fn r4_r7_r16_expr_interp_then_not_expression() {
-    // An expression (foo) with AtomType: R4 fires (needsInterpExpr for expression with non-matching type)
-    // Wait — AtomType matches everything. Use ExpressionType mismatch for a symbol.
-    // Actually: for an expression with UndefinedType, R4 should fire (expression, typeNotMatches).
-    // Then R7 won't fire because the atom IS an expression.
-    // For R7 to fire we need InterpExpr with a non-expression atom — but that can only happen
-    // via R4 which requires expression type. So R7 is defensive.
-    //
-    // Instead test the expression path: expression with type mismatch → InterpExpr
+fn e2e_untyped_id_5_equals_5() {
+    let results = run_he(concat!(
+        "C_State(",
+          "C_Metta(",
+            "C_ExprCons(C_SymAtom(id), C_ExprCons(C_GInt(C_5), C_ExprNil)),",
+            "C_UndefinedType",
+          "),",
+          "C_Space(",
+            "C_ExprCons(",
+              "C_EqAtom(",
+                "C_ExprCons(C_SymAtom(id), C_ExprCons(C_VarAtom(x), C_ExprNil)),",
+                "C_VarAtom(x)",
+              "),",
+              "C_ExprNil",
+            ")",
+          "),",
+          "C_Empty",
+        ")"
+    ));
+    let displays = all_displays(&results);
+    assert!(
+        displays.iter().any(|d| d.contains("C_MettaCall(")),
+        "expected untyped head to fall through to C_MettaCall, got: {displays:?}"
+    );
+    assert!(
+        displays
+            .iter()
+            .any(|d| d.contains("C_Done") && d.contains("C_GInt(C_5)")),
+        "expected C_Done with C_GInt(C_5) for untyped (id 5), got: {displays:?}"
+    );
+}
+
+
+// ─── R4 + IE_NoType + MC_NoMatch: untyped expression head falls through ──
+
+#[test]
+fn r4_ie_notype_mc_nomatch_untyped_expression_falls_through() {
     let results = run_he(
         "C_State(C_Metta(C_ExprCons(C_SymAtom(foo), C_ExprNil), C_UndefinedType), C_Space(C_ExprNil), C_Empty)",
     );
     let displays = all_displays(&results);
     assert!(
-        displays.iter().any(|d| d.contains("C_InterpExpr(")),
-        "expected InterpExpr for expression, got: {displays:?}"
+        displays.iter().any(|d| d.contains("C_MettaCall(")),
+        "expected IE_NoType fallthrough to C_MettaCall, got: {displays:?}"
+    );
+    assert!(
+        displays
+            .iter()
+            .any(|d| d.contains("C_Done") && d.contains("C_SymAtom(foo)") && d.contains("C_ExprNil")),
+        "expected unknown untyped expression to return unchanged after mettaCall, got: {displays:?}"
     );
 }

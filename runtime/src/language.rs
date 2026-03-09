@@ -131,6 +131,52 @@ fn lookup_registered_mork_backend(
     Ok(guard.get(language_name).copied())
 }
 
+/// Whether this language has a registered native core MORK backend.
+pub fn language_supports_mork_backend(language_name: &str) -> bool {
+    lookup_registered_mork_backend(language_name)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Whether this language supports `Auto` by routing it to a registered native core MORK backend.
+pub fn language_supports_auto_backend(language_name: &str) -> bool {
+    lookup_registered_mork_backend(language_name)
+        .ok()
+        .flatten()
+        .is_some_and(|reg| reg.use_for_auto)
+}
+
+/// Run the registered native core MORK backend for one language.
+pub fn run_registered_mork_backend(
+    language_name: &str,
+    term: &dyn Term,
+) -> Result<AscentResults, String> {
+    if let Some(reg) = lookup_registered_mork_backend(language_name)? {
+        return (reg.run)(term);
+    }
+    Err(format!(
+        "language '{}' does not have a registered native core MORK backend",
+        language_name
+    ))
+}
+
+/// Run the registered native core MORK backend for one language if it is marked as the `Auto` route.
+pub fn run_registered_auto_backend(
+    language_name: &str,
+    term: &dyn Term,
+) -> Result<AscentResults, String> {
+    if let Some(reg) = lookup_registered_mork_backend(language_name)? {
+        if reg.use_for_auto {
+            return (reg.run)(term);
+        }
+    }
+    Err(format!(
+        "language '{}' does not support auto backend selection in this build; use --backend mork with a registered native core backend",
+        language_name
+    ))
+}
+
 /// Register a native MORK backend runner for one language.
 ///
 /// This is the shared runtime dispatch control-plane used by language bundles
@@ -168,6 +214,17 @@ pub trait Language: Send + Sync {
 
     /// Run Ascent on a term and return results
     fn run_ascent(&self, term: &dyn Term) -> Result<AscentResults, String>;
+
+    /// Run a direct evaluator and return lightweight results.
+    ///
+    /// Languages that don't use Ascent (e.g. PeTTa) should override this.
+    /// The default delegates to `run_ascent` and extracts normal forms.
+    fn run_eval(&self, term: &dyn Term) -> Result<EvalResults, String> {
+        let ar = self.run_ascent(term)?;
+        Ok(EvalResults {
+            normal_forms: ar.normal_forms().iter().map(|t| t.display.clone()).collect(),
+        })
+    }
 
     /// Whether this language supports the selected core backend.
     ///
@@ -303,6 +360,54 @@ pub trait Language: Send + Sync {
     ///
     /// Returns `None` if the variable is not found or its type cannot be inferred.
     fn infer_var_type(&self, term: &dyn Term, var_name: &str) -> Option<TermType>;
+}
+
+/// Lightweight evaluation results for languages that don't use Ascent.
+///
+/// Languages like PeTTa that compute results directly can return this
+/// instead of constructing the full `AscentResults` graph.
+#[derive(Debug, Clone)]
+pub struct EvalResults {
+    /// Normal-form results of evaluation.
+    pub normal_forms: Vec<String>,
+}
+
+impl EvalResults {
+    /// Convert to `AscentResults` for backward compatibility.
+    ///
+    /// Creates a synthetic rewrite graph: one start node → N normal-form nodes.
+    pub fn into_ascent_results(self, start_display: &str, start_id: u64) -> AscentResults {
+        if self.normal_forms.is_empty() {
+            return AscentResults::empty();
+        }
+        let mut all_terms = vec![TermInfo {
+            term_id: start_id,
+            display: start_display.to_string(),
+            is_normal_form: false,
+        }];
+        let mut rewrites = Vec::new();
+        for (i, display) in self.normal_forms.into_iter().enumerate() {
+            let term_id = start_id.wrapping_add((i as u64) + 1);
+            rewrites.push(Rewrite {
+                from_id: start_id,
+                to_id: term_id,
+                rule_name: Some("eval".to_string()),
+            });
+            all_terms.push(TermInfo {
+                term_id,
+                display,
+                is_normal_form: true,
+            });
+        }
+        AscentResults {
+            all_terms,
+            rewrites,
+            equivalences: Vec::new(),
+            custom_relations: std::collections::HashMap::new(),
+            relation_timings_ms: std::collections::HashMap::new(),
+            phase_timings_ms: std::collections::HashMap::new(),
+        }
+    }
 }
 
 /// Results from running Ascent

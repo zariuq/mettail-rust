@@ -14,7 +14,8 @@ use crate::lookup_plan::{
     relation_metadata_index, try_load_lookup_plan, LookupPlanArtifact, LookupRelationMetadata,
 };
 use crate::syntax_spec::{
-    try_load_syntax_spec, CommandHead, DispatchPolicy, EvalPrefixPolicy, LexerSpec, LoweringHeads,
+    try_load_atom_encoding, try_load_display_profile, try_load_syntax_spec, AtomEncodingSpec,
+    CommandHead, DisplayProfile, DispatchPolicy, EvalPrefixPolicy, LexerSpec, LoweringHeads,
     SyntaxSpec,
 };
 use std::borrow::Cow;
@@ -28,6 +29,8 @@ pub enum SurfaceProfile {
     Legacy,
     /// HE MeTTa backend
     HE,
+    /// PeTTa backend
+    PeTTa,
 }
 
 /// Surface syntax policy for command-level parsing.
@@ -124,14 +127,16 @@ struct GroundCallMemoKey {
     exact_rules: bool,
 }
 
-#[derive(Debug, Clone)]
 pub struct MeTTaSurfaceSession {
     profile: SurfaceProfile,
+    lowering: Box<dyn crate::surface_lowering::SurfaceLowering>,
     syntax_policy: SurfaceSyntaxPolicy,
     parser_backend: SurfaceParserBackend,
     syntax_spec: Option<SyntaxSpec>,
     syntax_spec_required: bool,
     syntax_spec_error: Option<String>,
+    atom_encoding: Option<AtomEncodingSpec>,
+    display_profile: Option<DisplayProfile>,
     lookup_plan: Option<LookupPlanArtifact>,
     lookup_relation_metadata: Option<HashMap<String, LookupRelationMetadata>>,
     lookup_plan_required: bool,
@@ -166,17 +171,101 @@ impl MeTTaSurfaceSession {
     }
 
     pub fn with_profile(profile: SurfaceProfile) -> Self {
+        let lowering: Box<dyn crate::surface_lowering::SurfaceLowering> = match profile {
+            SurfaceProfile::HE => {
+                #[cfg(feature = "lang-he")]
+                {
+                    Box::new(crate::surface_lowering_he::HeSurfaceLowering)
+                }
+                #[cfg(not(feature = "lang-he"))]
+                {
+                    panic!("HE surface profile requested without lang-he feature")
+                }
+            },
+            SurfaceProfile::PeTTa => {
+                #[cfg(feature = "lang-petta")]
+                {
+                    Box::new(crate::surface_lowering_petta::PeTTaSurfaceLowering)
+                }
+                #[cfg(not(feature = "lang-petta"))]
+                {
+                    panic!("PeTTa surface profile requested without lang-petta feature")
+                }
+            },
+            SurfaceProfile::Legacy => {
+                Box::new(crate::surface_lowering_legacy::LegacySurfaceLowering)
+            }
+        };
+        Self::with_lowering(profile, lowering)
+    }
+
+    pub fn with_lowering(
+        profile: SurfaceProfile,
+        lowering: Box<dyn crate::surface_lowering::SurfaceLowering>,
+    ) -> Self {
         let mut spaces = HashMap::new();
         let mut default_space = SurfaceSpaceState::default();
-        let (syntax_policy, syntax_spec, syntax_spec_required, syntax_spec_error) =
-            syntax_config_from_profile(profile);
-        let (lookup_plan, lookup_relation_metadata, lookup_plan_required, lookup_plan_error) =
-            lookup_plan_config_from_profile(profile);
+
+        // Use lowering trait for configuration
+        let dialect_key_str = lowering.dialect_key();
+        let requires_syntax_spec = lowering.requires_syntax_spec();
+        let requires_lookup_plan = lowering.requires_lookup_plan();
+
+        let (syntax_policy, syntax_spec, syntax_spec_required, syntax_spec_error) = if
+            requires_syntax_spec
+        {
+            syntax_config_for_dialect(dialect_key_str)
+        } else if dialect_key_str.is_empty() {
+            // Legacy: use builtin spec
+            (
+                SurfaceSyntaxPolicy::Strict,
+                Some(legacy_builtin_syntax_spec().clone()),
+                false,
+                None,
+            )
+        } else {
+            // Dialect without required syntax spec: try to load but don't require
+            let loaded = try_load_syntax_spec(dialect_key_str).ok().flatten();
+            let policy = loaded
+                .as_ref()
+                .map(|l| {
+                    if l.spec.eval_prefix.bang_prefixed_word_is_symbol {
+                        SurfaceSyntaxPolicy::HyperonCompat
+                    } else {
+                        SurfaceSyntaxPolicy::Strict
+                    }
+                })
+                .unwrap_or(SurfaceSyntaxPolicy::HyperonCompat);
+            (policy, loaded.map(|l| l.spec), false, None)
+        };
+
+        let (lookup_plan, lookup_relation_metadata, lookup_plan_required, lookup_plan_error) = if
+            requires_lookup_plan
+        {
+            lookup_plan_config_for_dialect(dialect_key_str)
+        } else {
+            (None, None, false, None)
+        };
+
         let parser_backend = parser_backend_from_profile(profile);
 
-        // HE profile: bootstrap grounded operator type annotations
-        if profile == SurfaceProfile::HE {
-            default_space.type_entries = crate::metta_surface_he::he_bootstrap_type_entries();
+        // Load atom encoding spec and display profile for dialects that use them
+        let dialect_key = if dialect_key_str.is_empty() {
+            None
+        } else {
+            Some(dialect_key_str)
+        };
+        let atom_encoding = dialect_key.and_then(|dk| {
+            try_load_atom_encoding(dk).ok().flatten().map(|l| l.spec)
+        });
+        let display_profile = dialect_key.and_then(|dk| {
+            try_load_display_profile(dk).ok().flatten().map(|l| l.profile)
+        });
+
+        // Bootstrap type entries from lowering
+        let bootstrap_types = lowering.bootstrap_type_entries();
+        if !bootstrap_types.is_empty() {
+            default_space.type_entries = bootstrap_types;
         }
 
         spaces.insert(DEFAULT_SPACE_IDENT.to_string(), default_space);
@@ -184,11 +273,14 @@ impl MeTTaSurfaceSession {
         space_revisions.insert(DEFAULT_SPACE_IDENT.to_string(), 0);
         Self {
             profile,
+            lowering,
             syntax_policy,
             parser_backend,
             syntax_spec,
             syntax_spec_required,
             syntax_spec_error,
+            atom_encoding,
+            display_profile,
             lookup_plan,
             lookup_relation_metadata,
             lookup_plan_required,
@@ -312,15 +404,18 @@ impl MeTTaSurfaceSession {
                 bail!("{err}");
             }
             bail!(
-                "surface syntax spec is required for profile {:?} but was not loaded",
-                self.profile
+                "surface syntax spec is required for dialect '{}' but was not loaded",
+                self.lowering.dialect_key()
             );
         }
         if self.lookup_plan_required && self.lookup_plan.is_none() {
             if let Some(err) = &self.lookup_plan_error {
                 bail!("{err}");
             }
-            bail!("lookup plan is required for profile {:?} but was not loaded", self.profile);
+            bail!(
+                "lookup plan is required for dialect '{}' but was not loaded",
+                self.lowering.dialect_key()
+            );
         }
         match self.parser_backend {
             SurfaceParserBackend::LegacySExpr => Self::parse_line_with_legacy_syntax(
@@ -380,9 +475,10 @@ impl MeTTaSurfaceSession {
         syntax_spec: Option<&SyntaxSpec>,
         profile: SurfaceProfile,
     ) -> Result<Option<SurfaceStmt>> {
-        if profile == SurfaceProfile::HE && syntax_spec.is_none() {
+        // Syntax spec requirement is checked in parse_line_for_session before we get here
+        if syntax_spec.is_none() {
             bail!(
-                "surface syntax spec is required for HE profile (missing he.syntax_spec.json/checksum artifacts)"
+                "surface syntax spec is required for tree-sitter parser backend"
             );
         }
         let trimmed = input.trim();
@@ -436,8 +532,9 @@ impl MeTTaSurfaceSession {
                 self.last_surface_diagnostics = None;
                 let handle = self.alloc_fresh_space_ident();
                 let out_atom = self.encode_expr_atom(&SExpr::Atom(handle))?;
+                let result_term = self.lowering.format_alloc_space(&out_atom);
                 Ok(SurfaceOutcome::EvalMany {
-                    core_terms: vec![format!("C_State(C_Done,C_Space(C_ANil,C_ANil),{out_atom})")],
+                    core_terms: vec![result_term],
                 })
             },
             SurfaceStmt::Eval(expr) => {
@@ -485,113 +582,17 @@ impl MeTTaSurfaceSession {
         }
     }
 
-    pub fn decode_atom_to_surface(&self, atom_core: &str) -> String {
-        // HE profile: use HE-specific decoder
-        if self.profile == SurfaceProfile::HE {
-            return crate::metta_surface_he::he_decode_atom(atom_core);
-        }
-        let atom = atom_core.trim();
-        if let Some(list_str) = self.try_decode_cons_list(atom) {
-            return list_str;
-        }
-        match atom {
-            "C_GBoolTrue" => return "true".to_string(),
-            "C_GBoolFalse" => return "false".to_string(),
-            "C_ATrue" => return "true".to_string(),
-            "C_AFalse" => return "false".to_string(),
-            "C_Bool" => return "Bool".to_string(),
-            "C_Atom" => return "Atom".to_string(),
-            "C_ANil" => return "()".to_string(),
-            "C_not" => return "not".to_string(),
-            "C_and" => return "and".to_string(),
-            "C_or" => return "or".to_string(),
-            "C_xor" => return "xor".to_string(),
-            "C_eqBool" => return "eq-bool".to_string(),
-            "C_add" => return "+".to_string(),
-            "C_sub" => return "-".to_string(),
-            "C_mul" => return "*".to_string(),
-            "C_div" => return "/".to_string(),
-            "C_modOp" => return "%".to_string(),
-            "C_lt" => return "<".to_string(),
-            "C_le" => return "<=".to_string(),
-            "C_gt" => return ">".to_string(),
-            "C_ge" => return ">=".to_string(),
-            "C_eqInt" => return "==".to_string(),
-            "C_concat" => return "concat".to_string(),
-            "C_length" => return "length".to_string(),
-            _ => {},
-        }
-
-        if let Some(inner) = atom
-            .strip_prefix("C_GInt(")
-            .and_then(|s| s.strip_suffix(')'))
-        {
-            if let Some(n) = decode_numeric_token(inner.trim()) {
-                return n.to_string();
-            }
-            return inner.trim().to_string();
-        }
-
-        // UserAtom: user-defined symbol wrapping a GStringCodes name
-        if let Some(inner) = atom
-            .strip_prefix("C_UserAtom(")
-            .and_then(|s| s.strip_suffix(')'))
-        {
-            if let Some(decoded) = try_decode_gstringcodes(inner.trim()) {
-                return decoded;
-            }
-            // fallback: decode inner as generic atom
-            return self.decode_atom_to_surface(inner.trim());
-        }
-
-        // GStringCodes: self-describing char-code cons-list (string literals)
-        if let Some(decoded) = try_decode_gstringcodes(atom) {
-            return quote_surface_string(&decoded);
-        }
-
-        // GString: bare token wrapper (logic-block outputs like concat results)
-        if let Some(inner) = atom
-            .strip_prefix("C_GString(")
-            .and_then(|s| s.strip_suffix(')'))
-        {
-            return quote_surface_string(inner.trim());
-        }
-
-        atom.to_string()
+    /// Extract user-facing result from a normal-form display string.
+    pub fn extract_result(&self, nf_display: &str) -> Option<String> {
+        self.lowering.extract_result(nf_display)
     }
 
-    fn try_decode_cons_list(&self, atom: &str) -> Option<String> {
-        let mut items = Vec::new();
-        let mut cur = atom.trim().to_string();
-        loop {
-            let cur_trim = cur.trim();
-            if cur_trim == "C_ANil" {
-                let rendered = if items.is_empty() {
-                    "()".to_string()
-                } else {
-                    format!("({})", items.join(" "))
-                };
-                return Some(rendered);
-            }
-            if let Some(inner) = cur_trim
-                .strip_prefix("C_ACons(")
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                let args = split_top_level_args(inner);
-                if args.len() != 2 {
-                    return None;
-                }
-                let head = self.decode_atom_to_surface(args[0].trim());
-                items.push(head);
-                cur = args[1].trim().to_string();
-                continue;
-            }
-            if items.is_empty() {
-                return None;
-            }
-            let tail = self.decode_atom_to_surface(cur_trim);
-            return Some(format!("({} . {})", items.join(" "), tail));
-        }
+    pub fn decode_atom_to_surface(&self, atom_core: &str) -> String {
+        self.lowering.decode_atom(
+            atom_core,
+            self.atom_encoding.as_ref(),
+            self.display_profile.as_ref(),
+        )
     }
 
     fn lower_eval_to_core_states(&mut self, expr: &SExpr) -> Result<Vec<String>> {
@@ -603,11 +604,14 @@ impl MeTTaSurfaceSession {
         space: &str,
         expr: &SExpr,
     ) -> Result<Vec<String>> {
-        // HE profile: bypass surface rewriter entirely, lower directly to HE core term
-        if self.profile == SurfaceProfile::HE {
+        // Dialects that bypass the surface rewriter (HE, PeTTa): lower directly
+        if self.lowering.bypasses_surface_rewriter() {
             let space_state = self.space_state(space);
-            let core_term = crate::metta_surface_he::he_lower_eval(expr, space_state)
-                .map_err(|e| anyhow!("HE lowering: {e}"))?;
+            let terms = self.lowering.lower_eval(
+                expr,
+                space_state,
+                self.atom_encoding.as_ref(),
+            )?;
             self.last_surface_diagnostics = Some(SurfaceEvalDiagnostics {
                 steps: 0,
                 frontier_terms: 0,
@@ -627,10 +631,10 @@ impl MeTTaSurfaceSession {
                 truncated_by_branch_cap: 0,
                 truncated_by_outcome_cap: false,
                 hit_step_cap: false,
-                normal_forms: 1,
+                normal_forms: terms.len(),
                 elapsed_ms: 0.0,
             });
-            return Ok(vec![core_term]);
+            return Ok(terms);
         }
 
         let core_fast_path =
@@ -1531,152 +1535,68 @@ impl MeTTaSurfaceSession {
     }
 
     fn encode_expr_atom(&mut self, expr: &SExpr) -> Result<String> {
-        // HE profile: use HE-specific encoding
-        if self.profile == SurfaceProfile::HE {
-            return crate::metta_surface_he::he_encode_sexpr(expr)
-                .map_err(|e| anyhow!("HE encode: {e}"));
-        }
-        match expr {
-            SExpr::Atom(a) => self.encode_atom_symbol(a),
-            SExpr::List(items) => {
-                if items.is_empty() {
-                    return Ok("C_ANil".to_string());
-                }
-                let mut acc = "C_ANil".to_string();
-                for item in items.iter().rev() {
-                    let item_enc = self.encode_expr_atom(item)?;
-                    acc = format!("C_ACons({item_enc},{acc})");
-                }
-                Ok(acc)
-            },
-        }
-    }
-
-    fn encode_atom_symbol(&mut self, symbol: &str) -> Result<String> {
-        if let Some(decoded) = parse_quoted_string_literal(symbol) {
-            // String literals use bare GStringCodes (no UserAtom wrapper).
-            return Ok(encode_gstringcodes(&decoded));
-        }
-
-        let lower = symbol.to_ascii_lowercase();
-        match lower.as_str() {
-            "true" => return Ok("C_GBoolTrue".to_string()),
-            "false" => return Ok("C_GBoolFalse".to_string()),
-            "atom" => return Ok("C_Atom".to_string()),
-            "bool" => return Ok("C_Bool".to_string()),
-            "nil" | "()" => return Ok("C_ANil".to_string()),
-            "not" => return Ok("C_not".to_string()),
-            "and" => return Ok("C_and".to_string()),
-            "or" => return Ok("C_or".to_string()),
-            "xor" => return Ok("C_xor".to_string()),
-            "eq-bool" => return Ok("C_eqBool".to_string()),
-            "add" => return Ok("C_add".to_string()),
-            "sub" => return Ok("C_sub".to_string()),
-            "mul" => return Ok("C_mul".to_string()),
-            "div" | "/" => return Ok("C_div".to_string()),
-            "mod" | "modop" | "%" => return Ok("C_modOp".to_string()),
-            "lt" => return Ok("C_lt".to_string()),
-            "le" | "<=" => return Ok("C_le".to_string()),
-            "gt" | ">" => return Ok("C_gt".to_string()),
-            "ge" | ">=" => return Ok("C_ge".to_string()),
-            "eq-int" => return Ok("C_eqInt".to_string()),
-            "concat" => return Ok("C_concat".to_string()),
-            "length" => return Ok("C_length".to_string()),
-            _ => {},
-        }
-
-        if let Ok(n) = symbol.parse::<i32>() {
-            return Ok(format_c_gint(n));
-        }
-
-        // Encode user-defined symbols as UserAtom(GStringCodes(char-code cons-list)).
-        // UserAtom wrapper preserves the symbol/string distinction:
-        //   symbol `foo`  → C_UserAtom(C_GStringCodes(102,111,111))
-        //   string "foo"  → C_GStringCodes(102,111,111)  (no wrapper)
-        // Self-describing, portable, matches Lean FullLanguageDef.
-        Ok(format!("C_UserAtom({})", encode_gstringcodes(symbol)))
+        self.lowering.encode_expr(expr, self.atom_encoding.as_ref())
     }
 }
 
-fn syntax_config_from_profile(
-    profile: SurfaceProfile,
+fn syntax_config_for_dialect(
+    dialect: &str,
 ) -> (SurfaceSyntaxPolicy, Option<SyntaxSpec>, bool, Option<String>) {
-    let dialect = match profile {
-        SurfaceProfile::HE => Some("he"),
-        SurfaceProfile::Legacy => None,
-    };
-    if let Some(dialect) = dialect {
-        match try_load_syntax_spec(dialect) {
-            Ok(Some(loaded)) => {
-                let policy = if loaded.spec.eval_prefix.bang_prefixed_word_is_symbol {
-                    SurfaceSyntaxPolicy::HyperonCompat
-                } else {
-                    SurfaceSyntaxPolicy::Strict
-                };
-                (policy, Some(loaded.spec), true, None)
-            },
-            Ok(None) => (
-                SurfaceSyntaxPolicy::HyperonCompat,
-                None,
-                true,
-                Some(
-                    "surface syntax spec required for HE profile, but no syntax artifacts were found"
-                        .to_string(),
-                ),
-            ),
-            Err(e) => (
-                SurfaceSyntaxPolicy::HyperonCompat,
-                None,
-                true,
-                Some(format!("failed to load HE syntax spec: {e}")),
-            ),
+    match try_load_syntax_spec(dialect) {
+        Ok(Some(loaded)) => {
+            let policy = if loaded.spec.eval_prefix.bang_prefixed_word_is_symbol {
+                SurfaceSyntaxPolicy::HyperonCompat
+            } else {
+                SurfaceSyntaxPolicy::Strict
+            };
+            (policy, Some(loaded.spec), true, None)
         }
-    } else {
-        (
-            SurfaceSyntaxPolicy::Strict,
-            Some(legacy_builtin_syntax_spec().clone()),
-            false,
+        Ok(None) => (
+            SurfaceSyntaxPolicy::HyperonCompat,
             None,
-        )
+            true,
+            Some(format!(
+                "surface syntax spec required for dialect '{}', but no syntax artifacts were found",
+                dialect
+            )),
+        ),
+        Err(e) => (
+            SurfaceSyntaxPolicy::HyperonCompat,
+            None,
+            true,
+            Some(format!("failed to load syntax spec for dialect '{}': {e}", dialect)),
+        ),
     }
 }
 
-fn lookup_plan_config_from_profile(
-    profile: SurfaceProfile,
+fn lookup_plan_config_for_dialect(
+    dialect: &str,
 ) -> (
     Option<LookupPlanArtifact>,
     Option<HashMap<String, LookupRelationMetadata>>,
     bool,
     Option<String>,
 ) {
-    let dialect = match profile {
-        SurfaceProfile::HE => Some("he"),
-        SurfaceProfile::Legacy => None,
-    };
-    if let Some(dialect) = dialect {
-        match try_load_lookup_plan(dialect) {
-            Ok(Some(loaded)) => {
-                let metadata = relation_metadata_index(&loaded.artifact);
-                (Some(loaded.artifact), Some(metadata), true, None)
-            },
-            Ok(None) => (
-                None,
-                None,
-                true,
-                Some(
-                    "lookup-plan artifacts are required for HE profile, but no lookup-plan artifacts were found"
-                        .to_string(),
-                ),
-            ),
-            Err(e) => (
-                None,
-                None,
-                true,
-                Some(format!("failed to load HE lookup plan: {e}")),
-            ),
+    match try_load_lookup_plan(dialect) {
+        Ok(Some(loaded)) => {
+            let metadata = relation_metadata_index(&loaded.artifact);
+            (Some(loaded.artifact), Some(metadata), true, None)
         }
-    } else {
-        (None, None, false, None)
+        Ok(None) => (
+            None,
+            None,
+            true,
+            Some(format!(
+                "lookup-plan artifacts are required for dialect '{}', but no lookup-plan artifacts were found",
+                dialect
+            )),
+        ),
+        Err(e) => (
+            None,
+            None,
+            true,
+            Some(format!("failed to load lookup plan for dialect '{}': {e}", dialect)),
+        ),
     }
 }
 
@@ -1864,6 +1784,7 @@ fn dialect_key_for_tree_sitter(
     }
     match profile {
         SurfaceProfile::HE => "he".to_string(),
+        SurfaceProfile::PeTTa => "petta".to_string(),
         SurfaceProfile::Legacy => "he".to_string(),
     }
 }
@@ -2900,9 +2821,23 @@ pub fn extract_state_out_atom(core_state_term: &str) -> Option<String> {
     }
 }
 
+pub fn extract_done_state_out_atom(core_state_term: &str) -> Option<String> {
+    let trimmed = core_state_term.trim();
+    if !(trimmed.starts_with("C_State(") && trimmed.ends_with(')')) {
+        return None;
+    }
+    let inner = &trimmed["C_State(".len()..trimmed.len() - 1];
+    let args = split_top_level_args(inner);
+    if args.len() == 3 && args[0].trim() == "C_Done" {
+        Some(args[2].trim().to_string())
+    } else {
+        None
+    }
+}
+
 /// Encode a string as C_GStringCodes(C_ACons(c1,C_ACons(c2,...,C_ANil)))
 /// where c1, c2, ... are Unicode codepoints (matching Lean's codeTokensOfString).
-fn encode_gstringcodes(s: &str) -> String {
+pub(crate) fn encode_gstringcodes(s: &str) -> String {
     let mut acc = "C_ANil".to_string();
     for ch in s.chars().rev() {
         let tok = encode_nonneg_token(ch as u32);
@@ -2913,7 +2848,7 @@ fn encode_gstringcodes(s: &str) -> String {
 
 /// Decode C_GStringCodes(C_ACons(N1,C_ACons(N2,...,C_ANil))) back to a string.
 /// Each N is a decimal Unicode codepoint token.
-fn try_decode_gstringcodes(atom: &str) -> Option<String> {
+pub(crate) fn try_decode_gstringcodes(atom: &str) -> Option<String> {
     let inner = atom.strip_prefix("C_GStringCodes(")?.strip_suffix(')')?;
     let mut chars = Vec::new();
     let mut cur = inner.trim().to_string();
@@ -2933,11 +2868,11 @@ fn try_decode_gstringcodes(atom: &str) -> Option<String> {
     }
 }
 
-fn format_c_gint(n: i32) -> String {
+pub(crate) fn format_c_gint(n: i32) -> String {
     format!("C_GInt({})", encode_i32_token(n))
 }
 
-fn encode_i32_token(n: i32) -> String {
+pub(crate) fn encode_i32_token(n: i32) -> String {
     if n < 0 {
         format!("C_neg_{}", n.unsigned_abs())
     } else {
@@ -2945,11 +2880,11 @@ fn encode_i32_token(n: i32) -> String {
     }
 }
 
-fn encode_nonneg_token(n: u32) -> String {
+pub(crate) fn encode_nonneg_token(n: u32) -> String {
     format!("C_{n}")
 }
 
-fn parse_quoted_string_literal(symbol: &str) -> Option<String> {
+pub(crate) fn parse_quoted_string_literal(symbol: &str) -> Option<String> {
     if symbol.len() < 2 || !symbol.starts_with('"') || !symbol.ends_with('"') {
         return None;
     }
@@ -2988,7 +2923,7 @@ fn parse_quoted_string_literal(symbol: &str) -> Option<String> {
     Some(decoded)
 }
 
-fn quote_surface_string(s: &str) -> String {
+pub(crate) fn quote_surface_string(s: &str) -> String {
     let mut out = String::from("\"");
     for ch in s.chars() {
         match ch {
@@ -3005,7 +2940,7 @@ fn quote_surface_string(s: &str) -> String {
     out
 }
 
-fn decode_numeric_token(tok: &str) -> Option<i32> {
+pub(crate) fn decode_numeric_token(tok: &str) -> Option<i32> {
     if let Some(rest) = tok.strip_prefix("C_neg_") {
         let mag = rest.parse::<u32>().ok()?;
         i32::try_from(mag).ok().map(|m| -m)
@@ -3024,7 +2959,7 @@ fn decode_code_token(tok: &str) -> Option<u32> {
     }
 }
 
-fn split_top_level_args(s: &str) -> Vec<String> {
+pub(crate) fn split_top_level_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
@@ -3045,7 +2980,7 @@ fn split_top_level_args(s: &str) -> Vec<String> {
     args
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lang-mettafull-legacy"))]
 mod tests {
     use super::*;
     use crate::syntax_spec::{
@@ -3234,12 +3169,14 @@ mod tests {
         assert!(parsed.is_err(), "standalone bang should error in strict mode");
     }
 
+    #[cfg(feature = "lang-he")]
     #[test]
     fn he_profile_defaults_to_hyperon_compat() {
         let session = MeTTaSurfaceSession::with_profile(SurfaceProfile::HE);
         assert_eq!(session.syntax_policy(), SurfaceSyntaxPolicy::HyperonCompat);
     }
 
+    #[cfg(feature = "lang-he")]
     #[test]
     fn he_profile_defaults_to_legacy_parser_backend() {
         let _guard = acquire_env_lock();
@@ -3248,6 +3185,7 @@ mod tests {
         assert_eq!(session.parser_backend(), SurfaceParserBackend::LegacySExpr);
     }
 
+    #[cfg(feature = "lang-he")]
     #[test]
     fn env_can_select_tree_sitter_parser_backend() {
         let _guard = acquire_env_lock();
@@ -3257,6 +3195,7 @@ mod tests {
         assert_eq!(session.parser_backend(), SurfaceParserBackend::TreeSitter);
     }
 
+    #[cfg(feature = "lang-he")]
     #[test]
     fn tree_sitter_backend_matches_legacy_parser_for_core_forms() {
         let he_spec = load_real_syntax_spec("he");
@@ -3288,6 +3227,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lang-he")]
     #[test]
     fn he_profile_requires_syntax_spec_when_missing() {
         let _guard = acquire_env_lock();
@@ -3300,13 +3240,14 @@ mod tests {
             .expect_err("HE parse should fail when syntax spec is missing");
         assert!(
             err.to_string()
-                .contains("surface syntax spec required for HE profile"),
+                .contains("surface syntax spec required for dialect"),
             "unexpected error: {err}"
         );
         std::env::remove_var("METTAIL_SYNTAX_SPEC_DIR");
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "lang-he")]
     #[test]
     fn he_profile_requires_lookup_plan_when_missing() {
         let _guard = acquire_env_lock();
@@ -3325,7 +3266,7 @@ mod tests {
             .expect_err("HE parse should fail when lookup plan is missing");
         assert!(
             err.to_string()
-                .contains("lookup-plan artifacts are required for HE profile"),
+                .contains("lookup-plan artifacts are required for dialect"),
             "unexpected error: {err}"
         );
 
@@ -3334,6 +3275,7 @@ mod tests {
         let _ = fs::remove_dir_all(&lookup_dir);
     }
 
+    #[cfg(feature = "lang-he")]
     #[test]
     fn backend_parity_he_fixture_file() {
         let he_spec = load_real_syntax_spec("he");
@@ -3350,6 +3292,7 @@ mod tests {
         assert_backend_parity_for_forms(&petta_spec, &forms, "petta_comments");
     }
 
+    #[cfg(feature = "lang-he")]
     #[test]
     fn backend_parity_negative_cases_he_and_petta() {
         let he_spec = load_real_syntax_spec("he");
@@ -3435,6 +3378,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "lang-he")]
     #[test]
     fn parse_he_style_space_mutations() {
         let add =
@@ -3597,6 +3541,18 @@ mod tests {
         let term = "C_State(C_Done,C_Space(C_ANil,C_ANil),C_GBoolTrue)";
         let out = extract_state_out_atom(term).expect("should extract");
         assert_eq!(out, "C_GBoolTrue");
+    }
+
+    #[test]
+    fn extract_done_out_atom_requires_done_instr() {
+        let done = "C_State(C_Done,C_Space(C_ANil,C_ANil),C_GBoolTrue)";
+        let running = "C_State(C_Return(C_SymAtom(foo)),C_Space(C_ANil,C_ANil),C_Empty)";
+        let out = extract_done_state_out_atom(done).expect("done state should extract");
+        assert_eq!(out, "C_GBoolTrue");
+        assert!(
+            extract_done_state_out_atom(running).is_none(),
+            "non-Done state must not be treated as a user-facing result"
+        );
     }
 
     #[test]

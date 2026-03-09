@@ -70,3 +70,21 @@ fn imp_rewrite_ir_loads_and_matches_transition_artifact() {
         assert!(!rw.rule_name.trim().is_empty(), "rule_name should be non-empty for '{}')", tr.rule_id);
     }
 }
+
+#[test]
+fn imp_rewrite_ir_v2_exposes_structured_terms_and_premises() {
+    let dir = imp_artifact_dir();
+    let rewrite_ir = load_imp_rewrite_ir_artifact(&dir).expect("IMP rewrite-ir artifact should parse");
+    assert_eq!(rewrite_ir.schema_version, 2);
+    assert!(
+        rewrite_ir.rules.iter().all(|r| r.lhs.is_some() && r.rhs.is_some()),
+        "IMP rewrite_ir v2 should provide structured lhs/rhs for every rule"
+    );
+    assert!(
+        rewrite_ir
+            .rules
+            .iter()
+            .any(|r| !r.premises.is_empty()),
+        "IMP rewrite_ir v2 should expose structured premises for lookup-backed rules"
+    );
+}

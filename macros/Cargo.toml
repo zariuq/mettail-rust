@@ -16,18 +16,21 @@ proc-macro = true
 ## Propagate WFST features to mettail-prattail.
 wfst = ["mettail-prattail/wfst"]
 wfst-log = ["mettail-prattail/wfst-log"]
+## Enable Ascent datalog code generation.  When OFF the language! macro emits
+## only Syntax (types + parser) + metadata — no Ascent fixpoint engine.
+ascent-codegen = ["dep:ascent", "dep:ascent-byods-rels", "dep:ascent_syntax_export"]
 
 [dependencies]
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
 proc-macro-error = { workspace = true }
-ascent = { workspace = true }
-ascent-byods-rels = { workspace = true }
+ascent = { workspace = true, optional = true }
+ascent-byods-rels = { workspace = true, optional = true }
 moniker = { workspace = true }
 indexmap = { workspace = true }
 mettail-prattail = { path = "../prattail" }
-ascent_syntax_export = { workspace = true }
+ascent_syntax_export = { workspace = true, optional = true }
 
 [dev-dependencies]
 trybuild = "1.0"

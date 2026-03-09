@@ -1,6 +1,6 @@
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -54,6 +54,12 @@ pub struct RewriteIRRule {
     pub left_repr: String,
     pub right_repr: String,
     pub premise_relations: Vec<String>,
+    #[serde(default)]
+    pub lhs: Option<PatternNode>,
+    #[serde(default)]
+    pub rhs: Option<PatternNode>,
+    #[serde(default)]
+    pub premises: Vec<PremiseNode>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -62,6 +68,98 @@ pub struct RewriteIRArtifact {
     pub schema_version: u64,
     pub dialect: String,
     pub rules: Vec<RewriteIRRule>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteIRV2PremiseVarFlow {
+    pub premise_index: u64,
+    pub premise_vars: Vec<String>,
+    pub introduced_vars: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteIRV2RootUpdateHint {
+    pub lhs_root_ctor: String,
+    pub rhs_root_ctor: String,
+    pub lhs_arity: u64,
+    pub rhs_arity: u64,
+    pub preserved_arg_positions: Vec<u64>,
+    pub changed_arg_positions: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteIRV2Rule {
+    pub rule_id: String,
+    pub rule_name: String,
+    pub source_instr: String,
+    pub source_label: String,
+    pub priority: u64,
+    pub lhs_vars: Vec<String>,
+    pub premise_var_flow: Vec<RewriteIRV2PremiseVarFlow>,
+    pub rhs_vars: Vec<String>,
+    pub rhs_requires: Vec<String>,
+    pub root_update: Option<RewriteIRV2RootUpdateHint>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteIRV2Artifact {
+    pub schema_version: u64,
+    pub dialect: String,
+    pub artifact_label: String,
+    pub base_rewrite_ir_schema_version: u64,
+    pub rules: Vec<RewriteIRV2Rule>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PatternNode {
+    Bvar {
+        index: u64,
+    },
+    Fvar {
+        name: String,
+    },
+    Apply {
+        ctor: String,
+        args: Vec<PatternNode>,
+    },
+    Lambda {
+        body: Box<PatternNode>,
+    },
+    MultiLambda {
+        arity: u64,
+        body: Box<PatternNode>,
+    },
+    Subst {
+        body: Box<PatternNode>,
+        repl: Box<PatternNode>,
+    },
+    Collection {
+        collection_type: String,
+        elements: Vec<PatternNode>,
+        rest: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PremiseNode {
+    Freshness {
+        var_name: String,
+        term: Box<PatternNode>,
+    },
+    Congruence {
+        lhs: Box<PatternNode>,
+        rhs: Box<PatternNode>,
+    },
+    RelationQuery {
+        relation: String,
+        args: Vec<PatternNode>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -181,4 +279,19 @@ pub fn parse_rule_ids_from_generated_language(path: &Path) -> Result<BTreeSet<St
         ));
     }
     Ok(ids)
+}
+
+pub fn index_rewrite_ir_v2_rules_by_id(
+    artifact: &RewriteIRV2Artifact,
+) -> Result<BTreeMap<String, RewriteIRV2Rule>, String> {
+    let mut indexed = BTreeMap::new();
+    for rule in &artifact.rules {
+      if indexed.insert(rule.rule_id.clone(), rule.clone()).is_some() {
+            return Err(format!(
+                "duplicate rewrite-ir-v2 rule_id '{}' in dialect {}",
+                rule.rule_id, artifact.dialect
+            ));
+        }
+    }
+    Ok(indexed)
 }

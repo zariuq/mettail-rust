@@ -7,6 +7,7 @@
 use crate::ast::grammar::GrammarItem;
 use crate::ast::language::LanguageDef;
 use crate::gen::{generate_literal_label, generate_var_label};
+#[cfg(feature = "ascent-codegen")]
 use crate::logic::list_all_relations_for_extraction;
 use proc_macro2::Span;
 use proc_macro2::TokenStream;
@@ -434,18 +435,24 @@ fn generate_language_struct(
     _name_str: &str,
     _name_lower: &str,
     language: &LanguageDef,
-    raw_ascent_content: &TokenStream,
+    _raw_ascent_content: &TokenStream,
 ) -> TokenStream {
+    #[cfg(feature = "ascent-codegen")]
+    let raw_ascent_content = _raw_ascent_content;
     let language_name = format_ident!("{}Language", name);
     let term_name = format_ident!("{}Term", name);
     let _metadata_name = format_ident!("{}Metadata", name);
     let env_name = format_ident!("{}Env", name);
+    #[cfg(feature = "ascent-codegen")]
     let prog_struct_name = format_ident!("{}AscentProg", name);
 
     // Primary type relation names (lowercase)
     let primary_lower = primary_type.to_string().to_lowercase();
+    #[cfg(feature = "ascent-codegen")]
     let primary_relation = format_ident!("{}", primary_lower);
+    #[cfg(feature = "ascent-codegen")]
     let rw_relation = format_ident!("rw_{}", primary_lower);
+    #[cfg(feature = "ascent-codegen")]
     let eq_ind_common = format_ident!("__eq_{}_ind_common", primary_lower);
     let _primary_type_str = primary_type.to_string();
 
@@ -457,18 +464,186 @@ fn generate_language_struct(
     let collect_fn = format_ident!("collect_all_vars_impl");
     let var_collection_impl = generate_var_collection_impl(primary_type, language, &collect_fn);
 
-    // Generate custom relation extraction code
+    // Generate custom relation extraction code (Ascent-only)
+    #[cfg(feature = "ascent-codegen")]
     let custom_relation_extraction = generate_custom_relation_extraction(language);
 
     let parse_preserving_vars_body = quote! {
         #primary_type::parse(input).map(#term_name)
     };
 
-    quote! {
+    // --- Ascent program struct + run_ascent_typed (only when ascent-codegen is on) ---
+    #[cfg(feature = "ascent-codegen")]
+    let ascent_struct_and_run_method = quote! {
         ascent::ascent! {
             struct #prog_struct_name;
             #raw_ascent_content
         }
+    };
+    #[cfg(not(feature = "ascent-codegen"))]
+    let ascent_struct_and_run_method = quote! {};
+
+    #[cfg(feature = "ascent-codegen")]
+    let run_ascent_typed_method = quote! {
+        /// Run Ascent on a typed term (seeds with term as-is so step-by-step rewrites are visible)
+        pub fn run_ascent_typed(term: &#term_name) -> mettail_runtime::AscentResults {
+            let initial = term.0.clone();
+
+            let mut prog = #prog_struct_name::default();
+            prog.#primary_relation.push((initial.clone(),));
+            prog.step_term.push((initial.clone(),));
+            let mut phase_timings_ms = std::collections::HashMap::new();
+            let __ascent_eval_started = std::time::Instant::now();
+            prog.run();
+            phase_timings_ms.insert(
+                "ascent_eval_ms".to_string(),
+                __ascent_eval_started.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            // Extract results
+            let __term_extract_started = std::time::Instant::now();
+            let all_terms: Vec<#primary_type> = prog.#primary_relation
+                .iter()
+                .map(|(p,)| p.clone())
+                .collect();
+            phase_timings_ms.insert(
+                "term_extract_ms".to_string(),
+                __term_extract_started.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            let __rewrite_extract_started = std::time::Instant::now();
+            let rewrites: Vec<(#primary_type, #primary_type)> = prog
+                .#rw_relation
+                .iter()
+                .map(|(from, to)| (from.clone(), to.clone()))
+                .collect();
+            phase_timings_ms.insert(
+                "rewrite_extract_ms".to_string(),
+                __rewrite_extract_started.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            // Build term info
+            let __term_info_build_started = std::time::Instant::now();
+            let mut term_infos = Vec::new();
+            for t in &all_terms {
+                let term_id = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    t.hash(&mut hasher);
+                    hasher.finish()
+                };
+                let has_rewrites = rewrites.iter().any(|(from, _)| from == t);
+                term_infos.push(mettail_runtime::TermInfo {
+                    term_id,
+                    display: format!("{}", t),
+                    is_normal_form: !has_rewrites,
+                });
+            }
+            phase_timings_ms.insert(
+                "term_info_build_ms".to_string(),
+                __term_info_build_started.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            // Build rewrite list
+            let __rewrite_info_build_started = std::time::Instant::now();
+            let rewrite_list: Vec<mettail_runtime::Rewrite> = rewrites
+                .iter()
+                .map(|(from, to)| {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h1 = DefaultHasher::new();
+                    let mut h2 = DefaultHasher::new();
+                    from.hash(&mut h1);
+                    to.hash(&mut h2);
+                    mettail_runtime::Rewrite {
+                        from_id: h1.finish(),
+                        to_id: h2.finish(),
+                        rule_name: Some("rewrite".to_string()),
+                    }
+                })
+                .collect();
+            phase_timings_ms.insert(
+                "rewrite_info_build_ms".to_string(),
+                __rewrite_info_build_started.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            // Extract equivalence classes from eqrel union-find
+            let __equiv_extract_started = std::time::Instant::now();
+            let equivalences = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::collections::{HashMap, HashSet};
+                use std::hash::{Hash, Hasher};
+
+                let hash_of = |t: &#primary_type| -> u64 {
+                    let mut h = DefaultHasher::new();
+                    t.hash(&mut h);
+                    h.finish()
+                };
+
+                let mut classes: HashMap<u64, HashSet<u64>> = HashMap::new();
+                for (a, b) in prog.#eq_ind_common.iter_all_added() {
+                    let ha = hash_of(a);
+                    let hb = hash_of(b);
+                    if ha != hb {
+                        classes.entry(ha).or_default().insert(hb);
+                        classes.entry(hb).or_default().insert(ha);
+                    }
+                }
+
+                // Deduplicate: each element appears in one class
+                let mut seen: HashSet<u64> = HashSet::new();
+                let mut result = Vec::new();
+                for (id, peers) in &classes {
+                    if seen.contains(id) { continue; }
+                    let mut class: HashSet<u64> = peers.clone();
+                    class.insert(*id);
+                    for &member in &class {
+                        seen.insert(member);
+                    }
+                    if class.len() > 1 {
+                        result.push(mettail_runtime::EquivClass {
+                            term_ids: class.into_iter().collect(),
+                        });
+                    }
+                }
+                result
+            };
+            phase_timings_ms.insert(
+                "equivalence_extract_ms".to_string(),
+                __equiv_extract_started.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            // Extract custom relations
+            let mut custom_relations = std::collections::HashMap::new();
+            let mut relation_timings_ms = std::collections::HashMap::new();
+            let __custom_extract_started = std::time::Instant::now();
+            #custom_relation_extraction
+            phase_timings_ms.insert(
+                "custom_relation_extract_ms".to_string(),
+                __custom_extract_started.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            mettail_runtime::AscentResults {
+                all_terms: term_infos,
+                rewrites: rewrite_list,
+                equivalences,
+                custom_relations,
+                relation_timings_ms,
+                phase_timings_ms,
+            }
+        }
+    };
+    #[cfg(not(feature = "ascent-codegen"))]
+    let run_ascent_typed_method = quote! {
+        /// Run Ascent on a typed term — stub (Ascent not available in this build)
+        pub fn run_ascent_typed(_term: &#term_name) -> mettail_runtime::AscentResults {
+            panic!("Ascent backend not available in this build; use MORK backend instead")
+        }
+    };
+
+    quote! {
+        #ascent_struct_and_run_method
 
         /// Language implementation struct
         ///
@@ -487,154 +662,7 @@ fn generate_language_struct(
                 #parse_preserving_vars_body
             }
 
-            /// Run Ascent on a typed term (seeds with term as-is so step-by-step rewrites are visible)
-            pub fn run_ascent_typed(term: &#term_name) -> mettail_runtime::AscentResults {
-                let initial = term.0.clone();
-
-                let mut prog = #prog_struct_name::default();
-                prog.#primary_relation.push((initial.clone(),));
-                prog.step_term.push((initial.clone(),));
-                let mut phase_timings_ms = std::collections::HashMap::new();
-                let __ascent_eval_started = std::time::Instant::now();
-                prog.run();
-                phase_timings_ms.insert(
-                    "ascent_eval_ms".to_string(),
-                    __ascent_eval_started.elapsed().as_secs_f64() * 1000.0,
-                );
-
-                // Extract results
-                let __term_extract_started = std::time::Instant::now();
-                let all_terms: Vec<#primary_type> = prog.#primary_relation
-                    .iter()
-                    .map(|(p,)| p.clone())
-                    .collect();
-                phase_timings_ms.insert(
-                    "term_extract_ms".to_string(),
-                    __term_extract_started.elapsed().as_secs_f64() * 1000.0,
-                );
-
-                let __rewrite_extract_started = std::time::Instant::now();
-                let rewrites: Vec<(#primary_type, #primary_type)> = prog
-                    .#rw_relation
-                    .iter()
-                    .map(|(from, to)| (from.clone(), to.clone()))
-                    .collect();
-                phase_timings_ms.insert(
-                    "rewrite_extract_ms".to_string(),
-                    __rewrite_extract_started.elapsed().as_secs_f64() * 1000.0,
-                );
-
-                // Build term info
-                let __term_info_build_started = std::time::Instant::now();
-                let mut term_infos = Vec::new();
-                for t in &all_terms {
-                    let term_id = {
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = DefaultHasher::new();
-                        t.hash(&mut hasher);
-                        hasher.finish()
-                    };
-                    let has_rewrites = rewrites.iter().any(|(from, _)| from == t);
-                    term_infos.push(mettail_runtime::TermInfo {
-                        term_id,
-                        display: format!("{}", t),
-                        is_normal_form: !has_rewrites,
-                    });
-                }
-                phase_timings_ms.insert(
-                    "term_info_build_ms".to_string(),
-                    __term_info_build_started.elapsed().as_secs_f64() * 1000.0,
-                );
-
-                // Build rewrite list
-                let __rewrite_info_build_started = std::time::Instant::now();
-                let rewrite_list: Vec<mettail_runtime::Rewrite> = rewrites
-                    .iter()
-                    .map(|(from, to)| {
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut h1 = DefaultHasher::new();
-                        let mut h2 = DefaultHasher::new();
-                        from.hash(&mut h1);
-                        to.hash(&mut h2);
-                        mettail_runtime::Rewrite {
-                            from_id: h1.finish(),
-                            to_id: h2.finish(),
-                            rule_name: Some("rewrite".to_string()),
-                        }
-                    })
-                    .collect();
-                phase_timings_ms.insert(
-                    "rewrite_info_build_ms".to_string(),
-                    __rewrite_info_build_started.elapsed().as_secs_f64() * 1000.0,
-                );
-
-                // Extract equivalence classes from eqrel union-find
-                let __equiv_extract_started = std::time::Instant::now();
-                let equivalences = {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::collections::{HashMap, HashSet};
-                    use std::hash::{Hash, Hasher};
-
-                    let hash_of = |t: &#primary_type| -> u64 {
-                        let mut h = DefaultHasher::new();
-                        t.hash(&mut h);
-                        h.finish()
-                    };
-
-                    let mut classes: HashMap<u64, HashSet<u64>> = HashMap::new();
-                    for (a, b) in prog.#eq_ind_common.iter_all_added() {
-                        let ha = hash_of(a);
-                        let hb = hash_of(b);
-                        if ha != hb {
-                            classes.entry(ha).or_default().insert(hb);
-                            classes.entry(hb).or_default().insert(ha);
-                        }
-                    }
-
-                    // Deduplicate: each element appears in one class
-                    let mut seen: HashSet<u64> = HashSet::new();
-                    let mut result = Vec::new();
-                    for (id, peers) in &classes {
-                        if seen.contains(id) { continue; }
-                        let mut class: HashSet<u64> = peers.clone();
-                        class.insert(*id);
-                        for &member in &class {
-                            seen.insert(member);
-                        }
-                        if class.len() > 1 {
-                            result.push(mettail_runtime::EquivClass {
-                                term_ids: class.into_iter().collect(),
-                            });
-                        }
-                    }
-                    result
-                };
-                phase_timings_ms.insert(
-                    "equivalence_extract_ms".to_string(),
-                    __equiv_extract_started.elapsed().as_secs_f64() * 1000.0,
-                );
-
-                // Extract custom relations
-                let mut custom_relations = std::collections::HashMap::new();
-                let mut relation_timings_ms = std::collections::HashMap::new();
-                let __custom_extract_started = std::time::Instant::now();
-                #custom_relation_extraction
-                phase_timings_ms.insert(
-                    "custom_relation_extract_ms".to_string(),
-                    __custom_extract_started.elapsed().as_secs_f64() * 1000.0,
-                );
-
-                mettail_runtime::AscentResults {
-                    all_terms: term_infos,
-                    rewrites: rewrite_list,
-                    equivalences,
-                    custom_relations,
-                    relation_timings_ms,
-                    phase_timings_ms,
-                }
-            }
+            #run_ascent_typed_method
 
             /// Create a new empty environment
             pub fn create_env() -> #env_name {
@@ -1100,15 +1128,21 @@ fn generate_language_struct_multi(
     _name_str: &str,
     _name_lower: &str,
     language: &LanguageDef,
-    raw_ascent_content: &TokenStream,
-    core_raw_ascent_content: Option<&TokenStream>,
+    _raw_ascent_content: &TokenStream,
+    _core_raw_ascent_content: Option<&TokenStream>,
 ) -> TokenStream {
+    #[cfg(feature = "ascent-codegen")]
+    let raw_ascent_content = _raw_ascent_content;
+    #[cfg(feature = "ascent-codegen")]
+    let core_raw_ascent_content = _core_raw_ascent_content;
     let language_name = format_ident!("{}Language", name);
     let term_name = format_ident!("{}Term", name);
     let inner_enum_name = format_ident!("{}TermInner", name);
     let env_name = format_ident!("{}Env", name);
+    #[cfg(feature = "ascent-codegen")]
     let prog_struct_name = format_ident!("{}AscentProg", name);
 
+    #[cfg(feature = "ascent-codegen")]
     let custom_relation_extraction = generate_custom_relation_extraction(language);
 
     // NFA-style multi-category parse: try ALL category parsers and collect successes.
@@ -1163,8 +1197,10 @@ fn generate_language_struct_multi(
         quote! {}
     };
 
+    #[cfg(feature = "ascent-codegen")]
     let primary_type_for_step = language.types.first().map(|t| &t.name);
     // Seed arms: push the initial term into the appropriate relation on the unified Ascent struct.
+    #[cfg(feature = "ascent-codegen")]
     let seed_arms: Vec<TokenStream> = language
         .types
         .iter()
@@ -1192,8 +1228,7 @@ fn generate_language_struct_multi(
         .collect();
 
     // Extract arms: read results from the appropriate relation after Ascent fixpoint.
-    // Term IDs must match the wrapper's term_id() which hashes the inner enum (e.g. CalculatorTermInner::Str(t)),
-    // so we hash the enum variant wrapping each term for TermInfo and Rewrite.
+    #[cfg(feature = "ascent-codegen")]
     let extract_arms: Vec<TokenStream> = language
         .types
         .iter()
@@ -1340,9 +1375,8 @@ fn generate_language_struct_multi(
         })
         .collect();
 
-    // Generate the core Ascent struct if core content is available.
-    // The core struct has fewer rules (only for core categories) but ALL relation
-    // declarations, so it compiles correctly. Non-core relations remain empty.
+    // --- Ascent-gated: core struct + run_ascent dispatcher ---
+    #[cfg(feature = "ascent-codegen")]
     let core_struct_def = core_raw_ascent_content.map(|core_content| {
         let core_prog_name = format_ident!("{}AscentProgCore", name);
         quote! {
@@ -1353,11 +1387,12 @@ fn generate_language_struct_multi(
         }
     });
 
-    // Build dispatcher: core-category inputs use the core struct (if available),
-    // non-core inputs use the full struct.
+    #[cfg(feature = "ascent-codegen")]
     let core_prog_name = format_ident!("{}AscentProgCore", name);
+    #[cfg(feature = "ascent-codegen")]
     let core_cats = crate::logic::common::compute_core_categories(language);
 
+    #[cfg(feature = "ascent-codegen")]
     let run_ascent_body = if core_raw_ascent_content.is_some() {
         // SCC-split dispatcher: core categories → core struct, others → full struct
         let core_cats_ref = core_cats
@@ -1577,16 +1612,39 @@ fn generate_language_struct_multi(
         }
     };
 
-    // Optionally emit the core struct definition
+    // --- Ascent-gated: emit Ascent struct(s) + run_ascent_typed ---
+    #[cfg(feature = "ascent-codegen")]
     let core_struct_output = core_struct_def.unwrap_or_default();
 
-    quote! {
+    #[cfg(feature = "ascent-codegen")]
+    let ascent_structs_and_run_method = quote! {
         ascent::ascent! {
             struct #prog_struct_name;
             #raw_ascent_content
         }
 
         #core_struct_output
+    };
+    #[cfg(not(feature = "ascent-codegen"))]
+    let ascent_structs_and_run_method = quote! {};
+
+    #[cfg(feature = "ascent-codegen")]
+    let run_ascent_typed_method = quote! {
+        /// Run Ascent on a typed term (seeds the relation for the term's category).
+        pub fn run_ascent_typed(term: &#term_name) -> mettail_runtime::AscentResults {
+            #run_ascent_body
+        }
+    };
+    #[cfg(not(feature = "ascent-codegen"))]
+    let run_ascent_typed_method = quote! {
+        /// Run Ascent on a typed term — stub (Ascent not available in this build)
+        pub fn run_ascent_typed(_term: &#term_name) -> mettail_runtime::AscentResults {
+            panic!("Ascent backend not available in this build; use MORK backend instead")
+        }
+    };
+
+    quote! {
+        #ascent_structs_and_run_method
 
         /// Language implementation struct (multi-category: one parser/relation per type).
         pub struct #language_name;
@@ -1599,13 +1657,6 @@ fn generate_language_struct_multi(
             }
 
             /// Parse without clearing var cache. Tries ALL category parsers (NFA-style).
-            /// If exactly 1 succeeds → unambiguous. If N succeed → `Ambiguous(Vec<Inner>)`.
-            /// Reports the first parser's error when all fail.
-            ///
-            /// When the language has non-native categories (e.g. Proc, Name), a lexer probe
-            /// classifies the first token: if it's an `Ident`, native-only categories (Float,
-            /// Int, Bool, Str) are skipped since identifiers are not native literals. This
-            /// reduces 6-way ambiguity to 2-way for bare variables in languages like rhocalc.
             pub fn parse_preserving_vars(input: &str) -> Result<#term_name, std::string::String> {
                 #lexer_probe
 
@@ -1619,17 +1670,7 @@ fn generate_language_struct_multi(
                 }
             }
 
-            /// Run Ascent on a typed term (seeds the relation for the term's category).
-            /// For Ambiguous terms, evaluates only the first alternative by declaration
-            /// order. All alternatives that reach Stage C are valid parses, so evaluating
-            /// only the first-declared is deterministic and avoids redundant Ascent runs.
-            ///
-            /// SCC splitting: when available, core-category inputs (e.g., Proc, Name) use
-            /// a smaller Ascent struct with fewer rules, reducing fixpoint iteration cost.
-            /// Non-core inputs (e.g., Float, Bool, Str) fall back to the full struct.
-            pub fn run_ascent_typed(term: &#term_name) -> mettail_runtime::AscentResults {
-                #run_ascent_body
-            }
+            #run_ascent_typed_method
 
             /// Create a new empty environment
             pub fn create_env() -> #env_name {
@@ -1725,6 +1766,53 @@ fn generate_language_trait_impl(
         quote! {}
     };
 
+    #[cfg(feature = "ascent-codegen")]
+    let backend_contract_methods = quote! {};
+    #[cfg(not(feature = "ascent-codegen"))]
+    let backend_contract_methods = quote! {
+        fn run_eval(
+            &self,
+            term: &dyn mettail_runtime::Term,
+        ) -> Result<mettail_runtime::EvalResults, std::string::String> {
+            let _ = term;
+            Err(format!(
+                "language '{}' does not provide direct evaluation in this build; use --backend mork with a registered native core backend",
+                self.name()
+            ))
+        }
+
+        fn supports_backend(&self, backend: mettail_runtime::RuntimeBackend) -> bool {
+            match backend {
+                mettail_runtime::RuntimeBackend::Auto => {
+                    mettail_runtime::language_supports_auto_backend(self.name())
+                }
+                mettail_runtime::RuntimeBackend::Ascent => false,
+                mettail_runtime::RuntimeBackend::Mork => {
+                    mettail_runtime::language_supports_mork_backend(self.name())
+                }
+            }
+        }
+
+        fn run_backend(
+            &self,
+            term: &dyn mettail_runtime::Term,
+            backend: mettail_runtime::RuntimeBackend,
+        ) -> Result<mettail_runtime::AscentResults, std::string::String> {
+            match backend {
+                mettail_runtime::RuntimeBackend::Auto => {
+                    mettail_runtime::run_registered_auto_backend(self.name(), term)
+                }
+                mettail_runtime::RuntimeBackend::Ascent => Err(format!(
+                    "language '{}' does not include Ascent support in this build",
+                    self.name()
+                )),
+                mettail_runtime::RuntimeBackend::Mork => {
+                    mettail_runtime::run_registered_mork_backend(self.name(), term)
+                }
+            }
+        }
+    };
+
     quote! {
         impl mettail_runtime::Language for #language_name {
             fn name(&self) -> &'static str {
@@ -1752,6 +1840,8 @@ fn generate_language_trait_impl(
                     .ok_or_else(|| format!("Expected {}", stringify!(#term_name)))?;
                 Ok(#language_name::run_ascent_typed(typed_term))
             }
+
+            #backend_contract_methods
 
             #try_direct_eval_method
 
@@ -1995,6 +2085,53 @@ fn generate_language_trait_impl_multi(
         }
     };
 
+    #[cfg(feature = "ascent-codegen")]
+    let backend_contract_methods = quote! {};
+    #[cfg(not(feature = "ascent-codegen"))]
+    let backend_contract_methods = quote! {
+        fn run_eval(
+            &self,
+            term: &dyn mettail_runtime::Term,
+        ) -> Result<mettail_runtime::EvalResults, std::string::String> {
+            let _ = term;
+            Err(format!(
+                "language '{}' does not provide direct evaluation in this build; use --backend mork with a registered native core backend",
+                self.name()
+            ))
+        }
+
+        fn supports_backend(&self, backend: mettail_runtime::RuntimeBackend) -> bool {
+            match backend {
+                mettail_runtime::RuntimeBackend::Auto => {
+                    mettail_runtime::language_supports_auto_backend(self.name())
+                }
+                mettail_runtime::RuntimeBackend::Ascent => false,
+                mettail_runtime::RuntimeBackend::Mork => {
+                    mettail_runtime::language_supports_mork_backend(self.name())
+                }
+            }
+        }
+
+        fn run_backend(
+            &self,
+            term: &dyn mettail_runtime::Term,
+            backend: mettail_runtime::RuntimeBackend,
+        ) -> Result<mettail_runtime::AscentResults, std::string::String> {
+            match backend {
+                mettail_runtime::RuntimeBackend::Auto => {
+                    mettail_runtime::run_registered_auto_backend(self.name(), term)
+                }
+                mettail_runtime::RuntimeBackend::Ascent => Err(format!(
+                    "language '{}' does not include Ascent support in this build",
+                    self.name()
+                )),
+                mettail_runtime::RuntimeBackend::Mork => {
+                    mettail_runtime::run_registered_mork_backend(self.name(), term)
+                }
+            }
+        }
+    };
+
     // infer_var_types dispatch arms (per-category)
     let infer_var_types_arms: Vec<TokenStream> = language
         .types
@@ -2065,6 +2202,8 @@ fn generate_language_trait_impl_multi(
                     .ok_or_else(|| format!("Expected {}", stringify!(#term_name)))?;
                 Ok(#language_name::run_ascent_typed(typed_term))
             }
+
+            #backend_contract_methods
 
             #try_direct_eval_method
 
@@ -2308,6 +2447,7 @@ fn generate_type_inference_helpers(
 /// Generate code to extract all relations (generated + custom) from the Ascent program.
 /// Uses the unified list from list_all_relations_for_extraction so custom_relations
 /// is the single source for query schema and data.
+#[cfg(feature = "ascent-codegen")]
 fn generate_custom_relation_extraction(language: &LanguageDef) -> TokenStream {
     let relations = list_all_relations_for_extraction(language);
 

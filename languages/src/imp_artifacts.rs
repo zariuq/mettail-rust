@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub const IMP_TRANSITION_SCHEMA_VERSION: u64 = 2;
 pub const IMP_LOOKUP_SCHEMA_VERSION: u64 = 2;
-pub const IMP_REWRITE_IR_SCHEMA_VERSION: u64 = 1;
+pub const IMP_REWRITE_IR_SCHEMA_VERSION: u64 = 2;
 
 pub fn imp_artifact_dir() -> PathBuf {
     if let Ok(from_env) = std::env::var("METTAIL_IMP_ARTIFACT_DIR") {
@@ -17,7 +17,8 @@ pub fn imp_artifact_dir() -> PathBuf {
             return dir;
         }
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../lean-projects/mettapedia/artifacts/imp")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../lean-projects/mettapedia/artifacts/imp")
 }
 
 pub fn imp_generated_language_path() -> PathBuf {
@@ -26,7 +27,8 @@ pub fn imp_generated_language_path() -> PathBuf {
 
 fn candidate_imp_artifact_dirs() -> Vec<PathBuf> {
     vec![
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../lean-projects/mettapedia/artifacts/imp"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../lean-projects/mettapedia/artifacts/imp"),
         PathBuf::from("../../../lean-projects/mettapedia/artifacts/imp"),
         PathBuf::from("../../lean-projects/mettapedia/artifacts/imp"),
         PathBuf::from("../lean-projects/mettapedia/artifacts/imp"),

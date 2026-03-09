@@ -8,13 +8,25 @@ use std::collections::HashMap;
 use std::process::Command;
 
 // Import generated language implementations directly
+#[cfg(feature = "lang-ambient")]
 use mettail_languages::ambient::AmbientLanguage;
+#[cfg(feature = "lang-calculator")]
 use mettail_languages::calculator::CalculatorLanguage;
+#[cfg(feature = "lang-imp")]
 use mettail_languages::imp_from_lean::IMPLanguage;
+#[cfg(feature = "lang-imp")]
+use mettail_languages::imp_surface::{parse_imp_term, parse_imp_term_for_env};
+#[cfg(feature = "lang-lambda")]
 use mettail_languages::lambda::LambdaLanguage;
+#[cfg(feature = "lang-he")]
 use mettail_languages::mettahe_from_lean::MeTTaHELanguage;
+#[cfg(feature = "lang-petta")]
+use mettail_languages::petta_from_lean::PeTTaLanguage;
+#[cfg(feature = "lang-minskylite")]
 use mettail_languages::minskylite_from_lean::MinskyLiteLanguage;
+#[cfg(feature = "lang-mm0lite")]
 use mettail_languages::mm0lite_from_lean::MM0LiteLanguage;
+#[cfg(feature = "lang-rhocalc")]
 use mettail_languages::rhocalc::RhoCalcLanguage;
 
 /// Registry of available languages
@@ -26,11 +38,29 @@ pub struct LanguageRegistry {
 struct OracleAugmentedLanguage {
     inner: Box<dyn Language>,
     expose_meta_oracle: bool,
+    parse_term_override: Option<fn(&str) -> Result<Box<dyn Term>, String>>,
+    parse_term_for_env_override: Option<fn(&str) -> Result<Box<dyn Term>, String>>,
 }
 
 impl OracleAugmentedLanguage {
     fn new(inner: Box<dyn Language>) -> Self {
-        Self { inner, expose_meta_oracle: true }
+        Self {
+            inner,
+            expose_meta_oracle: true,
+            parse_term_override: None,
+            parse_term_for_env_override: None,
+        }
+    }
+
+    #[cfg(feature = "lang-imp")]
+    fn with_parse_overrides(
+        mut self,
+        parse_term_override: fn(&str) -> Result<Box<dyn Term>, String>,
+        parse_term_for_env_override: fn(&str) -> Result<Box<dyn Term>, String>,
+    ) -> Self {
+        self.parse_term_override = Some(parse_term_override);
+        self.parse_term_for_env_override = Some(parse_term_for_env_override);
+        self
     }
 }
 
@@ -105,11 +135,19 @@ impl Language for OracleAugmentedLanguage {
     }
 
     fn parse_term(&self, input: &str) -> Result<Box<dyn Term>, String> {
-        self.inner.parse_term(input)
+        if let Some(parse) = self.parse_term_override {
+            parse(input)
+        } else {
+            self.inner.parse_term(input)
+        }
     }
 
     fn parse_term_for_env(&self, input: &str) -> Result<Box<dyn Term>, String> {
-        self.inner.parse_term_for_env(input)
+        if let Some(parse) = self.parse_term_for_env_override {
+            parse(input)
+        } else {
+            self.inner.parse_term_for_env(input)
+        }
     }
 
     fn run_ascent(&self, term: &dyn Term) -> Result<AscentResults, String> {
@@ -377,13 +415,26 @@ pub fn build_registry() -> Result<LanguageRegistry> {
     mettail_languages::register_default_core_backends().map_err(anyhow::Error::msg)?;
 
     // Register auto-generated language implementations
+    #[cfg(feature = "lang-ambient")]
     registry.register(Box::new(AmbientLanguage));
+    #[cfg(feature = "lang-calculator")]
     registry.register(Box::new(CalculatorLanguage));
-    registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(IMPLanguage))));
+    #[cfg(feature = "lang-imp")]
+    registry.register(Box::new(
+        OracleAugmentedLanguage::new(Box::new(IMPLanguage))
+            .with_parse_overrides(parse_imp_term, parse_imp_term_for_env),
+    ));
+    #[cfg(feature = "lang-lambda")]
     registry.register(Box::new(LambdaLanguage));
+    #[cfg(feature = "lang-he")]
     registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(MeTTaHELanguage))));
+    #[cfg(feature = "lang-petta")]
+    registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(PeTTaLanguage))));
+    #[cfg(feature = "lang-minskylite")]
     registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(MinskyLiteLanguage))));
+    #[cfg(feature = "lang-mm0lite")]
     registry.register(Box::new(OracleAugmentedLanguage::new(Box::new(MM0LiteLanguage))));
+    #[cfg(feature = "lang-rhocalc")]
     registry.register(Box::new(RhoCalcLanguage));
 
     if registry.languages.is_empty() {
@@ -396,6 +447,7 @@ pub fn build_registry() -> Result<LanguageRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lang-he")]
     use mettail_runtime::OracleQuery;
     #[cfg(feature = "mork-backend")]
     use mettail_runtime::RuntimeBackend;
@@ -403,13 +455,15 @@ mod tests {
     #[test]
     fn default_registry_contains_mettahe() {
         let registry = build_registry().expect("registry should build");
-        assert!(registry.contains("imp"));
-        assert!(registry.contains("mettahe"));
-        assert!(registry.contains("minskylite"));
-        assert!(registry.contains("mm0lite"));
+        assert_eq!(registry.contains("imp"), cfg!(feature = "lang-imp"));
+        assert_eq!(registry.contains("mettahe"), cfg!(feature = "lang-he"));
+        assert_eq!(registry.contains("petta"), cfg!(feature = "lang-petta"));
+        assert_eq!(registry.contains("minskylite"), cfg!(feature = "lang-minskylite"));
+        assert_eq!(registry.contains("mm0lite"), cfg!(feature = "lang-mm0lite"));
         assert!(!registry.contains("mettafullstate"));
     }
 
+    #[cfg(feature = "lang-he")]
     #[test]
     fn mettahe_exposes_meta_oracle() {
         let registry = build_registry().expect("registry should build");
@@ -435,7 +489,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "mork-backend")]
+    #[cfg(all(feature = "mork-backend", feature = "lang-he"))]
     #[test]
     fn mettahe_registry_supports_core_mork_backend() {
         let registry = build_registry().expect("registry should build");
@@ -470,7 +524,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "mork-backend")]
+    #[cfg(all(feature = "mork-backend", feature = "lang-he"))]
     #[test]
     fn mettahe_registry_auto_uses_native_mork_backend() {
         let registry = build_registry().expect("registry should build");
@@ -505,7 +559,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "mork-backend")]
+    #[cfg(all(feature = "mork-backend", feature = "lang-mm0lite"))]
     #[test]
     fn mm0lite_registry_supports_core_mork_backend() {
         let registry = build_registry().expect("registry should build");
@@ -537,7 +591,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "mork-backend")]
+    #[cfg(all(feature = "mork-backend", feature = "lang-mm0lite"))]
     #[test]
     fn mm0lite_registry_auto_uses_native_mork_backend() {
         let registry = build_registry().expect("registry should build");
@@ -559,7 +613,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "mork-backend")]
+    #[cfg(all(feature = "mork-backend", feature = "lang-minskylite"))]
     #[test]
     fn minskylite_registry_supports_core_mork_backend() {
         let registry = build_registry().expect("registry should build");
@@ -589,7 +643,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "mork-backend")]
+    #[cfg(all(feature = "mork-backend", feature = "lang-minskylite"))]
     #[test]
     fn minskylite_registry_auto_uses_native_mork_backend() {
         let registry = build_registry().expect("registry should build");
@@ -611,7 +665,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "mork-backend")]
+    #[cfg(all(feature = "mork-backend", feature = "lang-imp"))]
     #[test]
     fn imp_registry_supports_core_mork_backend() {
         let registry = build_registry().expect("registry should build");
@@ -630,7 +684,7 @@ mod tests {
             .expect("IMP MORK backend should execute");
 
         assert!(
-            mork.all_terms.iter().any(|t| t.display.contains("done")),
+            mork.all_terms.iter().any(|t| t.display.contains("C_Done")),
             "expected IMP MORK to reach done, got {:?}",
             mork.all_terms
                 .iter()
@@ -639,7 +693,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "mork-backend")]
+    #[cfg(all(feature = "mork-backend", feature = "lang-imp"))]
     #[test]
     fn imp_registry_auto_uses_native_mork_backend() {
         let registry = build_registry().expect("registry should build");

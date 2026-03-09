@@ -1,5 +1,7 @@
 use crate::artifact_contract::{LookupArtifact, RewriteIRArtifact, TransitionArtifact};
+use mettail_runtime::dispatch_ordered_rules;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub struct NativeTransitionRuleMeta {
@@ -31,6 +33,88 @@ impl NativeTransitionContract {
 
     pub fn rule(&self, rule_id: &str) -> Option<&NativeTransitionRuleMeta> {
         self.by_rule_id.get(rule_id)
+    }
+}
+
+pub fn expect_rule_contract(
+    dialect_name: &str,
+    meta: &NativeTransitionRuleMeta,
+    transition_kind: &str,
+    guard_family: &str,
+    effect_kind: &str,
+) -> Result<(), String> {
+    if meta.transition_kind != transition_kind
+        || meta.guard_family != guard_family
+        || meta.effect_kind != effect_kind
+    {
+        return Err(format!(
+            "{dialect_name} contract mismatch for rule '{}' (logical id '{}'): expected kind='{}' guard='{}' effect='{}', got kind='{}' guard='{}' effect='{}'",
+            meta.rule_id,
+            meta.logical_transition_id,
+            transition_kind,
+            guard_family,
+            effect_kind,
+            meta.transition_kind,
+            meta.guard_family,
+            meta.effect_kind,
+        ));
+    }
+    Ok(())
+}
+
+pub fn dispatch_checked_source_rules<T: std::fmt::Display>(
+    dialect_name: &str,
+    contract: &NativeTransitionContract,
+    source_instr: &str,
+    mut apply: impl FnMut(&str, &NativeTransitionRuleMeta) -> Result<Vec<T>, String>,
+) -> Result<Vec<(String, T)>, String> {
+    let ordered = contract.ordered_rules_for(source_instr).ok_or_else(|| {
+        format!(
+            "{dialect_name} transition artifact missing source instruction '{}'",
+            source_instr
+        )
+    })?;
+
+    dispatch_ordered_rules(
+        ordered,
+        |rule| {
+            let meta = contract.rule(rule).cloned().ok_or_else(|| {
+                format!(
+                    "{dialect_name} rewrite contract missing metadata for rule '{}' listed under source '{}'",
+                    rule, source_instr
+                )
+            })?;
+            if meta.source_instr != source_instr {
+                return Err(format!(
+                    "{dialect_name} rewrite contract mismatch: rule '{}' expected source '{}', got '{}'",
+                    rule, source_instr, meta.source_instr
+                ));
+            }
+            Ok(meta)
+        },
+        |rule, meta| apply(rule, meta),
+    )
+}
+
+pub fn dispatch_active_source_step<T: std::fmt::Display>(
+    dialect_name: &str,
+    contract: &NativeTransitionContract,
+    active_source: Result<Option<&str>, String>,
+    apply: impl FnMut(&str, &NativeTransitionRuleMeta) -> Result<Vec<T>, String>,
+) -> Result<Vec<(String, T)>, String> {
+    let Some(source_instr) = active_source? else {
+        return Ok(Vec::new());
+    };
+    dispatch_checked_source_rules(dialect_name, contract, source_instr, apply)
+}
+
+pub fn cached_contract_result<T>(
+    slot: &'static OnceLock<Result<T, String>>,
+    load: impl FnOnce() -> Result<T, String>,
+) -> Result<&'static T, String> {
+    match slot.get_or_init(load) {
+        Ok(value) => Ok(value),
+        Err(err) => Err(err.clone()),
     }
 }
 

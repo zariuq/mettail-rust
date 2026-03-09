@@ -17,21 +17,20 @@ use crate::minskylite_artifacts::{
 };
 #[cfg(feature = "mork-backend")]
 use crate::native_transition_contract::{
-    build_native_transition_contract, NativeTransitionContract, NativeTransitionRuleMeta,
+    build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
+    expect_rule_contract, NativeTransitionContract, NativeTransitionRuleMeta,
 };
 #[cfg(feature = "mork-backend")]
 use mettail_runtime::{
-    dispatch_ordered_rules, run_transition_graph, AscentResults, MorkExecutionLimits, Term,
+    run_native_term_graph_with_timing, AscentResults, MorkExecutionLimits, Term,
 };
 #[cfg(feature = "mork-backend")]
 use std::sync::OnceLock;
-#[cfg(feature = "mork-backend")]
-use std::time::Instant;
 
 #[cfg(feature = "mork-backend")]
 fn minskylite_rewrite_contract() -> Result<&'static NativeTransitionContract, String> {
     static CONTRACT: OnceLock<Result<NativeTransitionContract, String>> = OnceLock::new();
-    match CONTRACT.get_or_init(|| {
+    cached_contract_result(&CONTRACT, || {
         let dir = minskylite_artifact_dir();
         let transition = load_minskylite_transition_artifact(&dir)?;
         let lookup = load_minskylite_lookup_artifact(&dir)?;
@@ -43,10 +42,7 @@ fn minskylite_rewrite_contract() -> Result<&'static NativeTransitionContract, St
                 Err("MinskyLite lookup-plan should be empty for current core semantics".to_string())
             }
         })
-    }) {
-        Ok(contract) => Ok(contract),
-        Err(err) => Err(err.clone()),
-    }
+    })
 }
 
 #[cfg(feature = "mork-backend")]
@@ -85,12 +81,7 @@ fn minsky_apply_rule(
 ) -> Result<Vec<Machine>, String> {
     let next_machine = match meta.transition_kind.as_str() {
         "increment" => {
-            if meta.guard_family != "none" || meta.effect_kind != "advance_machine" {
-                return Err(format!(
-                    "MinskyLite increment contract mismatch for rule '{}' (logical id '{}'): guard='{}', effect='{}'",
-                    meta.rule_id, meta.logical_transition_id, meta.guard_family, meta.effect_kind
-                ));
-            }
+            expect_rule_contract("MinskyLite", meta, "increment", "none", "advance_machine")?;
             match ctrl {
                 Control::C_IncA(next) => Some(Machine::C_Machine(
                     next.clone(),
@@ -108,12 +99,7 @@ fn minsky_apply_rule(
             }
         },
         "branch_zero" => {
-            if meta.guard_family != "zero" || meta.effect_kind != "advance_machine" {
-                return Err(format!(
-                    "MinskyLite zero-branch contract mismatch for rule '{}' (logical id '{}'): guard='{}', effect='{}'",
-                    meta.rule_id, meta.logical_transition_id, meta.guard_family, meta.effect_kind
-                ));
-            }
+            expect_rule_contract("MinskyLite", meta, "branch_zero", "zero", "advance_machine")?;
             match ctrl {
                 Control::C_DecA(zero_next, _) if matches!(reg_a, Nat::C_Zero) => {
                     Some(Machine::C_Machine(
@@ -135,12 +121,13 @@ fn minsky_apply_rule(
             }
         },
         "branch_positive" => {
-            if meta.guard_family != "positive" || meta.effect_kind != "advance_machine" {
-                return Err(format!(
-                    "MinskyLite positive-branch contract mismatch for rule '{}' (logical id '{}'): guard='{}', effect='{}'",
-                    meta.rule_id, meta.logical_transition_id, meta.guard_family, meta.effect_kind
-                ));
-            }
+            expect_rule_contract(
+                "MinskyLite",
+                meta,
+                "branch_positive",
+                "positive",
+                "advance_machine",
+            )?;
             match ctrl {
                 Control::C_DecA(_, succ_next) => {
                     if let Nat::C_Succ(prev_a) = reg_a {
@@ -170,12 +157,7 @@ fn minsky_apply_rule(
             }
         },
         "halt" => {
-            if meta.guard_family != "none" || meta.effect_kind != "set_done" {
-                return Err(format!(
-                    "MinskyLite halt contract mismatch for rule '{}' (logical id '{}'): guard='{}', effect='{}'",
-                    meta.rule_id, meta.logical_transition_id, meta.guard_family, meta.effect_kind
-                ));
-            }
+            expect_rule_contract("MinskyLite", meta, "halt", "none", "set_done")?;
             match ctrl {
                 Control::C_Halt => Some(Machine::C_Machine(
                     Box::new(Control::C_Halt),
@@ -207,37 +189,17 @@ fn minsky_native_step_state(state: &Machine) -> Result<Vec<(String, Machine)>, S
     let Machine::C_Machine(ctrl, reg_a, reg_b, status) = state else {
         return Err(format!("MinskyLite native backend expects C_Machine(...), got {}", state));
     };
-    if !matches!(status.as_ref(), Status::C_Running) {
-        return Ok(Vec::new());
-    }
-
-    let source_instr = minsky_source_instr(ctrl.as_ref()).ok_or_else(|| {
-        format!("MinskyLite native backend does not support control shape '{}'", ctrl)
-    })?;
     let contract = minskylite_rewrite_contract()?;
-    let ordered = contract.ordered_rules_for(source_instr).ok_or_else(|| {
-        format!("MinskyLite transition artifact missing source instruction '{}'", source_instr)
-    })?;
-
-    dispatch_ordered_rules(
-        ordered,
-        |rule| {
-            let meta = contract.rule(rule).cloned().ok_or_else(|| {
-                format!(
-                    "MinskyLite rewrite contract missing metadata for rule '{}' listed under source '{}'",
-                    rule, source_instr
-                )
-            })?;
-            if meta.source_instr != source_instr {
-                return Err(format!(
-                    "MinskyLite rewrite contract mismatch: rule '{}' expected source '{}', got '{}'",
-                    rule, source_instr, meta.source_instr
-                ));
-            }
-            Ok(meta)
-        },
-        |_rule, meta| minsky_apply_rule(meta, ctrl.as_ref(), reg_a.as_ref(), reg_b.as_ref()),
-    )
+    let active_source = if matches!(status.as_ref(), Status::C_Running) {
+        minsky_source_instr(ctrl.as_ref()).map(Some).ok_or_else(|| {
+            format!("MinskyLite native backend does not support control shape '{}'", ctrl)
+        })
+    } else {
+        Ok(None)
+    };
+    dispatch_active_source_step("MinskyLite", contract, active_source, |_rule, meta| {
+        minsky_apply_rule(meta, ctrl.as_ref(), reg_a.as_ref(), reg_b.as_ref())
+    })
 }
 
 #[cfg(feature = "mork-backend")]
@@ -262,9 +224,7 @@ fn run_minskylite_native_state_graph(
         },
     };
 
-    let start_display = format!("{}", term);
-    let start_id = term.term_id();
-    run_transition_graph(start_state, &start_display, start_id, limits, |state| {
+    run_native_term_graph_with_timing(term, start_state, limits, |state| {
         minsky_native_step_state(state)
     })
 }
@@ -279,10 +239,5 @@ pub fn run_minskylite_mork_backend_with_limits(
     term: &dyn Term,
     limits: MorkExecutionLimits,
 ) -> Result<AscentResults, String> {
-    let started = Instant::now();
-    let mut results = run_minskylite_native_state_graph(term, limits)?;
-    results
-        .phase_timings_ms
-        .insert("mork_native_state_ms".to_string(), started.elapsed().as_secs_f64() * 1000.0);
-    Ok(results)
+    run_minskylite_native_state_graph(term, limits)
 }

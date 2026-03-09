@@ -7,9 +7,14 @@
 )]
 
 use mettail_macros::language;
+use mettail_runtime::{Language, Term};
 
 include!("generated/imp_language_working.rs");
 
+use crate::imp_surface::{parse_imp_term, parse_imp_term_for_env};
+
+#[cfg(feature = "mork-backend")]
+use crate::artifact_contract::{PatternNode, RewriteIRRule};
 #[cfg(feature = "mork-backend")]
 use crate::imp_artifacts::{
     imp_artifact_dir, load_imp_lookup_artifact, load_imp_rewrite_ir_artifact,
@@ -17,56 +22,85 @@ use crate::imp_artifacts::{
 };
 #[cfg(feature = "mork-backend")]
 use crate::native_transition_contract::{
-    build_native_transition_contract, NativeTransitionContract, NativeTransitionRuleMeta,
+    build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
+    NativeTransitionContract,
 };
 #[cfg(feature = "mork-backend")]
-use mettail_runtime::{
-    dispatch_ordered_rules, run_transition_graph, AscentResults, MorkExecutionLimits, Term,
+use crate::rewrite_template::{
+    bind_var, execute_rule_to_runtime_strings, resolve_query_arg, CPrefixConstructorCodec,
+    ResolvedQueryArg, RewritePremiseEvaluator, TemplateBindings,
 };
+#[cfg(feature = "mork-backend")]
+use mettail_runtime::{run_native_term_graph_with_timing, AscentResults, MorkExecutionLimits};
+#[cfg(feature = "mork-backend")]
+use std::collections::HashMap;
 #[cfg(feature = "mork-backend")]
 use std::sync::OnceLock;
-#[cfg(feature = "mork-backend")]
-use std::time::Instant;
 
-#[cfg(feature = "mork-backend")]
-fn imp_rewrite_contract() -> Result<&'static NativeTransitionContract, String> {
-    static CONTRACT: OnceLock<Result<NativeTransitionContract, String>> = OnceLock::new();
-    match CONTRACT.get_or_init(|| {
-        let dir = imp_artifact_dir();
-        let transition = load_imp_transition_artifact(&dir)?;
-        let lookup = load_imp_lookup_artifact(&dir)?;
-        let rewrite_ir = load_imp_rewrite_ir_artifact(&dir)?;
-        build_native_transition_contract("IMP", transition, lookup, rewrite_ir, |lookup| {
-            let family = lookup
-                .families
-                .iter()
-                .find(|f| f.family == "storeGet")
-                .ok_or_else(|| "IMP lookup-plan must expose storeGet family".to_string())?;
-            if family.query_arity != 2 || family.payload_arity != 1 {
-                return Err(format!(
-                    "IMP storeGet family arity mismatch: query_arity={}, payload_arity={} (expected 2/1)",
-                    family.query_arity, family.payload_arity
-                ));
-            }
-            if !family.contracts.exact_result || !family.contracts.no_false_negatives {
-                return Err("IMP storeGet family must be exact and no-false-negatives".to_string());
-            }
-            Ok(())
-        })
-    }) {
-        Ok(contract) => Ok(contract),
-        Err(err) => Err(err.clone()),
+impl IMPLanguage {
+    pub fn parse_term(&self, input: &str) -> Result<Box<dyn Term>, String> {
+        parse_imp_term(input)
+    }
+
+    pub fn parse_term_for_env(&self, input: &str) -> Result<Box<dyn Term>, String> {
+        parse_imp_term_for_env(input)
     }
 }
 
 #[cfg(feature = "mork-backend")]
-fn running_status() -> Box<Status> {
-    Box::new(Status::C_Running)
+#[derive(Debug)]
+struct ImpRewriteContract {
+    transition: NativeTransitionContract,
+    rules_by_id: HashMap<String, RewriteIRRule>,
 }
 
 #[cfg(feature = "mork-backend")]
-fn done_status() -> Box<Status> {
-    Box::new(Status::C_Done)
+fn imp_rewrite_contract() -> Result<&'static ImpRewriteContract, String> {
+    static CONTRACT: OnceLock<Result<ImpRewriteContract, String>> = OnceLock::new();
+    cached_contract_result(&CONTRACT, || {
+        let dir = imp_artifact_dir();
+        let transition = load_imp_transition_artifact(&dir)?;
+        let lookup = load_imp_lookup_artifact(&dir)?;
+        let rewrite_ir = load_imp_rewrite_ir_artifact(&dir)?;
+        let transition = build_native_transition_contract(
+            "IMP",
+            transition,
+            lookup,
+            rewrite_ir.clone(),
+            |lookup| {
+                let family = lookup
+                    .families
+                    .iter()
+                    .find(|f| f.family == "storeGet")
+                    .ok_or_else(|| "IMP lookup-plan must expose storeGet family".to_string())?;
+                if family.query_arity != 2 || family.payload_arity != 1 {
+                    return Err(format!(
+                    "IMP storeGet family arity mismatch: query_arity={}, payload_arity={} (expected 2/1)",
+                    family.query_arity, family.payload_arity
+                ));
+                }
+                if !family.contracts.exact_result || !family.contracts.no_false_negatives {
+                    return Err(
+                        "IMP storeGet family must be exact and no-false-negatives".to_string()
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        let mut rules_by_id = HashMap::new();
+        for rule in rewrite_ir.rules {
+            if rule.lhs.is_none() || rule.rhs.is_none() {
+                return Err(format!(
+                    "IMP rewrite_ir v2 requires structured lhs/rhs for rule '{}'",
+                    rule.rule_id
+                ));
+            }
+            if rules_by_id.insert(rule.rule_id.clone(), rule).is_some() {
+                return Err("IMP rewrite_ir contains duplicate rule ids".to_string());
+            }
+        }
+        Ok(ImpRewriteContract { transition, rules_by_id })
+    })
 }
 
 #[cfg(feature = "mork-backend")]
@@ -77,16 +111,6 @@ fn true_bool() -> Box<Bool> {
 #[cfg(feature = "mork-backend")]
 fn false_bool() -> Box<Bool> {
     Box::new(Bool::C_BoolFalse)
-}
-
-#[cfg(feature = "mork-backend")]
-fn mk_state(control: Control, store: Box<Store>, kont: Box<Kont>, status: Box<Status>) -> State {
-    State::C_ImpState(Box::new(control), store, kont, status)
-}
-
-#[cfg(feature = "mork-backend")]
-fn promote_stmt_atom(atom: &StmtAtom) -> Box<Stmt> {
-    Box::new(Stmt::C_StmtAtomPromote(Box::new(atom.clone())))
 }
 
 #[cfg(feature = "mork-backend")]
@@ -143,735 +167,291 @@ fn store_get(store: &Store, var: &ImpVar) -> Option<Box<Nat>> {
 #[cfg(feature = "mork-backend")]
 fn store_set(store: &Store, var: &ImpVar, value: &Nat) -> Option<Box<Store>> {
     match (store, var) {
-        (Store::C_Store(_, y, z), ImpVar::C_VarX) => Some(Box::new(Store::C_Store(
-            Box::new(value.clone()),
-            y.clone(),
-            z.clone(),
-        ))),
-        (Store::C_Store(x, _, z), ImpVar::C_VarY) => Some(Box::new(Store::C_Store(
-            x.clone(),
-            Box::new(value.clone()),
-            z.clone(),
-        ))),
-        (Store::C_Store(x, y, _), ImpVar::C_VarZ) => Some(Box::new(Store::C_Store(
-            x.clone(),
-            y.clone(),
-            Box::new(value.clone()),
-        ))),
+        (Store::C_Store(_, y, z), ImpVar::C_VarX) => {
+            Some(Box::new(Store::C_Store(Box::new(value.clone()), y.clone(), z.clone())))
+        },
+        (Store::C_Store(x, _, z), ImpVar::C_VarY) => {
+            Some(Box::new(Store::C_Store(x.clone(), Box::new(value.clone()), z.clone())))
+        },
+        (Store::C_Store(x, y, _), ImpVar::C_VarZ) => {
+            Some(Box::new(Store::C_Store(x.clone(), y.clone(), Box::new(value.clone()))))
+        },
         _ => None,
     }
 }
 
 #[cfg(feature = "mork-backend")]
-fn expect_contract(
-    meta: &NativeTransitionRuleMeta,
-    transition_kind: &str,
-    guard_family: &str,
-    effect_kind: &str,
-) -> Result<(), String> {
-    if meta.transition_kind != transition_kind
-        || meta.guard_family != guard_family
-        || meta.effect_kind != effect_kind
-    {
-        return Err(format!(
-            "IMP contract mismatch for rule '{}' (logical id '{}'): expected kind='{}' guard='{}' effect='{}', got kind='{}' guard='{}' effect='{}'",
-            meta.rule_id,
-            meta.logical_transition_id,
-            transition_kind,
-            guard_family,
-            effect_kind,
-            meta.transition_kind,
-            meta.guard_family,
-            meta.effect_kind,
-        ));
-    }
-    Ok(())
+fn apply_ctor(ctor: &str, args: Vec<PatternNode>) -> PatternNode {
+    PatternNode::Apply { ctor: ctor.to_string(), args }
 }
 
 #[cfg(feature = "mork-backend")]
-fn imp_apply_rule(meta: &NativeTransitionRuleMeta, state: &State) -> Result<Vec<State>, String> {
-    let next = match meta.rule_name.as_str() {
-        "R_Start" => {
-            expect_contract(meta, "enter", "shape", "advance_state")?;
-            match state {
-                State::C_Start(stmt, store) => Some(mk_state(
-                    Control::C_RunStmt(stmt.clone()),
-                    store.clone(),
-                    Box::new(Kont::C_KDone),
-                    running_status(),
-                )),
-                _ => None,
+fn nat_to_node(n: &Nat) -> PatternNode {
+    match n {
+        Nat::C_Zero => apply_ctor("Zero", vec![]),
+        Nat::C_Succ(prev) => apply_ctor("Succ", vec![nat_to_node(prev.as_ref())]),
+        _ => unreachable!("generated IMP Nat only exposes Zero/Succ"),
+    }
+}
+
+#[cfg(feature = "mork-backend")]
+fn nat_from_node(node: &PatternNode) -> Option<Box<Nat>> {
+    match node {
+        PatternNode::Apply { ctor, args } if ctor == "Zero" && args.is_empty() => {
+            Some(Box::new(Nat::C_Zero))
+        },
+        PatternNode::Apply { ctor, args } if ctor == "Succ" && args.len() == 1 => {
+            nat_from_node(&args[0]).map(|prev| Box::new(Nat::C_Succ(prev)))
+        },
+        _ => None,
+    }
+}
+
+#[cfg(feature = "mork-backend")]
+fn bool_to_node(b: &Bool) -> PatternNode {
+    match b {
+        Bool::C_BoolTrue => apply_ctor("BoolTrue", vec![]),
+        Bool::C_BoolFalse => apply_ctor("BoolFalse", vec![]),
+        _ => unreachable!("generated IMP Bool only exposes BoolTrue/BoolFalse"),
+    }
+}
+
+#[cfg(feature = "mork-backend")]
+fn imp_var_from_node(node: &PatternNode) -> Option<Box<ImpVar>> {
+    match node {
+        PatternNode::Apply { ctor, args } if ctor == "VarX" && args.is_empty() => {
+            Some(Box::new(ImpVar::C_VarX))
+        },
+        PatternNode::Apply { ctor, args } if ctor == "VarY" && args.is_empty() => {
+            Some(Box::new(ImpVar::C_VarY))
+        },
+        PatternNode::Apply { ctor, args } if ctor == "VarZ" && args.is_empty() => {
+            Some(Box::new(ImpVar::C_VarZ))
+        },
+        _ => None,
+    }
+}
+
+#[cfg(feature = "mork-backend")]
+fn store_to_node(store: &Store) -> PatternNode {
+    match store {
+        Store::C_Store(x, y, z) => apply_ctor(
+            "Store",
+            vec![nat_to_node(x.as_ref()), nat_to_node(y.as_ref()), nat_to_node(z.as_ref())],
+        ),
+        _ => unreachable!("generated IMP Store only exposes Store"),
+    }
+}
+
+#[cfg(feature = "mork-backend")]
+fn store_from_node(node: &PatternNode) -> Option<Box<Store>> {
+    match node {
+        PatternNode::Apply { ctor, args } if ctor == "Store" && args.len() == 3 => {
+            Some(Box::new(Store::C_Store(
+                nat_from_node(&args[0])?,
+                nat_from_node(&args[1])?,
+                nat_from_node(&args[2])?,
+            )))
+        },
+        _ => None,
+    }
+}
+
+#[cfg(feature = "mork-backend")]
+fn bind_relation_result(
+    env: &TemplateBindings,
+    arg: &PatternNode,
+    value: PatternNode,
+) -> Result<Vec<TemplateBindings>, String> {
+    match resolve_query_arg(arg, env)? {
+        ResolvedQueryArg::Ground(existing) => {
+            if existing == value {
+                Ok(vec![env.clone()])
+            } else {
+                Ok(Vec::new())
             }
         },
-        "R_Skip" => {
-            expect_contract(meta, "transition", "shape", "advance_state")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunStmt(stmt) => match stmt.as_ref() {
-                        Stmt::C_StmtAtomPromote(atom) if matches!(atom.as_ref(), StmtAtom::C_Skip) => Some(mk_state(
-                            Control::C_RetUnit,
-                            store.clone(),
-                            k.clone(),
-                            running_status(),
-                        )),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
+        ResolvedQueryArg::UnboundVar(name) => {
+            let mut next = env.clone();
+            bind_var(&mut next, &name, value)?;
+            Ok(vec![next])
         },
-        "R_Assign" => {
-            expect_contract(meta, "assign", "shape", "store_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunStmt(stmt) => match stmt.as_ref() {
-                        Stmt::C_StmtAtomPromote(atom) => match atom.as_ref() {
-                            StmtAtom::C_Assign(x, e) => Some(mk_state(
-                                Control::C_RunA(e.clone()),
-                                store.clone(),
-                                Box::new(Kont::C_KAssign(x.clone(), k.clone())),
-                                running_status(),
-                            )),
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_Seq" => {
-            expect_contract(meta, "sequence", "shape", "kont_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunStmt(stmt) => match stmt.as_ref() {
-                        Stmt::C_Seq(s1, s2) => Some(mk_state(
-                            Control::C_RunStmt(s1.clone()),
-                            store.clone(),
-                            Box::new(Kont::C_KSeq(promote_stmt_atom(s2.as_ref()), k.clone())),
-                            running_status(),
-                        )),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_If" => {
-            expect_contract(meta, "branch", "shape", "kont_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunStmt(stmt) => match stmt.as_ref() {
-                        Stmt::C_StmtAtomPromote(atom) => match atom.as_ref() {
-                            StmtAtom::C_If(b, t, f) => Some(mk_state(
-                                Control::C_RunB(b.clone()),
-                                store.clone(),
-                                Box::new(Kont::C_KIf(t.clone(), f.clone(), k.clone())),
-                                running_status(),
-                            )),
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_While" => {
-            expect_contract(meta, "while", "shape", "kont_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunStmt(stmt) => match stmt.as_ref() {
-                        Stmt::C_StmtAtomPromote(atom) => match atom.as_ref() {
-                            StmtAtom::C_While(b, body) => Some(mk_state(
-                                Control::C_RunB(b.clone()),
-                                store.clone(),
-                                Box::new(Kont::C_KWhile(b.clone(), body.clone(), k.clone())),
-                                running_status(),
-                            )),
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_ANat" => {
-            expect_contract(meta, "arith", "shape", "advance_state")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunA(expr) => match expr.as_ref() {
-                        AExp::C_AExpMul(m) => match m.as_ref() {
-                            AMul::C_AMulAtom(atom) => match atom.as_ref() {
-                                AAtom::C_ANat(n) => Some(mk_state(
-                                    Control::C_RetNat(n.clone()),
-                                    store.clone(),
-                                    k.clone(),
-                                    running_status(),
-                                )),
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_AVar" => {
-            expect_contract(meta, "arith", "lookup", "advance_state")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunA(expr) => match expr.as_ref() {
-                        AExp::C_AExpMul(m) => match m.as_ref() {
-                            AMul::C_AMulAtom(atom) => match atom.as_ref() {
-                                AAtom::C_AVar(x) => store_get(store.as_ref(), x.as_ref()).map(|n| {
-                                    mk_state(
-                                        Control::C_RetNat(n),
-                                        store.clone(),
-                                        k.clone(),
-                                        running_status(),
-                                    )
-                                }),
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_AParen" => {
-            expect_contract(meta, "arith", "shape", "advance_state")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunA(expr) => match expr.as_ref() {
-                        AExp::C_AExpMul(m) => match m.as_ref() {
-                            AMul::C_AMulAtom(atom) => match atom.as_ref() {
-                                AAtom::C_AParen(e) => Some(mk_state(
-                                    Control::C_RunA(e.clone()),
-                                    store.clone(),
-                                    k.clone(),
-                                    running_status(),
-                                )),
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_AMul" => {
-            expect_contract(meta, "arith", "shape", "advance_state")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunA(expr) => match expr.as_ref() {
-                        AExp::C_AExpMul(m) => match m.as_ref() {
-                            AMul::C_AMulTimes(lhs, rhs) => Some(mk_state(
-                                Control::C_RunA(Box::new(AExp::C_AExpMul(lhs.clone()))),
-                                store.clone(),
-                                Box::new(Kont::C_KTimesL(rhs.clone(), k.clone())),
-                                running_status(),
-                            )),
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_APlus" => {
-            expect_contract(meta, "arith_plus", "shape", "arith_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunA(expr) => match expr.as_ref() {
-                        AExp::C_AExpPlus(lhs, rhs) => Some(mk_state(
-                            Control::C_RunA(lhs.clone()),
-                            store.clone(),
-                            Box::new(Kont::C_KPlusL(rhs.clone(), k.clone())),
-                            running_status(),
-                        )),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_BTrue" => {
-            expect_contract(meta, "bool", "bool_true", "advance_state")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunB(expr) => match expr.as_ref() {
-                        BExp::C_BExpConj(conj) => match conj.as_ref() {
-                            BConj::C_BConjNeg(neg) => match neg.as_ref() {
-                                BNeg::C_BNegAtom(atom) if matches!(atom.as_ref(), BAtom::C_BTrueAtom) => Some(mk_state(
-                                    Control::C_RetBool(true_bool()),
-                                    store.clone(),
-                                    k.clone(),
-                                    running_status(),
-                                )),
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_BFalse" => {
-            expect_contract(meta, "bool", "bool_false", "advance_state")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunB(expr) => match expr.as_ref() {
-                        BExp::C_BExpConj(conj) => match conj.as_ref() {
-                            BConj::C_BConjNeg(neg) => match neg.as_ref() {
-                                BNeg::C_BNegAtom(atom) if matches!(atom.as_ref(), BAtom::C_BFalseAtom) => Some(mk_state(
-                                    Control::C_RetBool(false_bool()),
-                                    store.clone(),
-                                    k.clone(),
-                                    running_status(),
-                                )),
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_BParen" => {
-            expect_contract(meta, "bool", "shape", "advance_state")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunB(expr) => match expr.as_ref() {
-                        BExp::C_BExpConj(conj) => match conj.as_ref() {
-                            BConj::C_BConjNeg(neg) => match neg.as_ref() {
-                                BNeg::C_BNegAtom(atom) => match atom.as_ref() {
-                                    BAtom::C_BParen(b) => Some(mk_state(
-                                        Control::C_RunB(b.clone()),
-                                        store.clone(),
-                                        k.clone(),
-                                        running_status(),
-                                    )),
-                                    _ => None,
-                                },
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_BLe" => {
-            expect_contract(meta, "bool_le", "shape", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunB(expr) => match expr.as_ref() {
-                        BExp::C_BExpConj(conj) => match conj.as_ref() {
-                            BConj::C_BConjNeg(neg) => match neg.as_ref() {
-                                BNeg::C_BNegAtom(atom) => match atom.as_ref() {
-                                    BAtom::C_BLe(lhs, rhs) => Some(mk_state(
-                                        Control::C_RunA(lhs.clone()),
-                                        store.clone(),
-                                        Box::new(Kont::C_KLeL(rhs.clone(), k.clone())),
-                                        running_status(),
-                                    )),
-                                    _ => None,
-                                },
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_BEq" => {
-            expect_contract(meta, "bool_eq", "shape", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunB(expr) => match expr.as_ref() {
-                        BExp::C_BExpConj(conj) => match conj.as_ref() {
-                            BConj::C_BConjNeg(neg) => match neg.as_ref() {
-                                BNeg::C_BNegAtom(atom) => match atom.as_ref() {
-                                    BAtom::C_BEq(lhs, rhs) => Some(mk_state(
-                                        Control::C_RunA(lhs.clone()),
-                                        store.clone(),
-                                        Box::new(Kont::C_KEqL(rhs.clone(), k.clone())),
-                                        running_status(),
-                                    )),
-                                    _ => None,
-                                },
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_BNot" => {
-            expect_contract(meta, "bool_not", "shape", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunB(expr) => match expr.as_ref() {
-                        BExp::C_BExpConj(conj) => match conj.as_ref() {
-                            BConj::C_BConjNeg(neg) => match neg.as_ref() {
-                                BNeg::C_BNot(b) => Some(mk_state(
-                                    Control::C_RunB(Box::new(BExp::C_BExpConj(Box::new(BConj::C_BConjNeg(b.clone()))))),
-                                    store.clone(),
-                                    Box::new(Kont::C_KNot(k.clone())),
-                                    running_status(),
-                                )),
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_BAnd" => {
-            expect_contract(meta, "bool_and", "shape", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, k, _) => match ctrl.as_ref() {
-                    Control::C_RunB(expr) => match expr.as_ref() {
-                        BExp::C_BExpConj(conj) => match conj.as_ref() {
-                            BConj::C_BAnd(lhs, rhs) => Some(mk_state(
-                                Control::C_RunB(Box::new(BExp::C_BExpConj(lhs.clone()))),
-                                store.clone(),
-                                Box::new(Kont::C_KAndL(rhs.clone(), k.clone())),
-                                running_status(),
-                            )),
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KSeq" => {
-            expect_contract(meta, "sequence", "shape", "kont_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetUnit, Kont::C_KSeq(stmt, k)) => Some(mk_state(
-                        Control::C_RunStmt(stmt.clone()),
-                        store.clone(),
-                        k.clone(),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KAssign" => {
-            expect_contract(meta, "assign", "lookup", "store_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetNat(n), Kont::C_KAssign(x, k)) => {
-                        store_set(store.as_ref(), x.as_ref(), n.as_ref()).map(|store2| {
-                            mk_state(Control::C_RetUnit, store2, k.clone(), running_status())
-                        })
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KIf_True" => {
-            expect_contract(meta, "branch", "bool_true", "kont_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetBool(b), Kont::C_KIf(t, _, k)) if matches!(b.as_ref(), Bool::C_BoolTrue) => Some(mk_state(
-                        Control::C_RunStmt(t.clone()),
-                        store.clone(),
-                        k.clone(),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KIf_False" => {
-            expect_contract(meta, "branch", "bool_false", "kont_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetBool(b), Kont::C_KIf(_, f, k)) if matches!(b.as_ref(), Bool::C_BoolFalse) => Some(mk_state(
-                        Control::C_RunStmt(f.clone()),
-                        store.clone(),
-                        k.clone(),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KWhile_True" => {
-            expect_contract(meta, "while", "bool_true", "kont_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetBool(b), Kont::C_KWhile(cond, body, k)) if matches!(b.as_ref(), Bool::C_BoolTrue) => {
-                        let loop_stmt = promote_stmt_atom(&StmtAtom::C_While(cond.clone(), body.clone()));
-                        Some(mk_state(
-                            Control::C_RunStmt(body.clone()),
-                            store.clone(),
-                            Box::new(Kont::C_KSeq(loop_stmt, k.clone())),
-                            running_status(),
-                        ))
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KWhile_False" => {
-            expect_contract(meta, "while", "bool_false", "kont_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetBool(b), Kont::C_KWhile(_, _, k)) if matches!(b.as_ref(), Bool::C_BoolFalse) => Some(mk_state(
-                        Control::C_RetUnit,
-                        store.clone(),
-                        k.clone(),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KPlus_L" => {
-            expect_contract(meta, "arith_plus", "shape", "arith_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetNat(n), Kont::C_KPlusL(rhs, k)) => Some(mk_state(
-                        Control::C_RunA(Box::new(AExp::C_AExpMul(rhs.clone()))),
-                        store.clone(),
-                        Box::new(Kont::C_KPlusR(n.clone(), k.clone())),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KPlus_R" => {
-            expect_contract(meta, "arith_plus", "lookup", "arith_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetNat(rhs), Kont::C_KPlusR(lhs, k)) => nat_add(lhs.as_ref(), rhs.as_ref()).map(|sum| {
-                        mk_state(Control::C_RetNat(sum), store.clone(), k.clone(), running_status())
-                    }),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KTimes_L" => {
-            expect_contract(meta, "arith_times", "shape", "arith_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetNat(n), Kont::C_KTimesL(rhs, k)) => Some(mk_state(
-                        Control::C_RunA(Box::new(AExp::C_AExpMul(Box::new(AMul::C_AMulAtom(rhs.clone()))))),
-                        store.clone(),
-                        Box::new(Kont::C_KTimesR(n.clone(), k.clone())),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KTimes_R" => {
-            expect_contract(meta, "arith_times", "lookup", "arith_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetNat(rhs), Kont::C_KTimesR(lhs, k)) => nat_mul(lhs.as_ref(), rhs.as_ref()).map(|prod| {
-                        mk_state(Control::C_RetNat(prod), store.clone(), k.clone(), running_status())
-                    }),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KLe_L" => {
-            expect_contract(meta, "bool_le", "shape", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetNat(lhs), Kont::C_KLeL(rhs, k)) => Some(mk_state(
-                        Control::C_RunA(rhs.clone()),
-                        store.clone(),
-                        Box::new(Kont::C_KLeR(lhs.clone(), k.clone())),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KLe_R" => {
-            expect_contract(meta, "bool_le", "lookup", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetNat(rhs), Kont::C_KLeR(lhs, k)) => nat_le(lhs.as_ref(), rhs.as_ref()).map(|out| {
-                        mk_state(Control::C_RetBool(out), store.clone(), k.clone(), running_status())
-                    }),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KEq_L" => {
-            expect_contract(meta, "bool_eq", "shape", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetNat(lhs), Kont::C_KEqL(rhs, k)) => Some(mk_state(
-                        Control::C_RunA(rhs.clone()),
-                        store.clone(),
-                        Box::new(Kont::C_KEqR(lhs.clone(), k.clone())),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KEq_R" => {
-            expect_contract(meta, "bool_eq", "lookup", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetNat(rhs), Kont::C_KEqR(lhs, k)) => nat_eq(lhs.as_ref(), rhs.as_ref()).map(|out| {
-                        mk_state(Control::C_RetBool(out), store.clone(), k.clone(), running_status())
-                    }),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KNot_True" => {
-            expect_contract(meta, "bool_not", "bool_true", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetBool(b), Kont::C_KNot(k)) if matches!(b.as_ref(), Bool::C_BoolTrue) => Some(mk_state(
-                        Control::C_RetBool(false_bool()),
-                        store.clone(),
-                        k.clone(),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KNot_False" => {
-            expect_contract(meta, "bool_not", "bool_false", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetBool(b), Kont::C_KNot(k)) if matches!(b.as_ref(), Bool::C_BoolFalse) => Some(mk_state(
-                        Control::C_RetBool(true_bool()),
-                        store.clone(),
-                        k.clone(),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KAnd_True" => {
-            expect_contract(meta, "bool_and", "bool_true", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetBool(b), Kont::C_KAndL(rhs, k)) if matches!(b.as_ref(), Bool::C_BoolTrue) => Some(mk_state(
-                        Control::C_RunB(Box::new(BExp::C_BExpConj(Box::new(BConj::C_BConjNeg(rhs.clone()))))),
-                        store.clone(),
-                        k.clone(),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_KAnd_False" => {
-            expect_contract(meta, "bool_and", "bool_false", "bool_update")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetBool(b), Kont::C_KAndL(_, k)) if matches!(b.as_ref(), Bool::C_BoolFalse) => Some(mk_state(
-                        Control::C_RetBool(false_bool()),
-                        store.clone(),
-                        k.clone(),
-                        running_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        "R_Final" => {
-            expect_contract(meta, "finalize", "shape", "set_done")?;
-            match state {
-                State::C_ImpState(ctrl, store, kont, _) => match (ctrl.as_ref(), kont.as_ref()) {
-                    (Control::C_RetUnit, Kont::C_KDone) => Some(mk_state(
-                        Control::C_RetUnit,
-                        store.clone(),
-                        Box::new(Kont::C_KDone),
-                        done_status(),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        },
-        _ => {
-            return Err(format!(
-                "IMP MORK backend has no semantic handler for rule '{}' (id '{}', logical id '{}', source '{}')",
-                meta.rule_name, meta.rule_id, meta.logical_transition_id, meta.source_instr
-            ));
-        },
-    };
-    Ok(next.into_iter().collect())
+    }
+}
+
+#[cfg(feature = "mork-backend")]
+fn expect_ground_arg(
+    relation: &str,
+    idx: usize,
+    arg: &PatternNode,
+    env: &TemplateBindings,
+) -> Result<PatternNode, String> {
+    match resolve_query_arg(arg, env)? {
+        ResolvedQueryArg::Ground(value) => Ok(value),
+        ResolvedQueryArg::UnboundVar(name) => Err(format!(
+            "IMP relation '{}' requires argument {} to be ground, got unbound variable '{}'",
+            relation, idx, name
+        )),
+    }
+}
+
+#[cfg(feature = "mork-backend")]
+struct ImpPremiseEvaluator;
+
+#[cfg(feature = "mork-backend")]
+impl RewritePremiseEvaluator for ImpPremiseEvaluator {
+    fn eval_relation_query(
+        &self,
+        relation: &str,
+        args: &[PatternNode],
+        env: &TemplateBindings,
+    ) -> Result<Vec<TemplateBindings>, String> {
+        match relation {
+            "storeGet" => {
+                if args.len() != 3 {
+                    return Err(format!(
+                        "IMP relation '{}' expects 3 args, got {}",
+                        relation,
+                        args.len()
+                    ));
+                }
+                let store = store_from_node(&expect_ground_arg(relation, 0, &args[0], env)?)
+                    .ok_or_else(|| "storeGet arg 0 must be a Store term".to_string())?;
+                let var = imp_var_from_node(&expect_ground_arg(relation, 1, &args[1], env)?)
+                    .ok_or_else(|| "storeGet arg 1 must be a Var term".to_string())?;
+                let Some(value) = store_get(store.as_ref(), var.as_ref()) else {
+                    return Ok(Vec::new());
+                };
+                bind_relation_result(env, &args[2], nat_to_node(value.as_ref()))
+            },
+            "storeSet" => {
+                if args.len() != 4 {
+                    return Err(format!(
+                        "IMP relation '{}' expects 4 args, got {}",
+                        relation,
+                        args.len()
+                    ));
+                }
+                let store = store_from_node(&expect_ground_arg(relation, 0, &args[0], env)?)
+                    .ok_or_else(|| "storeSet arg 0 must be a Store term".to_string())?;
+                let var = imp_var_from_node(&expect_ground_arg(relation, 1, &args[1], env)?)
+                    .ok_or_else(|| "storeSet arg 1 must be a Var term".to_string())?;
+                let value = nat_from_node(&expect_ground_arg(relation, 2, &args[2], env)?)
+                    .ok_or_else(|| "storeSet arg 2 must be a Nat term".to_string())?;
+                let Some(updated) = store_set(store.as_ref(), var.as_ref(), value.as_ref()) else {
+                    return Ok(Vec::new());
+                };
+                bind_relation_result(env, &args[3], store_to_node(updated.as_ref()))
+            },
+            "natAdd" => {
+                if args.len() != 3 {
+                    return Err(format!(
+                        "IMP relation '{}' expects 3 args, got {}",
+                        relation,
+                        args.len()
+                    ));
+                }
+                let lhs = nat_from_node(&expect_ground_arg(relation, 0, &args[0], env)?)
+                    .ok_or_else(|| "natAdd arg 0 must be Nat".to_string())?;
+                let rhs = nat_from_node(&expect_ground_arg(relation, 1, &args[1], env)?)
+                    .ok_or_else(|| "natAdd arg 1 must be Nat".to_string())?;
+                let Some(sum) = nat_add(lhs.as_ref(), rhs.as_ref()) else {
+                    return Ok(Vec::new());
+                };
+                bind_relation_result(env, &args[2], nat_to_node(sum.as_ref()))
+            },
+            "natMul" => {
+                if args.len() != 3 {
+                    return Err(format!(
+                        "IMP relation '{}' expects 3 args, got {}",
+                        relation,
+                        args.len()
+                    ));
+                }
+                let lhs = nat_from_node(&expect_ground_arg(relation, 0, &args[0], env)?)
+                    .ok_or_else(|| "natMul arg 0 must be Nat".to_string())?;
+                let rhs = nat_from_node(&expect_ground_arg(relation, 1, &args[1], env)?)
+                    .ok_or_else(|| "natMul arg 1 must be Nat".to_string())?;
+                let Some(prod) = nat_mul(lhs.as_ref(), rhs.as_ref()) else {
+                    return Ok(Vec::new());
+                };
+                bind_relation_result(env, &args[2], nat_to_node(prod.as_ref()))
+            },
+            "natLe" => {
+                if args.len() != 3 {
+                    return Err(format!(
+                        "IMP relation '{}' expects 3 args, got {}",
+                        relation,
+                        args.len()
+                    ));
+                }
+                let lhs = nat_from_node(&expect_ground_arg(relation, 0, &args[0], env)?)
+                    .ok_or_else(|| "natLe arg 0 must be Nat".to_string())?;
+                let rhs = nat_from_node(&expect_ground_arg(relation, 1, &args[1], env)?)
+                    .ok_or_else(|| "natLe arg 1 must be Nat".to_string())?;
+                let Some(out) = nat_le(lhs.as_ref(), rhs.as_ref()) else {
+                    return Ok(Vec::new());
+                };
+                bind_relation_result(env, &args[2], bool_to_node(out.as_ref()))
+            },
+            "natEq" => {
+                if args.len() != 3 {
+                    return Err(format!(
+                        "IMP relation '{}' expects 3 args, got {}",
+                        relation,
+                        args.len()
+                    ));
+                }
+                let lhs = nat_from_node(&expect_ground_arg(relation, 0, &args[0], env)?)
+                    .ok_or_else(|| "natEq arg 0 must be Nat".to_string())?;
+                let rhs = nat_from_node(&expect_ground_arg(relation, 1, &args[1], env)?)
+                    .ok_or_else(|| "natEq arg 1 must be Nat".to_string())?;
+                let Some(out) = nat_eq(lhs.as_ref(), rhs.as_ref()) else {
+                    return Ok(Vec::new());
+                };
+                bind_relation_result(env, &args[2], bool_to_node(out.as_ref()))
+            },
+            _ => Err(format!(
+                "IMP generic rewrite executor does not yet support relation '{}'",
+                relation
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "mork-backend")]
+fn parse_imp_state_from_runtime_text(text: &str) -> Result<State, String> {
+    let lang = IMPLanguage;
+    let term = lang.parse_term(text)?;
+    let wrapped = term.as_any().downcast_ref::<IMPTerm>().ok_or_else(|| {
+        format!("IMP generic rewrite executor expected IMPTerm wrapper after parsing '{}'", text)
+    })?;
+    match &wrapped.0 {
+        IMPTermInner::State(state) => Ok(state.clone()),
+        _ => Err(format!("IMP generic rewrite executor parsed non-State term from '{}'", text)),
+    }
+}
+
+#[cfg(feature = "mork-backend")]
+fn imp_apply_rule(
+    rule_id: &str,
+    state: &State,
+    contract: &ImpRewriteContract,
+) -> Result<Vec<State>, String> {
+    let rule = contract
+        .rules_by_id
+        .get(rule_id)
+        .ok_or_else(|| format!("IMP rewrite contract missing structured rule '{}'", rule_id))?;
+    let rendered = execute_rule_to_runtime_strings(
+        &CPrefixConstructorCodec,
+        &format!("{}", state),
+        rule,
+        &ImpPremiseEvaluator,
+    )?;
+    rendered
+        .into_iter()
+        .map(|text| parse_imp_state_from_runtime_text(&text))
+        .collect()
 }
 
 #[cfg(feature = "mork-backend")]
@@ -898,31 +478,12 @@ fn imp_source_instr(state: &State) -> Option<&'static str> {
 
 #[cfg(feature = "mork-backend")]
 fn imp_native_step_state(state: &State) -> Result<Vec<(String, State)>, String> {
-    let Some(source_instr) = imp_source_instr(state) else {
-        return Ok(Vec::new());
-    };
     let contract = imp_rewrite_contract()?;
-    let ordered = contract.ordered_rules_for(source_instr).ok_or_else(|| {
-        format!("IMP transition artifact missing source instruction '{}'", source_instr)
-    })?;
-    dispatch_ordered_rules(
-        ordered,
-        |rule| {
-            let meta = contract.rule(rule).cloned().ok_or_else(|| {
-                format!(
-                    "IMP rewrite contract missing metadata for rule '{}' listed under source '{}'",
-                    rule, source_instr
-                )
-            })?;
-            if meta.source_instr != source_instr {
-                return Err(format!(
-                    "IMP rewrite contract mismatch: rule '{}' expected source '{}', got '{}'",
-                    rule, source_instr, meta.source_instr
-                ));
-            }
-            Ok(meta)
-        },
-        |_rule, meta| imp_apply_rule(meta, state),
+    dispatch_active_source_step(
+        "IMP",
+        &contract.transition,
+        Ok(imp_source_instr(state)),
+        |rule, _meta| imp_apply_rule(rule, state, contract),
     )
 }
 
@@ -931,12 +492,9 @@ fn run_imp_native_state_graph(
     term: &dyn Term,
     limits: MorkExecutionLimits,
 ) -> Result<AscentResults, String> {
-    let wrapped = term
-        .as_any()
-        .downcast_ref::<IMPTerm>()
-        .ok_or_else(|| {
-            "IMP MORK backend expects IMP parsed core term wrapper (IMPTerm)".to_string()
-        })?;
+    let wrapped = term.as_any().downcast_ref::<IMPTerm>().ok_or_else(|| {
+        "IMP MORK backend expects IMP parsed core term wrapper (IMPTerm)".to_string()
+    })?;
     let start_state = match &wrapped.0 {
         IMPTermInner::State(st) => st.clone(),
         _ => {
@@ -947,9 +505,7 @@ fn run_imp_native_state_graph(
         },
     };
 
-    let start_display = format!("{}", term);
-    let start_id = term.term_id();
-    run_transition_graph(start_state, &start_display, start_id, limits, |state| {
+    run_native_term_graph_with_timing(term, start_state, limits, |state| {
         imp_native_step_state(state)
     })
 }
@@ -964,10 +520,5 @@ pub fn run_imp_mork_backend_with_limits(
     term: &dyn Term,
     limits: MorkExecutionLimits,
 ) -> Result<AscentResults, String> {
-    let started = Instant::now();
-    let mut results = run_imp_native_state_graph(term, limits)?;
-    results
-        .phase_timings_ms
-        .insert("mork_native_state_ms".to_string(), started.elapsed().as_secs_f64() * 1000.0);
-    Ok(results)
+    run_imp_native_state_graph(term, limits)
 }

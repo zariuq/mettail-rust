@@ -1,14 +1,17 @@
 use crate::artifact_contract::load_json_with_checksum;
 pub use crate::artifact_contract::{
+    index_rewrite_ir_v2_rules_by_id,
     parse_rule_ids_from_generated_language, LookupArtifact, LookupContracts, LookupDemand,
-    LookupDemandArg, LookupFamily, RewriteIRArtifact, RewriteIRRule, TransitionArtifact,
-    TransitionRule, TransitionSemKey, TransitionSource,
+    LookupDemandArg, LookupFamily, RewriteIRArtifact, RewriteIRRule, RewriteIRV2Artifact,
+    RewriteIRV2Rule, TransitionArtifact, TransitionRule, TransitionSemKey, TransitionSource,
 };
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const METTAHE_TRANSITION_SCHEMA_VERSION: u64 = 2;
 pub const METTAHE_LOOKUP_SCHEMA_VERSION: u64 = 2;
-pub const METTAHE_REWRITE_IR_SCHEMA_VERSION: u64 = 1;
+pub const METTAHE_REWRITE_IR_SCHEMA_VERSION: u64 = 2;
+pub const METTAHE_REWRITE_IR_V2_DRAFT_SCHEMA_VERSION: u64 = 1;
 
 pub fn mettahe_generated_language_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/generated/mettahe_language_working.rs")
@@ -130,6 +133,44 @@ fn load_he_rewrite_ir_from_dir(dir: &Path) -> Result<RewriteIRArtifact, String> 
     Ok(artifact)
 }
 
+fn load_he_rewrite_ir_v2_draft_from_dir(dir: &Path) -> Result<RewriteIRV2Artifact, String> {
+    let json_path = dir.join("he.rewrite_ir_v2_draft.json");
+    let checksum_path = dir.join("he.rewrite_ir_v2_draft.checksum");
+    let artifact: RewriteIRV2Artifact =
+        load_json_with_checksum(&json_path, &checksum_path, "rewrite-ir-v2-draft")?;
+    if artifact.schema_version != METTAHE_REWRITE_IR_V2_DRAFT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported HE rewrite-ir-v2-draft schema_version {} (expected {})",
+            artifact.schema_version, METTAHE_REWRITE_IR_V2_DRAFT_SCHEMA_VERSION
+        ));
+    }
+    if !artifact.dialect.eq_ignore_ascii_case("he") {
+        return Err(format!(
+            "rewrite-ir-v2-draft artifact dialect mismatch: expected he, got {}",
+            artifact.dialect
+        ));
+    }
+    if artifact.artifact_label != "rewrite_ir_v2_draft_sidecar" {
+        return Err(format!(
+            "rewrite-ir-v2-draft artifact label mismatch: expected rewrite_ir_v2_draft_sidecar, got {}",
+            artifact.artifact_label
+        ));
+    }
+    if artifact.base_rewrite_ir_schema_version != METTAHE_REWRITE_IR_SCHEMA_VERSION {
+        return Err(format!(
+            "rewrite-ir-v2-draft base schema mismatch: expected {}, got {}",
+            METTAHE_REWRITE_IR_SCHEMA_VERSION, artifact.base_rewrite_ir_schema_version
+        ));
+    }
+    if artifact.rules.is_empty() {
+        return Err(format!(
+            "rewrite-ir-v2-draft artifact {} has empty rules",
+            json_path.display()
+        ));
+    }
+    Ok(artifact)
+}
+
 pub fn load_mettahe_transition_artifact() -> Result<TransitionArtifact, String> {
     let mut first_error: Option<String> = None;
     for dir in candidate_mettahe_transition_dirs() {
@@ -203,5 +244,37 @@ pub fn load_mettahe_rewrite_ir_artifact() -> Result<RewriteIRArtifact, String> {
         None => {
             Err("missing HE rewrite-ir artifact: expected he.rewrite_ir.json/checksum".to_string())
         },
+    }
+}
+
+pub fn load_optional_mettahe_rewrite_ir_v2_draft_artifact(
+) -> Result<Option<RewriteIRV2Artifact>, String> {
+    let mut first_error: Option<String> = None;
+    for dir in candidate_mettahe_transition_dirs() {
+        let json_path = dir.join("he.rewrite_ir_v2_draft.json");
+        let checksum_path = dir.join("he.rewrite_ir_v2_draft.checksum");
+        if !json_path.exists() || !checksum_path.exists() {
+            continue;
+        }
+        match load_he_rewrite_ir_v2_draft_from_dir(&dir) {
+            Ok(artifact) => return Ok(Some(artifact)),
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            },
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(None),
+    }
+}
+
+pub fn load_optional_mettahe_rewrite_ir_v2_draft_index(
+) -> Result<Option<BTreeMap<String, RewriteIRV2Rule>>, String> {
+    match load_optional_mettahe_rewrite_ir_v2_draft_artifact()? {
+        Some(artifact) => index_rewrite_ir_v2_rules_by_id(&artifact).map(Some),
+        None => Ok(None),
     }
 }

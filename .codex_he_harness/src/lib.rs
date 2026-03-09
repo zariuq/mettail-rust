@@ -17,6 +17,8 @@ pub mod artifact_contract;
 pub mod mettahe_artifacts;
 #[path = "../../languages/src/native_transition_contract.rs"]
 pub mod native_transition_contract;
+#[path = "../../languages/src/rewrite_template.rs"]
+pub mod rewrite_template;
 #[path = "../../languages/src/mork_backend.rs"]
 pub mod mork_backend;
 #[path = "../../languages/src/mettahe_from_lean.rs"]

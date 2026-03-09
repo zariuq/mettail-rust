@@ -4,12 +4,18 @@
 //! generated language helpers (equation/type lookup + memoized query results).
 
 use crate::{
-    metta_match, metta_query_index_key, metta_subst, HashEqCache, LookupFamilyIndex,
+    metta_expr_head, metta_match, metta_query_index_key, metta_subst, HashEqCache, LookupFamilyIndex,
     MettaFamilyListForm, PatternIndexKey,
 };
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
+
+/// Adapter trait for dialect-specific space containers that wrap one MeTTa-family
+/// atom list used as the indexed space payload.
+pub trait MettaFamilySpaceContainer<A> {
+    fn space_atoms(&self) -> Option<&A>;
+}
 
 /// Shared cache wrapper for space-derived indexes keyed by space atom payload.
 ///
@@ -60,6 +66,230 @@ where
         }
         guard.insert(atoms.clone(), Arc::clone(&built));
         built
+    }
+}
+
+impl<A> MettaFamilySpaceIndexCache<A, MettaFamilySpaceIndex<A>>
+where
+    A: MettaFamilyListForm,
+{
+    /// Create a reusable type-lookup service over the cached space index.
+    pub fn type_lookup_service_with<F>(&self, atoms: &A, build: F) -> MettaTypeLookupService<A>
+    where
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        MettaTypeLookupService {
+            index: self.get_or_build_with(atoms, build),
+        }
+    }
+
+    /// Create a reusable equation-query service over the cached space index.
+    pub fn eq_query_service_with<F>(&self, atoms: &A, build: F) -> MettaEqQueryService<A>
+    where
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        MettaEqQueryService {
+            index: self.get_or_build_with(atoms, build),
+        }
+    }
+
+    /// Query equation results through the shared space-index cache.
+    pub fn query_equation_results_with<F>(&self, atoms: &A, query: &A, build: F) -> Arc<Vec<A>>
+    where
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        self.eq_query_service_with(atoms, build).query_results(query)
+    }
+
+    /// Test equation existence through the shared space-index cache.
+    pub fn equation_has_match_with<F>(&self, atoms: &A, query: &A, build: F) -> bool
+    where
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        self.eq_query_service_with(atoms, build).has_match(query)
+    }
+
+    /// Create a reusable type-lookup service for one wrapped space value.
+    pub fn type_lookup_service_for_space<S, F>(
+        &self,
+        space: &S,
+        build: F,
+    ) -> Option<MettaTypeLookupService<A>>
+    where
+        S: MettaFamilySpaceContainer<A>,
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        Some(self.type_lookup_service_with(space.space_atoms()?, build))
+    }
+
+    /// Create a reusable equation-query service for one wrapped space value.
+    pub fn eq_query_service_for_space<S, F>(
+        &self,
+        space: &S,
+        build: F,
+    ) -> Option<MettaEqQueryService<A>>
+    where
+        S: MettaFamilySpaceContainer<A>,
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        Some(self.eq_query_service_with(space.space_atoms()?, build))
+    }
+
+    /// Find one exact type annotation inside a wrapped space value.
+    pub fn find_type_annotation_in_space<S, F>(
+        &self,
+        space: &S,
+        atom: &A,
+        build: F,
+    ) -> Option<A>
+    where
+        S: MettaFamilySpaceContainer<A>,
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        self.type_lookup_service_for_space(space, build)?
+            .find_type_annotation(atom)
+    }
+
+    /// Query one applicable function-type payload for the head of an expression
+    /// inside a wrapped space value.
+    pub fn first_applicable_func_type_for_expr_in_space<S, F>(
+        &self,
+        space: &S,
+        expr: &A,
+        build: F,
+    ) -> Option<A>
+    where
+        S: MettaFamilySpaceContainer<A>,
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        self.type_lookup_service_for_space(space, build)?
+            .first_applicable_func_type_for_expr(expr)
+    }
+
+    /// Query one explicit non-function type for the head of an expression inside
+    /// a wrapped space value.
+    pub fn first_non_func_type_for_expr_in_space<S, F>(
+        &self,
+        space: &S,
+        expr: &A,
+        build: F,
+    ) -> Option<A>
+    where
+        S: MettaFamilySpaceContainer<A>,
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        self.type_lookup_service_for_space(space, build)?
+            .first_non_func_type_for_expr(expr)
+    }
+
+    /// Return equation-query matches for one wrapped space value.
+    pub fn equation_matches_in_space<S, F>(
+        &self,
+        space: &S,
+        query: &A,
+        build: F,
+    ) -> MettaEqMatches<A>
+    where
+        S: MettaFamilySpaceContainer<A>,
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        match self.eq_query_service_for_space(space, build) {
+            Some(service) => service.matches(query),
+            None => MettaEqMatches::empty(query.clone()),
+        }
+    }
+
+    /// Return true iff one equation matches the query in a wrapped space value.
+    pub fn equation_has_match_in_space<S, F>(
+        &self,
+        space: &S,
+        query: &A,
+        build: F,
+    ) -> bool
+    where
+        S: MettaFamilySpaceContainer<A>,
+        F: FnOnce(&A) -> MettaFamilySpaceIndex<A>,
+    {
+        self.eq_query_service_for_space(space, build)
+            .is_some_and(|service| service.has_match(query))
+    }
+}
+
+/// Explicit equation-query lookup-family service over one cached space index.
+#[derive(Debug, Clone)]
+pub struct MettaEqQueryService<A>
+where
+    A: Clone + Eq + Hash,
+{
+    index: Arc<MettaFamilySpaceIndex<A>>,
+}
+
+impl<A> MettaEqQueryService<A>
+where
+    A: MettaFamilyListForm,
+{
+    /// Return equation-query results using exact and pattern paths.
+    pub fn query_results(&self, query: &A) -> Arc<Vec<A>> {
+        self.index.query_equation_results(query)
+    }
+
+    /// True iff at least one equation matches the query.
+    pub fn has_match(&self, query: &A) -> bool {
+        self.index.equation_has_match(query)
+    }
+
+    /// Return equation-query matches as a lazy iterator-backed stream.
+    pub fn matches(&self, query: &A) -> MettaEqMatches<A> {
+        self.index.equation_matches(query)
+    }
+}
+
+/// Explicit type-lookup service over one cached space index.
+#[derive(Debug, Clone)]
+pub struct MettaTypeLookupService<A>
+where
+    A: Clone + Eq + Hash,
+{
+    index: Arc<MettaFamilySpaceIndex<A>>,
+}
+
+impl<A> MettaTypeLookupService<A>
+where
+    A: Clone + Eq + Hash,
+{
+    /// Return the first exact type annotation for an atom, if present.
+    pub fn find_type_annotation(&self, atom: &A) -> Option<A> {
+        self.index
+            .type_lookup
+            .exact_values(atom)
+            .and_then(|tys| tys.first().cloned())
+    }
+
+    /// Return the first packed applicable function-type payload by operator.
+    pub fn first_applicable_func_type_by_op(&self, op: &A) -> Option<A> {
+        self.index.first_applicable_func_type_by_op.get(op).cloned()
+    }
+
+    /// Return the first explicitly non-function type by operator.
+    pub fn first_non_func_type_by_op(&self, op: &A) -> Option<A> {
+        self.index.first_non_func_type_by_op.get(op).cloned()
+    }
+}
+
+impl<A> MettaTypeLookupService<A>
+where
+    A: MettaFamilyListForm,
+{
+    /// Return the first packed applicable function-type payload for the head of one expression.
+    pub fn first_applicable_func_type_for_expr(&self, expr: &A) -> Option<A> {
+        let op = metta_expr_head(expr)?;
+        self.first_applicable_func_type_by_op(op)
+    }
+
+    /// Return the first explicitly non-function type for the head of one expression.
+    pub fn first_non_func_type_for_expr(&self, expr: &A) -> Option<A> {
+        let op = metta_expr_head(expr)?;
+        self.first_non_func_type_by_op(op)
     }
 }
 
@@ -274,6 +504,14 @@ impl<A> MettaFamilySpaceIndex<A>
 where
     A: MettaFamilyListForm,
 {
+    /// True iff at least one equation matches `atom`.
+    ///
+    /// This uses the lazy match iterator so existence checks do not need to
+    /// materialize the full result set on cache miss.
+    pub fn equation_has_match(&self, atom: &A) -> bool {
+        self.equation_matches(atom).into_iter().next().is_some()
+    }
+
     /// Return equation-query results for `atom` using exact and pattern paths.
     ///
     /// Results are memoized by query atom to avoid repeated match/subst work
@@ -356,7 +594,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MettaEqEntry, MettaFamilySpaceIndex, MettaFamilySpaceIndexCache, MettaTypeEntry};
+    use super::{
+        MettaEqEntry, MettaFamilySpaceContainer, MettaFamilySpaceIndex, MettaFamilySpaceIndexCache,
+        MettaTypeEntry,
+    };
     use crate::{MettaBinaryKind, MettaFamilyListForm, MettaFamilyPattern, PatternIndexKey};
 
     #[test]
@@ -415,6 +656,21 @@ mod tests {
         Cons(Box<T>, Box<T>),
         Eq(Box<T>, Box<T>),
         Nil,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SpaceT {
+        Space(T),
+        Other,
+    }
+
+    impl MettaFamilySpaceContainer<T> for SpaceT {
+        fn space_atoms(&self) -> Option<&T> {
+            match self {
+                SpaceT::Space(atoms) => Some(atoms),
+                SpaceT::Other => None,
+            }
+        }
     }
 
     impl MettaFamilyPattern for T {
@@ -519,5 +775,173 @@ mod tests {
         assert_eq!(miss_iter.next(), None);
         let miss_cached = index.query_equation_results(&T::Sym("absent"));
         assert!(miss_cached.is_empty());
+    }
+
+    #[test]
+    fn shared_cache_equation_query_helpers_reuse_index() {
+        let cache: MettaFamilySpaceIndexCache<T, MettaFamilySpaceIndex<T>> = Default::default();
+        let atoms = T::Sym("space");
+        let query = T::Sym("a");
+
+        let exact = cache.query_equation_results_with(&atoms, &query, |_| {
+            MettaFamilySpaceIndex::from_entries(
+                vec![MettaEqEntry {
+                    lhs: T::Sym("a"),
+                    rhs: T::Sym("hit"),
+                    has_pattern_var: false,
+                    pattern_key: PatternIndexKey::AtomConst(T::Sym("a")),
+                }],
+                Vec::new(),
+            )
+        });
+        assert_eq!(exact.as_ref(), &vec![T::Sym("hit")]);
+
+        let has_match = cache.equation_has_match_with(&atoms, &query, |_| {
+            panic!("cached index should be reused rather than rebuilt")
+        });
+        assert!(has_match);
+    }
+
+    #[test]
+    fn eq_query_service_exposes_results_and_match_checks() {
+        let cache: MettaFamilySpaceIndexCache<T, MettaFamilySpaceIndex<T>> = Default::default();
+        let atoms = T::Sym("space");
+        let query = T::Sym("a");
+
+        let service = cache.eq_query_service_with(&atoms, |_| {
+            MettaFamilySpaceIndex::from_entries(
+                vec![MettaEqEntry {
+                    lhs: T::Sym("a"),
+                    rhs: T::Sym("hit"),
+                    has_pattern_var: false,
+                    pattern_key: PatternIndexKey::AtomConst(T::Sym("a")),
+                }],
+                Vec::new(),
+            )
+        });
+        assert_eq!(service.query_results(&query).as_ref(), &vec![T::Sym("hit")]);
+        assert!(service.has_match(&query));
+        assert_eq!(
+            service.matches(&query).into_iter().collect::<Vec<_>>(),
+            vec![T::Sym("hit")]
+        );
+    }
+
+    #[test]
+    fn type_lookup_service_exposes_annotation_and_operator_queries() {
+        let cache: MettaFamilySpaceIndexCache<T, MettaFamilySpaceIndex<T>> = Default::default();
+        let atoms = T::Sym("space");
+
+        let service = cache.type_lookup_service_with(&atoms, |_| {
+            MettaFamilySpaceIndex::from_entries(
+                Vec::new(),
+                vec![
+                    MettaTypeEntry {
+                        atom: T::Sym("f"),
+                        ty: T::Sym("T1"),
+                        applicable_func_type: Some(T::Sym("pack")),
+                        non_func_type: false,
+                    },
+                    MettaTypeEntry {
+                        atom: T::Sym("f"),
+                        ty: T::Sym("T2"),
+                        applicable_func_type: None,
+                        non_func_type: true,
+                    },
+                ],
+            )
+        });
+
+        assert_eq!(service.find_type_annotation(&T::Sym("f")), Some(T::Sym("T1")));
+        assert_eq!(
+            service.first_applicable_func_type_by_op(&T::Sym("f")),
+            Some(T::Sym("pack"))
+        );
+        assert_eq!(
+            service.first_non_func_type_by_op(&T::Sym("f")),
+            Some(T::Sym("T2"))
+        );
+
+        let expr = T::Cons(
+            Box::new(T::Sym("f")),
+            Box::new(T::Cons(Box::new(T::Sym("x")), Box::new(T::Nil))),
+        );
+        assert_eq!(
+            service.first_applicable_func_type_for_expr(&expr),
+            Some(T::Sym("pack"))
+        );
+        assert_eq!(
+            service.first_non_func_type_for_expr(&expr),
+            Some(T::Sym("T2"))
+        );
+    }
+
+    #[test]
+    fn shared_cache_space_container_helpers_expose_lookup_services() {
+        let cache: MettaFamilySpaceIndexCache<T, MettaFamilySpaceIndex<T>> = Default::default();
+        let space = SpaceT::Space(T::Sym("space"));
+        let expr = T::Cons(
+            Box::new(T::Sym("f")),
+            Box::new(T::Cons(Box::new(T::Sym("x")), Box::new(T::Nil))),
+        );
+
+        fn build_space_index(_: &T) -> MettaFamilySpaceIndex<T> {
+            MettaFamilySpaceIndex::from_entries(
+                vec![MettaEqEntry {
+                    lhs: T::Sym("a"),
+                    rhs: T::Sym("hit"),
+                    has_pattern_var: false,
+                    pattern_key: PatternIndexKey::AtomConst(T::Sym("a")),
+                }],
+                vec![
+                    MettaTypeEntry {
+                        atom: T::Sym("f"),
+                        ty: T::Sym("T1"),
+                        applicable_func_type: Some(T::Sym("pack")),
+                        non_func_type: false,
+                    },
+                    MettaTypeEntry {
+                        atom: T::Sym("f"),
+                        ty: T::Sym("T2"),
+                        applicable_func_type: None,
+                        non_func_type: true,
+                    },
+                ],
+            )
+        }
+
+        assert_eq!(
+            cache.find_type_annotation_in_space(&space, &T::Sym("f"), build_space_index),
+            Some(T::Sym("T1"))
+        );
+        assert_eq!(
+            cache.first_applicable_func_type_for_expr_in_space(&space, &expr, |_| {
+                panic!("cached index should be reused rather than rebuilt")
+            }),
+            Some(T::Sym("pack"))
+        );
+        assert_eq!(
+            cache.first_non_func_type_for_expr_in_space(&space, &expr, |_| {
+                panic!("cached index should be reused rather than rebuilt")
+            }),
+            Some(T::Sym("T2"))
+        );
+        assert_eq!(
+            cache
+                .equation_matches_in_space(&space, &T::Sym("a"), |_| {
+                    panic!("cached index should be reused rather than rebuilt")
+                })
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![T::Sym("hit")]
+        );
+        assert!(cache.equation_has_match_in_space(&space, &T::Sym("a"), |_| {
+            panic!("cached index should be reused rather than rebuilt")
+        }));
+        assert!(cache
+            .equation_matches_in_space(&SpaceT::Other, &T::Sym("a"), |_| unreachable!())
+            .into_iter()
+            .next()
+            .is_none());
     }
 }

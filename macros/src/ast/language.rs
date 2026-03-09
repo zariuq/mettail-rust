@@ -1110,20 +1110,25 @@ fn parse_logic(input: ParseStream) -> SynResult<LogicBlock> {
     // Capture the entire content as a TokenStream (passed through verbatim to Ascent)
     let tokens: TokenStream = content.parse()?;
 
-    // Parse as an Ascent program to extract relation declarations with proper type handling
-    let program = ascent_syntax_export::parse_ascent_program_tokens(tokens.clone())?;
-    let relations = program
-        .relations
-        .into_iter()
-        .map(|rel| {
-            let param_types = rel
-                .field_types
-                .iter()
-                .map(|ty| quote::quote!(#ty).to_string())
-                .collect();
-            RelationDecl { name: rel.name, param_types }
-        })
-        .collect();
+    // Extract relation declarations from the Ascent program (only when ascent-codegen is on)
+    #[cfg(feature = "ascent-codegen")]
+    let relations = {
+        let program = ascent_syntax_export::parse_ascent_program_tokens(tokens.clone())?;
+        program
+            .relations
+            .into_iter()
+            .map(|rel| {
+                let param_types = rel
+                    .field_types
+                    .iter()
+                    .map(|ty| quote::quote!(#ty).to_string())
+                    .collect();
+                RelationDecl { name: rel.name, param_types }
+            })
+            .collect()
+    };
+    #[cfg(not(feature = "ascent-codegen"))]
+    let relations: Vec<RelationDecl> = Vec::new();
 
     // Optional comma after closing brace
     if input.peek(Token![,]) {

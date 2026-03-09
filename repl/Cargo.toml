@@ -9,17 +9,41 @@ path = "src/main.rs"
 doc = false  # Same binary as root package; document only from workspace root to avoid path collision
 
 [features]
-wfst = ["mettail-languages/wfst", "mettail-macros/wfst"]
-wfst-log = ["mettail-languages/wfst-log", "mettail-macros/wfst-log"]
+default = [
+    "lang-ambient",
+    "lang-calculator",
+    "lang-imp",
+    "lang-lambda",
+    "lang-mettafull-legacy",
+    "lang-he",
+    "lang-minskylite",
+    "lang-mm0lite",
+    "lang-pyashcore",
+    "lang-petta",
+    "lang-rhocalc",
+]
+query-support = ["dep:mettail-query"]
+wfst = ["mettail-languages/wfst"]
+wfst-log = ["mettail-languages/wfst-log"]
 mork-backend = ["mettail-languages/mork-backend"]
+lang-ambient = ["mettail-languages/lang-ambient"]
+lang-calculator = ["mettail-languages/lang-calculator"]
+lang-imp = ["mettail-languages/lang-imp"]
+lang-lambda = ["mettail-languages/lang-lambda"]
+lang-mettafull-legacy = ["mettail-languages/lang-mettafull-legacy"]
+lang-he = ["mettail-languages/lang-he"]
+lang-minskylite = ["mettail-languages/lang-minskylite"]
+lang-mm0lite = ["mettail-languages/lang-mm0lite"]
+lang-pyashcore = ["mettail-languages/lang-pyashcore"]
+lang-petta = ["mettail-languages/lang-petta"]
+lang-rhocalc = ["mettail-languages/lang-rhocalc"]
 python-oracle = []
 
 [dependencies]
 # Core MeTTaIL
 mettail-runtime = { path = "../runtime" }
-mettail-languages = { path = "../languages" }
-mettail-macros = { path = "../macros" }
-mettail-query = { path = "../query" }
+mettail-languages = { path = "../languages", default-features = false }
+mettail-query = { path = "../query", optional = true }
 
 moniker = {workspace = true}
 
@@ -36,11 +60,6 @@ serde_json = "1.0"
 tree-sitter = "0.25"
 
 rand = { workspace = true }
-
-# Ascent
-ascent = { workspace = true }
-ascent-byods-rels = { workspace = true }
-
 
 [dev-dependencies]
 

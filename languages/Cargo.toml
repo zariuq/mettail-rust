@@ -3,26 +3,51 @@ name = "mettail-languages"
 version = "0.1.0"
 edition = "2021"
 
-# Library only - no binaries
-# Examples are in workspace examples/ directory
-# Tests use separate test binaries
+[[bin]]
+name = "mettail-direct"
+path = "src/bin/mettail-direct.rs"
 
 [features]
+default = [
+    "lang-ambient",
+    "lang-calculator",
+    "lang-imp",
+    "lang-lambda",
+    "lang-mettafull-legacy",
+    "lang-he",
+    "lang-minskylite",
+    "lang-mm0lite",
+    "lang-pyashcore",
+    "lang-petta",
+    "lang-rhocalc",
+]
 ## Propagate WFST features through macros to mettail-prattail.
-wfst = ["mettail-macros/wfst"]
-wfst-log = ["mettail-macros/wfst-log"]
+wfst = ["mettail-macros?/wfst"]
+wfst-log = ["mettail-macros?/wfst-log"]
 ## Enable MORK backend spike tests (requires nightly, already satisfied by rust-toolchain.toml)
 mork-backend = ["dep:mork"]
+ascent-support = ["dep:mettail-macros", "mettail-macros/ascent-codegen", "dep:ascent", "dep:ascent-byods-rels"]
+lang-ambient = ["ascent-support"]
+lang-calculator = ["ascent-support"]
+lang-imp = ["dep:mettail-macros"]
+lang-lambda = ["ascent-support"]
+lang-mettafull-legacy = ["ascent-support"]
+lang-he = ["dep:mettail-macros"]
+lang-minskylite = ["ascent-support"]
+lang-mm0lite = ["ascent-support"]
+lang-pyashcore = ["ascent-support"]
+lang-petta = []
+lang-rhocalc = ["ascent-support"]
 
 [dependencies]
-mettail-macros = { path = "../macros" }
+mettail-macros = { path = "../macros", optional = true }
 mettail-runtime = { path = "../runtime" }
 moniker = { workspace = true }
 rand = { workspace = true }
 indexmap = { workspace = true }
 
-ascent = { workspace = true }
-ascent-byods-rels = { workspace = true }
+ascent = { workspace = true, optional = true }
+ascent-byods-rels = { workspace = true, optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

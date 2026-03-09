@@ -48,6 +48,8 @@ language! {
         C_KTupleCons . head:Atom, kont:Atom |- "C_KTupleCons" "(" head "," kont ")" : Atom;
         C_KArgTail . origHead:Atom, rest:Atom, types:Atom, kont:Atom |- "C_KArgTail" "(" origHead "," rest "," types "," kont ")" : Atom;
         C_KArgCons . head:Atom, kont:Atom |- "C_KArgCons" "(" head "," kont ")" : Atom;
+        C_KSwitch . rawCases:Atom, ty:Atom, kont:Atom |- "C_KSwitch" "(" rawCases "," ty "," kont ")" : Atom;
+        C_KAssert . asserted:Atom, kont:Atom |- "C_KAssert" "(" asserted "," kont ")" : Atom;
         C_OpAdd . |- "C_OpAdd" : Atom;
         C_OpSub . |- "C_OpSub" : Atom;
         C_OpMul . |- "C_OpMul" : Atom;
@@ -71,42 +73,57 @@ language! {
         R4 . | needsInterpExpr(atom, ty) |- (C_State (C_Metta atom ty) space out) ~> (C_State (C_InterpExpr atom ty) space out);
         R5 . | applicableFuncType(space, atom, ty, opType, retType) |- (C_State (C_InterpExpr atom ty) space out) ~> (C_State (C_InterpFunc atom opType retType) space out);
         R6 . | needsTupleInterp(space, atom, ty) |- (C_State (C_InterpExpr atom ty) space out) ~> (C_State (C_InterpTuple atom) space out);
-        R7 . | notExpression(atom) |- (C_State (C_InterpExpr atom ty) space out) ~> (C_State (C_Return atom) space out);
-        R8 . |- (C_State (C_InterpFunc (C_ExprCons op argsTail) opType retType) space out) ~> (C_State (C_Metta op opType) space (C_KAfterOp argsTail opType retType out));
-        R9 . |- (C_State (C_InterpFunc C_ExprNil opType retType) space out) ~> (C_State (C_Return C_ExprNil) space out);
-        R10 . | notExpression(atom) |- (C_State (C_InterpFunc atom opType retType) space out) ~> (C_State (C_Return atom) space out);
-        R11 . | isEmpty(h) |- (C_State (C_Return h) space (C_KAfterOp argsTail opType retType k)) ~> (C_State (C_Return h) space k);
-        R12 . | isError(h) |- (C_State (C_Return h) space (C_KAfterOp argsTail opType retType k)) ~> (C_State (C_Return h) space k);
-        R13 . | metaType(h, mt) |- (C_State (C_Return h) space (C_KAfterOp C_ExprNil opType retType k)) ~> (C_State (C_MettaCall (C_ExprCons h C_ExprNil) retType) space k);
-        R14 . | metaType(h, mt), funcArgTypes(opType, argTypes) |- (C_State (C_Return h) space (C_KAfterOp (C_ExprCons argHead argRest) opType retType k)) ~> (C_State (C_InterpArgs argHead argRest argTypes) space (C_KAfterArgs h retType k));
-        R15 . | isEmpty(argsEval) |- (C_State (C_Return argsEval) space (C_KAfterArgs h retType k)) ~> (C_State (C_Return argsEval) space k);
-        R16 . | isError(argsEval) |- (C_State (C_Return argsEval) space (C_KAfterArgs h retType k)) ~> (C_State (C_Return argsEval) space k);
-        R17 . | metaType(argsEval, mt) |- (C_State (C_Return argsEval) space (C_KAfterArgs h retType k)) ~> (C_State (C_MettaCall (C_ExprCons h argsEval) retType) space k);
-        R18 . |- (C_State (C_InterpArgs head rest (C_ExprCons ty typeRest)) space out) ~> (C_State (C_Metta head ty) space (C_KArgTail head rest typeRest out));
-        R19 . |- (C_State (C_InterpArgs head rest C_ExprNil) space out) ~> (C_State (C_Metta head C_UndefinedType) space (C_KArgTail head rest C_ExprNil out));
-        R20 . | changedToEmpty(origHead, h) |- (C_State (C_Return h) space (C_KArgTail origHead rest types k)) ~> (C_State (C_Return h) space k);
-        R21 . | changedToError(origHead, h) |- (C_State (C_Return h) space (C_KArgTail origHead rest types k)) ~> (C_State (C_Return h) space k);
-        R22 . | metaType(h, mt) |- (C_State (C_Return h) space (C_KArgTail origHead C_ExprNil types k)) ~> (C_State (C_Return (C_ExprCons h C_ExprNil)) space k);
-        R23 . | metaType(h, mt) |- (C_State (C_Return h) space (C_KArgTail origHead (C_ExprCons nextArg nextRest) types k)) ~> (C_State (C_InterpArgs nextArg nextRest types) space (C_KArgCons h k));
-        R24 . | isEmpty(t) |- (C_State (C_Return t) space (C_KArgCons h k)) ~> (C_State (C_Return t) space k);
-        R25 . | isError(t) |- (C_State (C_Return t) space (C_KArgCons h k)) ~> (C_State (C_Return t) space k);
-        R26 . | metaType(t, mt) |- (C_State (C_Return t) space (C_KArgCons h k)) ~> (C_State (C_Return (C_ExprCons h t)) space k);
-        R27 . |- (C_State (C_InterpTuple C_ExprNil) space out) ~> (C_State (C_Return C_ExprNil) space out);
-        R28 . |- (C_State (C_InterpTuple (C_ExprCons head tail)) space out) ~> (C_State (C_Metta head C_UndefinedType) space (C_KTupleTail tail out));
-        R29 . | isEmpty(h) |- (C_State (C_Return h) space (C_KTupleTail tail k)) ~> (C_State (C_Return h) space k);
-        R30 . | isError(h) |- (C_State (C_Return h) space (C_KTupleTail tail k)) ~> (C_State (C_Return h) space k);
-        R31 . | metaType(h, mt) |- (C_State (C_Return h) space (C_KTupleTail C_ExprNil k)) ~> (C_State (C_Return (C_ExprCons h C_ExprNil)) space k);
-        R32 . | metaType(h, mt) |- (C_State (C_Return h) space (C_KTupleTail (C_ExprCons tHead tTail) k)) ~> (C_State (C_InterpTuple (C_ExprCons tHead tTail)) space (C_KTupleCons h k));
-        R33 . | isEmpty(t) |- (C_State (C_Return t) space (C_KTupleCons h k)) ~> (C_State (C_Return t) space k);
-        R34 . | isError(t) |- (C_State (C_Return t) space (C_KTupleCons h k)) ~> (C_State (C_Return t) space k);
-        R35 . | metaType(t, mt) |- (C_State (C_Return t) space (C_KTupleCons h k)) ~> (C_State (C_Return (C_ExprCons h t)) space k);
-        R36 . | isError(atom) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Return atom) space out);
-        R37 . | groundedCallResult(space, atom, result) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta result ty) space out);
-        R38 . | eqQueryResult(space, atom, rhs), notExecutable(atom) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta rhs ty) space out);
-        R39 . | noEqQuery(space, atom), notExecutable(atom) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Return atom) space out);
-        R40 . | typeOf(space, atom, ty) |- (C_State (C_TypeCast atom ty) space out) ~> (C_State (C_Return atom) space out);
-        R41 . | typeMismatch(space, atom, ty, actual) |- (C_State (C_TypeCast atom ty) space out) ~> (C_State (C_Return (C_ErrorAtom atom (C_BadType ty actual))) space out);
-        R42 . | isEmpty(out) |- (C_State (C_Return result) space out) ~> (C_State C_Done space result);
+        R7 . | noTypeAtAll(space, atom) |- (C_State (C_InterpExpr atom ty) space out) ~> (C_State (C_MettaCall atom ty) space out);
+        R8 . | notExpression(atom) |- (C_State (C_InterpExpr atom ty) space out) ~> (C_State (C_Return atom) space out);
+        R9 . |- (C_State (C_InterpFunc (C_ExprCons op argsTail) opType retType) space out) ~> (C_State (C_Metta op opType) space (C_KAfterOp argsTail opType retType out));
+        R10 . |- (C_State (C_InterpFunc C_ExprNil opType retType) space out) ~> (C_State (C_Return C_ExprNil) space out);
+        R11 . | notExpression(atom) |- (C_State (C_InterpFunc atom opType retType) space out) ~> (C_State (C_Return atom) space out);
+        R12 . | isEmpty(h) |- (C_State (C_Return h) space (C_KAfterOp argsTail opType retType k)) ~> (C_State (C_Return h) space k);
+        R13 . | isError(h) |- (C_State (C_Return h) space (C_KAfterOp argsTail opType retType k)) ~> (C_State (C_Return h) space k);
+        R14 . | metaType(h, mt) |- (C_State (C_Return h) space (C_KAfterOp C_ExprNil opType retType k)) ~> (C_State (C_MettaCall (C_ExprCons h C_ExprNil) retType) space k);
+        R15 . | metaType(h, mt), funcArgTypes(opType, argTypes) |- (C_State (C_Return h) space (C_KAfterOp (C_ExprCons argHead argRest) opType retType k)) ~> (C_State (C_InterpArgs argHead argRest argTypes) space (C_KAfterArgs h retType k));
+        R16 . | isEmpty(argsEval) |- (C_State (C_Return argsEval) space (C_KAfterArgs h retType k)) ~> (C_State (C_Return argsEval) space k);
+        R17 . | isError(argsEval) |- (C_State (C_Return argsEval) space (C_KAfterArgs h retType k)) ~> (C_State (C_Return argsEval) space k);
+        R18 . | metaType(argsEval, mt) |- (C_State (C_Return argsEval) space (C_KAfterArgs h retType k)) ~> (C_State (C_MettaCall (C_ExprCons h argsEval) retType) space k);
+        R19 . |- (C_State (C_InterpArgs head rest (C_ExprCons ty typeRest)) space out) ~> (C_State (C_Metta head ty) space (C_KArgTail head rest typeRest out));
+        R20 . |- (C_State (C_InterpArgs head rest C_ExprNil) space out) ~> (C_State (C_Metta head C_UndefinedType) space (C_KArgTail head rest C_ExprNil out));
+        R21 . | changedToEmpty(origHead, h) |- (C_State (C_Return h) space (C_KArgTail origHead rest types k)) ~> (C_State (C_Return h) space k);
+        R22 . | changedToError(origHead, h) |- (C_State (C_Return h) space (C_KArgTail origHead rest types k)) ~> (C_State (C_Return h) space k);
+        R23 . | metaType(h, mt) |- (C_State (C_Return h) space (C_KArgTail origHead C_ExprNil types k)) ~> (C_State (C_Return (C_ExprCons h C_ExprNil)) space k);
+        R24 . | metaType(h, mt) |- (C_State (C_Return h) space (C_KArgTail origHead (C_ExprCons nextArg nextRest) types k)) ~> (C_State (C_InterpArgs nextArg nextRest types) space (C_KArgCons h k));
+        R25 . | isEmpty(t) |- (C_State (C_Return t) space (C_KArgCons h k)) ~> (C_State (C_Return t) space k);
+        R26 . | isError(t) |- (C_State (C_Return t) space (C_KArgCons h k)) ~> (C_State (C_Return t) space k);
+        R27 . | metaType(t, mt) |- (C_State (C_Return t) space (C_KArgCons h k)) ~> (C_State (C_Return (C_ExprCons h t)) space k);
+        R28 . |- (C_State (C_InterpTuple C_ExprNil) space out) ~> (C_State (C_Return C_ExprNil) space out);
+        R29 . |- (C_State (C_InterpTuple (C_ExprCons head tail)) space out) ~> (C_State (C_Metta head C_UndefinedType) space (C_KTupleTail tail out));
+        R30 . | isEmpty(h) |- (C_State (C_Return h) space (C_KTupleTail tail k)) ~> (C_State (C_Return h) space k);
+        R31 . | isError(h) |- (C_State (C_Return h) space (C_KTupleTail tail k)) ~> (C_State (C_Return h) space k);
+        R32 . | metaType(h, mt) |- (C_State (C_Return h) space (C_KTupleTail C_ExprNil k)) ~> (C_State (C_Return (C_ExprCons h C_ExprNil)) space k);
+        R33 . | metaType(h, mt) |- (C_State (C_Return h) space (C_KTupleTail (C_ExprCons tHead tTail) k)) ~> (C_State (C_InterpTuple (C_ExprCons tHead tTail)) space (C_KTupleCons h k));
+        R34 . | isEmpty(t) |- (C_State (C_Return t) space (C_KTupleCons h k)) ~> (C_State (C_Return t) space k);
+        R35 . | isError(t) |- (C_State (C_Return t) space (C_KTupleCons h k)) ~> (C_State (C_Return t) space k);
+        R36 . | metaType(t, mt) |- (C_State (C_Return t) space (C_KTupleCons h k)) ~> (C_State (C_Return (C_ExprCons h t)) space k);
+        R37 . | isError(atom) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Return atom) space out);
+        R38 . | groundedCallResult(space, atom, result) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta result ty) space out);
+        R39 . | notExecutable(atom), parseSwitchMinimalCall(atom, scrutinee, rawCases) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta scrutinee C_UndefinedType) space (C_KSwitch rawCases ty out));
+        R40 . | selectSwitchResult(scrutineeVal, rawCases, template), isReducible(template) |- (C_State (C_Return scrutineeVal) space (C_KSwitch rawCases ty k)) ~> (C_State (C_Metta template ty) space k);
+        R41 . | selectSwitchResult(scrutineeVal, rawCases, template), isNotReducible(template) |- (C_State (C_Return scrutineeVal) space (C_KSwitch rawCases ty k)) ~> (C_State (C_Return C_Empty) space k);
+        R42 . | notExecutable(atom), parseAssertCall(atom, asserted) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta asserted C_UndefinedType) space (C_KAssert asserted out));
+        R43 . | assertMatchesTrue(assertedVal) |- (C_State (C_Return assertedVal) space (C_KAssert asserted k)) ~> (C_State (C_Return C_ExprNil) space k);
+        R44 . | assertNotTrue(assertedVal), mkAssertError(asserted, assertedVal, errAtom) |- (C_State (C_Return assertedVal) space (C_KAssert asserted k)) ~> (C_State (C_Return errAtom) space k);
+        R45 . | notExecutable(atom), parseCaseCall(atom, scrutinee, rawCases) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta scrutinee C_UndefinedType) space (C_KSwitch rawCases ty out));
+        R46 . | notExecutable(atom), parseSuperpose(atom, elem) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta elem ty) space out);
+        R47 . | notExecutable(atom), isSuperpose_empty(atom) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Return C_Empty) space out);
+        R48 . | notExecutable(atom), parseMatchCall(atom, pattern, template), spaceQueryMatch(pattern, template, result) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta result ty) space out);
+        R49 . | notExecutable(atom), parseMatchCall(atom, pattern, template), spaceQueryNoMatch(pattern) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Return C_Empty) space out);
+        R50 . | notExecutable(atom), parseUnifyCall(atom, target, pattern, success, failure), localMatch(target, pattern, success, result) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta result ty) space out);
+        R51 . | notExecutable(atom), parseUnifyCall(atom, target, pattern, success, failure), localNoMatch(target, pattern) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta failure ty) space out);
+        R52 . | notExecutable(atom), parseCollapseCall(atom, expr), collapseBind(expr, ty, packed) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Return packed) space out);
+        R53 . | eqQueryResult(space, atom, rhs), notExecutable(atom) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Metta rhs ty) space out);
+        R54 . | noEqQuery(space, atom), notExecutable(atom) |- (C_State (C_MettaCall atom ty) space out) ~> (C_State (C_Return atom) space out);
+        R55 . | typeOf(space, atom, ty) |- (C_State (C_TypeCast atom ty) space out) ~> (C_State (C_Return atom) space out);
+        R56 . | typeMismatch(space, atom, ty, actual) |- (C_State (C_TypeCast atom ty) space out) ~> (C_State (C_Return (C_ErrorAtom atom (C_BadType ty actual))) space out);
+        R57 . | isEmpty(out) |- (C_State (C_Return result) space out) ~> (C_State C_Done space result);
     },
 
     logic {
@@ -228,14 +245,34 @@ language! {
         relation needsInterpExprQuery2(Space, Atom);
         relation applicableFuncTypeQuery3(Space, Atom, Atom);
         relation needsTupleInterpQuery3(Space, Atom, Atom);
+        relation noTypeAtAllQuery2(Space, Atom);
         relation notExpressionQuery1(Space);
         relation metaTypeQuery2(Space, Atom);
         relation funcArgTypesQuery2(Space, Atom);
         relation changedToEmptyQuery2(Space, Atom);
         relation changedToErrorQuery2(Space, Atom);
         relation groundedCallResultQuery3(Space, Atom, Atom);
-        relation eqQueryResultQuery3(Space, Atom, Atom);
         relation notExecutableQuery1(Space);
+        relation parseSwitchMinimalCallQuery3(Space, Atom, Atom);
+        relation selectSwitchResultQuery2(Space, Atom);
+        relation isReducibleQuery1(Space);
+        relation isNotReducibleQuery1(Space);
+        relation parseAssertCallQuery2(Space, Atom);
+        relation assertMatchesTrueQuery1(Space);
+        relation assertNotTrueQuery1(Space);
+        relation mkAssertErrorQuery2(Space, Atom);
+        relation parseCaseCallQuery3(Space, Atom, Atom);
+        relation parseSuperposeQuery2(Space, Atom);
+        relation isSuperpose_emptyQuery1(Space);
+        relation parseMatchCallQuery3(Space, Atom, Atom);
+        relation spaceQueryMatchQuery3(Space, Atom, Atom);
+        relation spaceQueryNoMatchQuery1(Space);
+        relation parseUnifyCallQuery3(Space, Atom, Atom);
+        relation localMatchQuery3(Space, Atom, Atom);
+        relation localNoMatchQuery2(Space, Atom);
+        relation parseCollapseCallQuery2(Space, Atom);
+        relation collapseBindQuery3(Space, Atom, Atom);
+        relation eqQueryResultQuery3(Space, Atom, Atom);
         relation noEqQueryQuery2(Space, Atom);
         relation typeOfQuery3(Space, Atom, Atom);
         relation typeMismatchQuery3(Space, Atom, Atom);
@@ -289,6 +326,14 @@ language! {
             let arg1 = (**arg10).clone();
 
         needsTupleInterpQuery3(sp, arg0, arg1) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_InterpExpr(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        noTypeAtAllQuery2(sp, arg0) <--
             state(st),
             if let State::C_State(ref instr, ref sp0, _) = st,
             if let Instr::C_InterpExpr(ref arg00, ref arg10) = &**instr,
@@ -483,6 +528,255 @@ language! {
             let arg0 = (**arg00).clone(),
             let arg1 = (**arg10).clone();
 
+        notExecutableQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        parseSwitchMinimalCallQuery3(sp, arg0, arg1) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        selectSwitchResultQuery2(sp, arg0) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_Return(ref arg00) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone();
+
+        isReducibleQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_Return(ref arg00) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone();
+
+        selectSwitchResultQuery2(sp, arg0) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_Return(ref arg00) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone();
+
+        isNotReducibleQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_Return(ref arg00) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone();
+
+        notExecutableQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        parseAssertCallQuery2(sp, arg0) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        assertMatchesTrueQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_Return(ref arg00) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone();
+
+        assertNotTrueQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_Return(ref arg00) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone();
+
+        mkAssertErrorQuery2(sp, arg0) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_Return(ref arg00) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone();
+
+        notExecutableQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        parseCaseCallQuery3(sp, arg0, arg1) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        notExecutableQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        parseSuperposeQuery2(sp, arg0) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        notExecutableQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        isSuperpose_emptyQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        notExecutableQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        parseMatchCallQuery3(sp, arg0, arg1) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        spaceQueryMatchQuery3(sp, arg0, arg1) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        notExecutableQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        parseMatchCallQuery3(sp, arg0, arg1) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        spaceQueryNoMatchQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        notExecutableQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        parseUnifyCallQuery3(sp, arg0, arg1) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        localMatchQuery3(sp, arg0, arg1) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        notExecutableQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        parseUnifyCallQuery3(sp, arg0, arg1) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        localNoMatchQuery2(sp, arg0) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        notExecutableQuery1(sp) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        parseCollapseCallQuery2(sp, arg0) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
+        collapseBindQuery3(sp, arg0, arg1) <--
+            state(st),
+            if let State::C_State(ref instr, ref sp0, _) = st,
+            if let Instr::C_MettaCall(ref arg00, ref arg10) = &**instr,
+            let sp = (**sp0).clone(),
+            let arg0 = (**arg00).clone(),
+            let arg1 = (**arg10).clone();
+
         eqQueryResultQuery3(sp, arg0, arg1) <--
             state(st),
             if let State::C_State(ref instr, ref sp0, _) = st,
@@ -549,6 +843,7 @@ language! {
         relation notExpression(Atom);
         relation isExecutable(Atom);
         relation notExecutable(Atom);
+        relation typeOfRaw(Space, Atom, Atom);
         relation typeOf(Space, Atom, Atom);
         relation typeMismatch(Space, Atom, Atom, Atom);
         relation funcArgTypes(Atom, Atom);
@@ -563,6 +858,26 @@ language! {
         relation applicableFuncType(Space, Atom, Atom, Atom, Atom);
         relation applicableFuncTypeHas(Space, Atom, Atom);
         relation needsTupleInterp(Space, Atom, Atom);
+        relation noTypeAtAll(Space, Atom);
+        relation parseSwitchMinimalCall(Atom, Atom, Atom);
+        relation parseCaseCall(Atom, Atom, Atom);
+        relation parseAssertCall(Atom, Atom);
+        relation selectSwitchResult(Atom, Atom, Atom);
+        relation isNotReducible(Atom);
+        relation isReducible(Atom);
+        relation assertMatchesTrue(Atom);
+        relation assertNotTrue(Atom);
+        relation mkAssertError(Atom, Atom, Atom);
+        relation parseSuperpose(Atom, Atom);
+        relation isSuperpose_empty(Atom);
+        relation parseMatchCall(Atom, Atom, Atom);
+        relation spaceQueryMatch(Atom, Atom, Atom);
+        relation spaceQueryNoMatch(Atom);
+        relation parseUnifyCall(Atom, Atom, Atom, Atom, Atom);
+        relation localMatch(Atom, Atom, Atom, Atom);
+        relation localNoMatch(Atom, Atom);
+        relation parseCollapseCall(Atom, Atom);
+        relation collapseBind(Atom, Atom, Atom);
 
         // ═══ Premise rules (generated from PremiseProgram IR) ═══
         // isEmpty_check
@@ -721,13 +1036,17 @@ language! {
             atom(op),
             if let Some(_) = is_not_executable_grounded(op);
 
-        // typeOf_annotation
-        typeOf(sp, atom, ty) <--
+        // typeOfRaw_annotation
+        typeOfRaw(sp, atom, ty) <--
             space(sp),
             atom(atom),
             if let Space::C_Space(ref atoms0) = sp,
             let atoms = (**atoms0).clone(),
             if let Some(ty) = find_type_annotation(atoms, atom);
+
+        // typeOf_from_raw
+        typeOf(sp, atom, ty) <--
+            typeOfRaw(sp, atom, ty);
 
         // typeMismatch_check
         typeMismatch(sp, atom, expected, actual) <--
@@ -795,5 +1114,131 @@ language! {
             atom(atom),
             if let Some(ty) = has_non_func_types(sp, atom),
             if find_applicable_func_type(sp, atom, &ty).is_none();
+
+        // noTypeAtAll_missing_head_type
+        noTypeAtAll(sp, atom) <--
+            space(sp),
+            atom(atom),
+            if let Some(_) = check_no_type_at_all(sp, atom);
+
+        // parseSwitchMinimalCall_check
+        parseSwitchMinimalCall(atom, scrutinee, rawCases) <--
+            atom(atom),
+            if let Some(packed) = parseSwitchMinimalCallArgs(atom),
+            if let Atom::C_ExprCons(ref scrutinee0, ref rawCases0) = packed,
+            let scrutinee = (**scrutinee0).clone(),
+            let rawCases = (**rawCases0).clone();
+
+        // parseCaseCall_check
+        parseCaseCall(atom, scrutinee, rawCases) <--
+            atom(atom),
+            if let Some(packed) = parseCaseCallArgs(atom),
+            if let Atom::C_ExprCons(ref scrutinee0, ref rawCases0) = packed,
+            let scrutinee = (**scrutinee0).clone(),
+            let rawCases = (**rawCases0).clone();
+
+        // parseAssertCall_check
+        parseAssertCall(atom, asserted) <--
+            atom(atom),
+            if let Some(asserted) = parseAssertCallArg(atom);
+
+        // selectSwitchResult_match
+        selectSwitchResult(scrutinee, rawCases, template) <--
+            atom(scrutinee),
+            atom(rawCases),
+            for template in selectSwitchTemplate(scrutinee, rawCases).into_iter();
+
+        // isNotReducible_check
+        isNotReducible(atom) <--
+            atom(atom),
+            if let Some(_) = checkIsNotReducible(atom);
+
+        // isReducible_check
+        isReducible(atom) <--
+            atom(atom),
+            if let Some(_) = checkIsReducible(atom);
+
+        // assertMatchesTrue_check
+        assertMatchesTrue(atom) <--
+            atom(atom),
+            if atom == Atom::C_True;
+
+        // assertNotTrue_check
+        assertNotTrue(atom) <--
+            atom(atom),
+            if atom != Atom::C_True;
+
+        // mkAssertError_build
+        mkAssertError(asserted, assertedVal, errAtom) <--
+            atom(asserted),
+            atom(assertedVal),
+            if let Some(errAtom) = buildAssertError(asserted, assertedVal);
+
+        // parseSuperpose_elements
+        parseSuperpose(atom, elem) <--
+            atom(atom),
+            for elem in parseSuperposElements(atom).into_iter();
+
+        // isSuperpose_empty_check
+        isSuperpose_empty(atom) <--
+            atom(atom),
+            if let Some(_) = checkSuperposeEmpty(atom);
+
+        // parseMatchCall_check
+        parseMatchCall(atom, pattern, template) <--
+            atom(atom),
+            if let Some(packed) = parseMatchCallArgs(atom),
+            if let Atom::C_ExprCons(ref pattern0, ref template0) = packed,
+            let pattern = (**pattern0).clone(),
+            let template = (**template0).clone();
+
+        // spaceQueryMatch_query
+        spaceQueryMatch(pattern, template, result) <--
+            atom(pattern),
+            atom(template),
+            for result in spacePatternQuery(pattern, template).into_iter();
+
+        // spaceQueryNoMatch_check
+        spaceQueryNoMatch(pattern) <--
+            atom(pattern),
+            if let Some(_) = checkSpaceNoMatch(pattern);
+
+        // parseUnifyCall_check
+        parseUnifyCall(atom, target, pattern, success, failure) <--
+            atom(atom),
+            if let Some(packed) = parseUnifyCallArgs(atom),
+            if let Atom::C_ExprCons(ref target0, ref rest10) = packed,
+            let target = (**target0).clone(),
+            let rest1 = (**rest10).clone(),
+            if let Atom::C_ExprCons(ref pattern0, ref rest20) = rest1,
+            let pattern = (**pattern0).clone(),
+            let rest2 = (**rest20).clone(),
+            if let Atom::C_ExprCons(ref success0, ref failure0) = rest2,
+            let success = (**success0).clone(),
+            let failure = (**failure0).clone();
+
+        // localMatch_compute
+        localMatch(target, pattern, success, result) <--
+            atom(target),
+            atom(pattern),
+            atom(success),
+            if let Some(result) = localPatternMatch(target, pattern, success);
+
+        // localNoMatch_check
+        localNoMatch(target, pattern) <--
+            atom(target),
+            atom(pattern),
+            if let Some(_) = checkLocalNoMatch(target, pattern);
+
+        // parseCollapseCall_check
+        parseCollapseCall(atom, expr) <--
+            atom(atom),
+            if let Some(expr) = parseCollapseCallArg(atom);
+
+        // collapseBind_oracle
+        collapseBind(expr, ty, packed) <--
+            atom(expr),
+            atom(ty),
+            if let Some(packed) = evalCollapseBind(expr, ty);
     }
 }

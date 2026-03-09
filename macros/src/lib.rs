@@ -3,13 +3,14 @@
 //! This crate provides the `language!` macro which defines a formal language with:
 //! - AST types (Rust enums)
 //! - Parser (PraTTaIL-generated Pratt + Recursive Descent)
-//! - Rewrite engine (Ascent-based)
+//! - Rewrite engine (Ascent-based, when `ascent-codegen` feature is enabled)
 //! - Term generation and manipulation
 //! - Metadata for REPL introspection
 //! - Language implementation struct
 
 mod ast;
 mod gen;
+#[cfg(feature = "ascent-codegen")]
 mod logic;
 
 use proc_macro::TokenStream;
@@ -22,6 +23,7 @@ use gen::{
     generate_all, generate_blockly_definitions, generate_language_impl, generate_metadata,
     write_blockly_blocks, write_blockly_categories,
 };
+#[cfg(feature = "ascent-codegen")]
 use logic::{generate_ascent_source, rules::generate_freshness_functions};
 
 #[proc_macro]
@@ -35,24 +37,37 @@ pub fn language(input: TokenStream) -> TokenStream {
         abort!(span, "{}", msg);
     }
 
-    // Generate the Rust AST types and operations
+    // Generate the Rust AST types and operations (no Ascent dependency)
     let ast_code = generate_all(&language_def);
 
-    // Generate freshness functions (needed by Ascent rewrite clauses)
-    let freshness_fns = generate_freshness_functions(&language_def);
-
-    // Generate Ascent datalog source (includes rewrites as Ascent clauses)
-    let ascent_output = generate_ascent_source(&language_def);
-    let ascent_code = ascent_output.full_output;
-    let raw_ascent_content = ascent_output.raw_content;
-    let core_raw_ascent_content = ascent_output.core_raw_content;
-
-    // Generate metadata for REPL introspection
+    // Generate metadata for REPL introspection (no Ascent dependency)
     let metadata_code = generate_metadata(&language_def);
 
+    // --- Ascent-gated code generation ---
+    #[cfg(feature = "ascent-codegen")]
+    let (freshness_fns, ascent_code, raw_ascent_content, core_raw_ascent_content) = {
+        let fns = generate_freshness_functions(&language_def);
+        let output = generate_ascent_source(&language_def);
+        (
+            fns,
+            output.full_output,
+            output.raw_content,
+            output.core_raw_content,
+        )
+    };
+    #[cfg(not(feature = "ascent-codegen"))]
+    let (freshness_fns, ascent_code, raw_ascent_content, core_raw_ascent_content) = {
+        let empty = proc_macro2::TokenStream::new();
+        (
+            empty.clone(),
+            empty.clone(),
+            empty.clone(),
+            None::<proc_macro2::TokenStream>,
+        )
+    };
+
     // Generate language implementation struct (Term wrapper + Language struct)
-    // Pass raw Ascent content for direct inclusion in ascent! { struct Foo; ... }
-    // Also pass core content for SCC-split struct (if available)
+    // When ascent-codegen is off, raw_ascent_content is empty → stub Language impl
     let language_code = generate_language_impl(
         &language_def,
         &raw_ascent_content,
