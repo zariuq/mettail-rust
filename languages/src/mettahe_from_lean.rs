@@ -54,27 +54,29 @@ use crate::artifact_contract::PatternNode;
 use crate::rewrite_template::{parse_runtime_term, CPrefixConstructorCodec, ConstructorCodec};
 
 #[cfg(feature = "mork-backend")]
+use crate::artifact_contract::RewriteIRRule;
+#[cfg(feature = "mork-backend")]
 use crate::mettahe_artifacts::{
     load_mettahe_lookup_artifact, load_mettahe_rewrite_ir_artifact,
     load_mettahe_transition_artifact, LookupArtifact, RewriteIRArtifact, TransitionArtifact,
 };
-#[cfg(feature = "mork-backend")]
-use crate::artifact_contract::RewriteIRRule;
-#[cfg(feature = "mork-backend")]
-use crate::native_transition_contract::{
-    build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
-    NativeTransitionContract, NativeTransitionRuleMeta,
-};
-#[cfg(feature = "mork-backend")]
-use crate::rewrite_template::{
-    bind_var, execute_rule_to_patterns, resolve_query_arg, ResolvedQueryArg,
-    RewritePremiseEvaluator, TemplateBindings,
-};
-#[cfg(feature = "mork-backend")]
-use mettail_runtime::{
-    hash_display_id, metta_match, metta_subst, run_native_term_graph_with_timing,
-    run_transition_graph, AscentResults, MorkExecutionLimits, Term,
-};
+// DELETED: native_transition_contract + transition_runner were hand-written PathMap reimplementations.
+// All execution must go through mork::space::Space::metta_calculus() via MM2.
+// #[cfg(feature = "mork-backend")]
+// use crate::native_transition_contract::{
+//     build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
+//     NativeTransitionContract, NativeTransitionRuleMeta,
+// };
+// #[cfg(feature = "mork-backend")]
+// use crate::rewrite_template::{
+//     bind_var, execute_rule_to_patterns, resolve_query_arg, ResolvedQueryArg,
+//     RewritePremiseEvaluator, TemplateBindings,
+// };
+// #[cfg(feature = "mork-backend")]
+// use mettail_runtime::{
+//     hash_display_id, metta_match, metta_subst, run_native_term_graph_with_timing,
+//     run_transition_graph, AscentResults, MorkExecutionLimits, Term,
+// };
 #[cfg(feature = "mork-backend")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "mork-backend")]
@@ -528,7 +530,9 @@ fn localPatternMatch(target: &Atom, pattern: &Atom, success: &Atom) -> Option<At
 fn checkLocalNoMatch(target: &Atom, pattern: &Atom) -> Option<()> {
     let target_node = he_atom_to_pattern_node(target).ok()?;
     let pattern_node = he_atom_to_pattern_node(pattern).ok()?;
-    he_pattern_match(&pattern_node, &target_node).is_none().then_some(())
+    he_pattern_match(&pattern_node, &target_node)
+        .is_none()
+        .then_some(())
 }
 
 fn parseCollapseCallArg(atom: &Atom) -> Option<Atom> {
@@ -1044,13 +1048,20 @@ fn he_pattern_head_is_minimal_instruction(node: &PatternNode) -> bool {
 #[cfg(feature = "mork-backend")]
 fn he_pattern_is_minimal_instruction_keyword(node: &PatternNode) -> bool {
     if let Some(name) = he_pattern_sym_name(node) {
-        matches!(name,
-            "superpose" | "symhex_7375706572706f7365"
-            | "match" | "symhex_6d61746368"
-            | "unify" | "symhex_756e696679"
-            | "collapse" | "symhex_636f6c6c61707365"
-            | "case" | "symhex_63617365"
-            | "assert" | "symhex_617373657274"
+        matches!(
+            name,
+            "superpose"
+                | "symhex_7375706572706f7365"
+                | "match"
+                | "symhex_6d61746368"
+                | "unify"
+                | "symhex_756e696679"
+                | "collapse"
+                | "symhex_636f6c6c61707365"
+                | "case"
+                | "symhex_63617365"
+                | "assert"
+                | "symhex_617373657274"
         )
     } else {
         false
@@ -1074,7 +1085,9 @@ fn he_pattern_sym_name(node: &PatternNode) -> Option<&str> {
     match node {
         PatternNode::Apply { ctor, args } if ctor == "SymAtom" && args.len() == 1 => {
             match &args[0] {
-                PatternNode::Apply { ctor: name, args: inner } if inner.is_empty() => Some(name.as_str()),
+                PatternNode::Apply { ctor: name, args: inner } if inner.is_empty() => {
+                    Some(name.as_str())
+                },
                 _ => None,
             }
         },
@@ -1128,11 +1141,7 @@ fn he_collapse_bind_nested(
 ) -> Result<PatternNode, String> {
     let expr_atom = he_pattern_node_to_atom(expr_node)?;
     let ty_atom = he_pattern_node_to_atom(ty_node)?;
-    let start = mk_state(
-        he_instr_metta(expr_atom, ty_atom),
-        space.clone(),
-        Atom::C_Empty,
-    );
+    let start = mk_state(he_instr_metta(expr_atom, ty_atom), space.clone(), Atom::C_Empty);
     let child_limits = MorkExecutionLimits {
         rule_copies: parent_limits.rule_copies,
         max_steps: parent_limits.max_steps / 2,
@@ -1140,13 +1149,9 @@ fn he_collapse_bind_nested(
     let start_display = format!("{}", start);
     let start_id = hash_display_id(&start_display);
     let mut child_eval_ms = 0.0f64;
-    let results = run_transition_graph(
-        start,
-        &start_display,
-        start_id,
-        child_limits,
-        |st| he_native_step_state(st, child_limits, &mut child_eval_ms),
-    )?;
+    let results = run_transition_graph(start, &start_display, start_id, child_limits, |st| {
+        he_native_step_state(st, child_limits, &mut child_eval_ms)
+    })?;
     // Collect result values from terminal Done states
     let lang = MeTTaHELanguage;
     let mut values = Vec::new();
@@ -1157,9 +1162,10 @@ fn he_collapse_bind_nested(
         let parsed = lang.parse_term_for_env(&term_info.display).map_err(|e| {
             format!("collapseBind: failed to reparse Done state '{}': {}", term_info.display, e)
         })?;
-        let wrapped = parsed.as_any().downcast_ref::<MeTTaHETerm>().ok_or_else(|| {
-            format!("collapseBind: reparsed state is not MeTTaHETerm")
-        })?;
+        let wrapped = parsed
+            .as_any()
+            .downcast_ref::<MeTTaHETerm>()
+            .ok_or_else(|| format!("collapseBind: reparsed state is not MeTTaHETerm"))?;
         if let MeTTaHETermInner::State(State::C_State(instr, _, out)) = &wrapped.0 {
             if matches!(instr.as_ref(), Instr::C_Done) {
                 let val_node = he_atom_to_pattern_node(out)?;
@@ -1185,7 +1191,11 @@ fn he_pattern_parse_switch_minimal(node: &PatternNode) -> Option<(PatternNode, P
     let items = he_pattern_collect_list(node);
     if items.len() == 3 {
         let head_name = he_pattern_sym_name(&items[0])?;
-        if head_name == "switch-minimal" || head_name == "switch" || head_name == "symhex_7377697463682d6d696e696d616c" || head_name == "symhex_737769746368" {
+        if head_name == "switch-minimal"
+            || head_name == "switch"
+            || head_name == "symhex_7377697463682d6d696e696d616c"
+            || head_name == "symhex_737769746368"
+        {
             return Some((items[1].clone(), items[2].clone()));
         }
     }
@@ -1259,7 +1269,9 @@ fn he_pattern_parse_match_call(node: &PatternNode) -> Option<(PatternNode, Patte
 }
 
 /// Parse (unify target pattern success failure) → Some((target, pattern, success, failure)).
-fn he_pattern_parse_unify_call(node: &PatternNode) -> Option<(PatternNode, PatternNode, PatternNode, PatternNode)> {
+fn he_pattern_parse_unify_call(
+    node: &PatternNode,
+) -> Option<(PatternNode, PatternNode, PatternNode, PatternNode)> {
     let items = he_pattern_collect_list(node);
     if items.len() == 5 {
         let head_name = he_pattern_sym_name(&items[0])?;
@@ -1289,7 +1301,10 @@ fn he_pattern_space_atoms(space: &Space) -> Vec<PatternNode> {
     match space {
         Space::C_Space(atoms) => {
             let atom_list = he_collect_list_atom(atoms);
-            atom_list.iter().filter_map(|a| he_atom_to_pattern_node(a).ok()).collect()
+            atom_list
+                .iter()
+                .filter_map(|a| he_atom_to_pattern_node(a).ok())
+                .collect()
         },
         _ => Vec::new(),
     }
@@ -1453,9 +1468,12 @@ impl RewritePremiseEvaluator for HeTemplatePremiseEvaluator<'_> {
         match relation {
             "isEmpty" => he_eval_unary_predicate(relation, args, env, he_pattern_is_empty),
             "isError" => he_eval_unary_predicate(relation, args, env, he_pattern_is_error),
-            "notExpression" => he_eval_unary_predicate(relation, args, env, |arg| {
-                !matches!(he_pattern_meta_type(arg), Some(PatternNode::Apply { ctor, args }) if ctor == "ExpressionType" && args.is_empty())
-            }),
+            "notExpression" => he_eval_unary_predicate(
+                relation,
+                args,
+                env,
+                |arg| !matches!(he_pattern_meta_type(arg), Some(PatternNode::Apply { ctor, args }) if ctor == "ExpressionType" && args.is_empty()),
+            ),
             "metaType" => he_eval_meta_type(args, env),
             "funcArgTypes" => he_eval_func_arg_types(args, env),
             "typeMatchesMetaOrAtom" => {
@@ -1488,7 +1506,10 @@ impl RewritePremiseEvaluator for HeTemplatePremiseEvaluator<'_> {
             }),
             "parseSwitchMinimalCall" => {
                 if args.len() != 3 {
-                    return Err(format!("parseSwitchMinimalCall expects 3 args, got {}", args.len()));
+                    return Err(format!(
+                        "parseSwitchMinimalCall expects 3 args, got {}",
+                        args.len()
+                    ));
                 }
                 let atom = he_expect_ground_arg(relation, 0, &args[0], env)?;
                 let Some((scrutinee, raw_cases)) = he_pattern_parse_switch_minimal(&atom) else {
@@ -1549,7 +1570,9 @@ impl RewritePremiseEvaluator for HeTemplatePremiseEvaluator<'_> {
                     && matches!(&args[0], PatternNode::Apply { ctor: n, args: a } if a.is_empty() && n == "NotReducible"))
             }),
             "assertMatchesTrue" => he_eval_unary_predicate(relation, args, env, he_pattern_is_true),
-            "assertNotTrue" => he_eval_unary_predicate(relation, args, env, |arg| !he_pattern_is_true(arg)),
+            "assertNotTrue" => {
+                he_eval_unary_predicate(relation, args, env, |arg| !he_pattern_is_true(arg))
+            },
             "mkAssertError" => {
                 if args.len() != 3 {
                     return Err(format!("mkAssertError expects 3 args, got {}", args.len()));
@@ -1561,7 +1584,6 @@ impl RewritePremiseEvaluator for HeTemplatePremiseEvaluator<'_> {
             },
 
             // ═══ Minimal instruction premises ═══
-
             "parseSuperpose" => {
                 // Multi-result: (superpose (e1 e2 ...)) → one binding per element
                 if args.len() != 2 {
@@ -1623,7 +1645,9 @@ impl RewritePremiseEvaluator for HeTemplatePremiseEvaluator<'_> {
                 }
                 let pattern = he_expect_ground_arg(relation, 0, &args[0], env)?;
                 let space_atoms = he_pattern_space_atoms(self.space);
-                let has_match = space_atoms.iter().any(|sa| he_pattern_match(&pattern, sa).is_some());
+                let has_match = space_atoms
+                    .iter()
+                    .any(|sa| he_pattern_match(&pattern, sa).is_some());
                 if has_match {
                     Ok(Vec::new())
                 } else {
@@ -1636,7 +1660,8 @@ impl RewritePremiseEvaluator for HeTemplatePremiseEvaluator<'_> {
                     return Err(format!("parseUnifyCall expects 5 args, got {}", args.len()));
                 }
                 let atom = he_expect_ground_arg(relation, 0, &args[0], env)?;
-                let Some((target, pattern, success, failure)) = he_pattern_parse_unify_call(&atom) else {
+                let Some((target, pattern, success, failure)) = he_pattern_parse_unify_call(&atom)
+                else {
                     return Ok(Vec::new());
                 };
                 let envs = he_bind_relation_result(env, &args[1], target)?;
@@ -1700,14 +1725,12 @@ impl RewritePremiseEvaluator for HeTemplatePremiseEvaluator<'_> {
                 }
                 let expr_node = he_expect_ground_arg(relation, 0, &args[0], env)?;
                 let ty_node = he_expect_ground_arg(relation, 1, &args[1], env)?;
-                let packed = he_collapse_bind_nested(
-                    &expr_node, &ty_node, self.space, self.limits,
-                )?;
+                let packed =
+                    he_collapse_bind_nested(&expr_node, &ty_node, self.space, self.limits)?;
                 he_bind_relation_result(env, &args[2], packed)
             },
 
             // ═══ Equation / grounded call premises (MC_Equation, MC_Grounded, MC_NoMatch) ═══
-
             "groundedCallResult" => {
                 // groundedCallResult(space, atom, result): if atom is (groundedOp args...),
                 // dispatch the grounded call and bind result.
@@ -1718,7 +1741,8 @@ impl RewritePremiseEvaluator for HeTemplatePremiseEvaluator<'_> {
                     return Err(format!("groundedCallResult expects 3 args, got {}", args.len()));
                 }
                 if let Some(ty_node) = env.get("ty") {
-                    if matches!(ty_node, PatternNode::Apply { ctor, args: a } if ctor == "AtomType" && a.is_empty()) {
+                    if matches!(ty_node, PatternNode::Apply { ctor, args: a } if ctor == "AtomType" && a.is_empty())
+                    {
                         return Ok(Vec::new());
                     }
                 }
@@ -1732,7 +1756,8 @@ impl RewritePremiseEvaluator for HeTemplatePremiseEvaluator<'_> {
                 if is_executable_grounded(op.as_ref()).is_none() {
                     return Ok(Vec::new());
                 }
-                let Some(result) = eval_grounded_dispatch((**op).clone(), (**args_tail).clone()) else {
+                let Some(result) = eval_grounded_dispatch((**op).clone(), (**args_tail).clone())
+                else {
                     return Ok(Vec::new());
                 };
                 let result_node = he_atom_to_pattern_node(&result)?;
@@ -1909,11 +1934,7 @@ fn he_eval_unary_predicate(
     pred: impl Fn(&PatternNode) -> bool,
 ) -> Result<Vec<TemplateBindings>, String> {
     if args.len() != 1 {
-        return Err(format!(
-            "HE relation '{}' expects 1 arg, got {}",
-            relation,
-            args.len()
-        ));
+        return Err(format!("HE relation '{}' expects 1 arg, got {}", relation, args.len()));
     }
     let arg = he_expect_ground_arg(relation, 0, &args[0], env)?;
     if pred(&arg) {
@@ -1931,11 +1952,7 @@ fn he_eval_binary_predicate(
     pred: impl Fn(&PatternNode, &PatternNode) -> bool,
 ) -> Result<Vec<TemplateBindings>, String> {
     if args.len() != 2 {
-        return Err(format!(
-            "HE relation '{}' expects 2 args, got {}",
-            relation,
-            args.len()
-        ));
+        return Err(format!("HE relation '{}' expects 2 args, got {}", relation, args.len()));
     }
     let lhs = he_expect_ground_arg(relation, 0, &args[0], env)?;
     let rhs = he_expect_ground_arg(relation, 1, &args[1], env)?;
@@ -1947,7 +1964,10 @@ fn he_eval_binary_predicate(
 }
 
 #[cfg(feature = "mork-backend")]
-fn he_eval_meta_type(args: &[PatternNode], env: &TemplateBindings) -> Result<Vec<TemplateBindings>, String> {
+fn he_eval_meta_type(
+    args: &[PatternNode],
+    env: &TemplateBindings,
+) -> Result<Vec<TemplateBindings>, String> {
     if args.len() != 2 {
         return Err(format!("HE relation 'metaType' expects 2 args, got {}", args.len()));
     }
@@ -1964,10 +1984,7 @@ fn he_eval_func_arg_types(
     env: &TemplateBindings,
 ) -> Result<Vec<TemplateBindings>, String> {
     if args.len() != 2 {
-        return Err(format!(
-            "HE relation 'funcArgTypes' expects 2 args, got {}",
-            args.len()
-        ));
+        return Err(format!("HE relation 'funcArgTypes' expects 2 args, got {}", args.len()));
     }
     let op_type = he_expect_ground_arg("funcArgTypes", 0, &args[0], env)?;
     let Some(arg_types) = he_pattern_func_arg_types(&op_type) else {
@@ -1982,14 +1999,18 @@ fn he_pattern_node_to_atom(node: &PatternNode) -> Result<Atom, String> {
     let text = render_he_runtime_term(node)?;
     let lang = MeTTaHELanguage;
     let parsed = lang.parse_term_for_env(&text)?;
-    let wrapped = parsed.as_any().downcast_ref::<MeTTaHETerm>().ok_or_else(|| {
-        format!("HE premise evaluator: expected MeTTaHETerm after parsing '{}'", text)
-    })?;
+    let wrapped = parsed
+        .as_any()
+        .downcast_ref::<MeTTaHETerm>()
+        .ok_or_else(|| {
+            format!("HE premise evaluator: expected MeTTaHETerm after parsing '{}'", text)
+        })?;
     match &wrapped.0 {
         MeTTaHETermInner::Atom(a) => Ok(a.clone()),
         _ => Err(format!(
             "HE premise evaluator: parsed non-Atom wrapper from '{}' (got {:?})",
-            text, std::mem::discriminant(&wrapped.0)
+            text,
+            std::mem::discriminant(&wrapped.0)
         )),
     }
 }
@@ -2018,8 +2039,7 @@ fn he_eval_type_of(
     let atom_node = he_expect_ground_arg("typeOf", 1, &args[1], env)?;
     let atom_val = he_pattern_node_to_atom(&atom_node)?;
     // HE spec: getAtomTypes defaults to [%Undefined%] when no annotation
-    let actual_type = he_type_of(space, &atom_val)
-        .unwrap_or(Atom::C_UndefinedType);
+    let actual_type = he_type_of(space, &atom_val).unwrap_or(Atom::C_UndefinedType);
     let actual_node = he_atom_to_pattern_node(&actual_type)?;
 
     // Check if the expected type (args[2]) is already bound
@@ -2030,9 +2050,12 @@ fn he_eval_type_of(
         },
         ResolvedQueryArg::Ground(expected_node) => {
             // HE spec matchTypes: succeed if either side is %Undefined% or Atom
-            let is_undef = |n: &PatternNode| matches!(n,
-                PatternNode::Apply { ctor, args } if (ctor == "UndefinedType" || ctor == "AtomType") && args.is_empty());
-            let is_var = |n: &PatternNode| matches!(n, PatternNode::Apply { ctor, .. } if ctor == "VarAtom");
+            let is_undef = |n: &PatternNode| {
+                matches!(n,
+                PatternNode::Apply { ctor, args } if (ctor == "UndefinedType" || ctor == "AtomType") && args.is_empty())
+            };
+            let is_var =
+                |n: &PatternNode| matches!(n, PatternNode::Apply { ctor, .. } if ctor == "VarAtom");
             if actual_node == expected_node
                 || is_undef(&actual_node)
                 || is_undef(&expected_node)
@@ -2062,8 +2085,7 @@ fn he_eval_type_mismatch(
     let atom_val = he_pattern_node_to_atom(&atom_node)?;
     let ty_val = he_pattern_node_to_atom(&ty_node)?;
     // HE spec: getAtomTypes defaults to [%Undefined%]
-    let actual_type = he_type_of(space, &atom_val)
-        .unwrap_or(Atom::C_UndefinedType);
+    let actual_type = he_type_of(space, &atom_val).unwrap_or(Atom::C_UndefinedType);
     // HE spec matchTypes: %Undefined%/Atom/variable → always match (no mismatch)
     let is_wildcard_type = |a: &Atom| matches!(a, Atom::C_UndefinedType | Atom::C_AtomType);
     let is_var_type = |a: &Atom| matches!(a, Atom::C_VarAtom(_));
@@ -2086,10 +2108,7 @@ fn he_eval_applicable_func_type(
     env: &TemplateBindings,
 ) -> Result<Vec<TemplateBindings>, String> {
     if args.len() != 5 {
-        return Err(format!(
-            "HE relation 'applicableFuncType' expects 5 args, got {}",
-            args.len()
-        ));
+        return Err(format!("HE relation 'applicableFuncType' expects 5 args, got {}", args.len()));
     }
     let atom_node = he_expect_ground_arg("applicableFuncType", 1, &args[1], env)?;
     let ty_node = he_expect_ground_arg("applicableFuncType", 2, &args[2], env)?;
@@ -2099,10 +2118,7 @@ fn he_eval_applicable_func_type(
         return Ok(Vec::new());
     };
     let Atom::C_ExprCons(op_type, ret_type) = payload else {
-        return Err(format!(
-            "HE applicableFuncType: expected C_ExprCons payload, got {}",
-            payload
-        ));
+        return Err(format!("HE applicableFuncType: expected C_ExprCons payload, got {}", payload));
     };
     let op_node = he_atom_to_pattern_node(&op_type)?;
     let ret_node = he_atom_to_pattern_node(&ret_type)?;
@@ -2123,10 +2139,7 @@ fn he_eval_needs_tuple_interp(
     env: &TemplateBindings,
 ) -> Result<Vec<TemplateBindings>, String> {
     if args.len() != 3 {
-        return Err(format!(
-            "HE relation 'needsTupleInterp' expects 3 args, got {}",
-            args.len()
-        ));
+        return Err(format!("HE relation 'needsTupleInterp' expects 3 args, got {}", args.len()));
     }
     let atom_node = he_expect_ground_arg("needsTupleInterp", 1, &args[1], env)?;
     let atom_val = he_pattern_node_to_atom(&atom_node)?;
@@ -2148,10 +2161,7 @@ fn he_eval_no_type_at_all(
     env: &TemplateBindings,
 ) -> Result<Vec<TemplateBindings>, String> {
     if args.len() != 2 {
-        return Err(format!(
-            "HE relation 'noTypeAtAll' expects 2 args, got {}",
-            args.len()
-        ));
+        return Err(format!("HE relation 'noTypeAtAll' expects 2 args, got {}", args.len()));
     }
     let atom_node = he_expect_ground_arg("noTypeAtAll", 1, &args[1], env)?;
     let atom_val = he_pattern_node_to_atom(&atom_node)?;
@@ -2166,10 +2176,7 @@ fn he_eval_no_type_at_all(
 }
 
 fn he_atom_ctor(name: &str) -> PatternNode {
-    PatternNode::Apply {
-        ctor: name.to_string(),
-        args: Vec::new(),
-    }
+    PatternNode::Apply { ctor: name.to_string(), args: Vec::new() }
 }
 
 #[cfg(feature = "mork-backend")]
@@ -2213,10 +2220,20 @@ fn he_pattern_meta_type(node: &PatternNode) -> Option<PatternNode> {
                     | "OpLt"
                     | "OpGt"
                     | "OpEq"
-            ) && ((matches!(ctor.as_str(), "GInt" | "GString" | "GBool") && args.len() == 1)
+            ) && ((matches!(ctor.as_str(), "GInt" | "GString" | "GBool")
+                && args.len() == 1)
                 || (matches!(
                     ctor.as_str(),
-                    "True" | "False" | "OpAdd" | "OpSub" | "OpMul" | "OpDiv" | "OpMod" | "OpLt" | "OpGt" | "OpEq"
+                    "True"
+                        | "False"
+                        | "OpAdd"
+                        | "OpSub"
+                        | "OpMul"
+                        | "OpDiv"
+                        | "OpMod"
+                        | "OpLt"
+                        | "OpGt"
+                        | "OpEq"
                 ) && args.is_empty())) =>
         {
             Some(he_atom_ctor("GroundedType"))
@@ -2297,15 +2314,15 @@ fn he_pattern_func_arg_types(node: &PatternNode) -> Option<PatternNode> {
 fn parse_he_state_from_runtime_text(text: &str) -> Result<State, String> {
     let lang = MeTTaHELanguage;
     let parsed = lang.parse_term_for_env(text)?;
-    let wrapped = parsed.as_any().downcast_ref::<MeTTaHETerm>().ok_or_else(|| {
-        format!("HE generic rewrite executor expected MeTTaHETerm after parsing '{}'", text)
-    })?;
+    let wrapped = parsed
+        .as_any()
+        .downcast_ref::<MeTTaHETerm>()
+        .ok_or_else(|| {
+            format!("HE generic rewrite executor expected MeTTaHETerm after parsing '{}'", text)
+        })?;
     match &wrapped.0 {
         MeTTaHETermInner::State(state) => Ok(state.clone()),
-        _ => Err(format!(
-            "HE generic rewrite executor parsed non-State wrapper from '{}'",
-            text
-        )),
+        _ => Err(format!("HE generic rewrite executor parsed non-State wrapper from '{}'", text)),
     }
 }
 
@@ -2321,7 +2338,10 @@ fn he_try_execute_template_rule(
         return Ok(None);
     }
     let rule = contract.rewrite_ir.rule(rule_id).ok_or_else(|| {
-        format!("HE rewrite contract missing structured rule '{}' for template execution", rule_id)
+        format!(
+            "HE rewrite contract missing structured rule '{}' for template execution",
+            rule_id
+        )
     })?;
     let space: &Space = match state {
         State::C_State(_, sp, _) => sp.as_ref(),
@@ -2345,10 +2365,7 @@ fn he_try_execute_template_rule(
 fn render_he_runtime_raw_payload(node: &PatternNode) -> Result<String, String> {
     match node {
         PatternNode::Apply { ctor, args } if args.is_empty() => Ok(ctor.clone()),
-        _ => Err(format!(
-            "HE template renderer expected raw payload leaf, got {:?}",
-            node
-        )),
+        _ => Err(format!("HE template renderer expected raw payload leaf, got {:?}", node)),
     }
 }
 
@@ -2359,8 +2376,7 @@ fn render_he_runtime_term(node: &PatternNode) -> Result<String, String> {
             if args.is_empty() {
                 return Ok(rendered_ctor);
             }
-            let rendered_args = if matches!(ctor.as_str(), "SymAtom" | "GString")
-                && args.len() == 1
+            let rendered_args = if matches!(ctor.as_str(), "SymAtom" | "GString") && args.len() == 1
             {
                 vec![render_he_runtime_raw_payload(&args[0])?]
             } else {
@@ -2374,12 +2390,12 @@ fn render_he_runtime_term(node: &PatternNode) -> Result<String, String> {
             "HE template renderer cannot render unresolved free variable '{}'",
             name
         )),
-        PatternNode::Bvar { index } => Err(format!(
-            "HE template renderer cannot render bound variable index {}",
-            index
-        )),
+        PatternNode::Bvar { index } => {
+            Err(format!("HE template renderer cannot render bound variable index {}", index))
+        },
         PatternNode::Collection { .. } => {
-            let text = crate::rewrite_template::render_runtime_term(&CPrefixConstructorCodec, node)?;
+            let text =
+                crate::rewrite_template::render_runtime_term(&CPrefixConstructorCodec, node)?;
             let reparsed = parse_runtime_term(&CPrefixConstructorCodec, &text)?;
             crate::rewrite_template::render_runtime_term(&CPrefixConstructorCodec, &reparsed)
         },
@@ -2455,27 +2471,32 @@ fn he_native_step_state(
     } else {
         Ok(Some(source_tag))
     };
-    let mut results = dispatch_active_source_step("HE", &contract.transition, active_source, |rule, meta| {
-        let rewrite_meta = contract.rewrite_ir.rule(rule).ok_or_else(|| {
-            format!("HE rewrite-ir is missing rule '{}' required by transition spec", rule)
+    let mut results =
+        dispatch_active_source_step("HE", &contract.transition, active_source, |rule, meta| {
+            let rewrite_meta = contract.rewrite_ir.rule(rule).ok_or_else(|| {
+                format!("HE rewrite-ir is missing rule '{}' required by transition spec", rule)
+            })?;
+            if rewrite_meta.source_instr != source_tag {
+                return Err(format!(
+                    "HE rewrite-ir mismatch: rule '{}' maps to '{}' but active source is '{}'",
+                    rule, rewrite_meta.source_instr, source_tag
+                ));
+            }
+            if let Some(states) = he_try_execute_template_rule(
+                rule,
+                &meta.logical_transition_id,
+                state,
+                contract,
+                limits,
+            )? {
+                return Ok(states);
+            }
+            // All rules are template-driven. Reaching here means a bug.
+            Err(format!(
+                "HE rule '{}' ({}) was not handled by template execution",
+                rule, meta.logical_transition_id
+            ))
         })?;
-        if rewrite_meta.source_instr != source_tag {
-            return Err(format!(
-                "HE rewrite-ir mismatch: rule '{}' maps to '{}' but active source is '{}'",
-                rule, rewrite_meta.source_instr, source_tag
-            ));
-        }
-        if let Some(states) =
-            he_try_execute_template_rule(rule, &meta.logical_transition_id, state, contract, limits)?
-        {
-            return Ok(states);
-        }
-        // All rules are template-driven. Reaching here means a bug.
-        Err(format!(
-            "HE rule '{}' ({}) was not handled by template execution",
-            rule, meta.logical_transition_id
-        ))
-    })?;
 
     // Catch-all: MettaCall(atom, AtomType) with no matching rules → Return(atom).
     // This matches the Ascent backend behavior; MettaCall with AtomType shouldn't normally

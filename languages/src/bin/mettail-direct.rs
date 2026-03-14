@@ -1,19 +1,24 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::path::Path;
 
-use mettail_runtime::{AscentResults, Language, RuntimeBackend, TermInfo};
+use mettail_runtime::{
+    language_supports_auto_backend, AscentResults, Language, RuntimeBackend, TermInfo,
+};
 
 #[cfg(feature = "lang-ambient")]
 use mettail_languages::ambient::AmbientLanguage;
 #[cfg(feature = "lang-calculator")]
 use mettail_languages::calculator::CalculatorLanguage;
-#[cfg(feature = "lang-he")]
-use mettail_languages::mettahe_from_lean::MeTTaHELanguage;
 #[cfg(feature = "lang-imp")]
 use mettail_languages::imp_from_lean::IMPLanguage;
 #[cfg(feature = "lang-lambda")]
 use mettail_languages::lambda::LambdaLanguage;
+#[cfg(feature = "lang-he")]
+use mettail_languages::mettahe_from_lean::MeTTaHELanguage;
+#[cfg(feature = "lang-he")]
+use mettail_languages::mettahe_surface::run_mettahe_surface_file_from_path;
 #[cfg(feature = "lang-minskylite")]
 use mettail_languages::minskylite_from_lean::MinskyLiteLanguage;
 #[cfg(feature = "lang-mm0lite")]
@@ -22,14 +27,16 @@ use mettail_languages::mm0lite_from_lean::MM0LiteLanguage;
 use mettail_languages::mm0lite_from_lean::{
     parse_mm0_theorem_facts, run_mm0lite_mork_backend_with_limits, with_mm0_theorem_facts,
 };
-#[cfg(all(feature = "lang-mm0lite", feature = "mork-backend"))]
-use mettail_runtime::MorkExecutionLimits;
 #[cfg(feature = "lang-petta")]
-use mettail_languages::petta_from_lean::{run_metta_surface_file, PeTTaLanguage};
+use mettail_languages::petta_from_lean::{
+    run_metta_surface_file_from_path, run_metta_surface_file_via_backend_from_path, PeTTaLanguage,
+};
 #[cfg(feature = "lang-pyashcore")]
 use mettail_languages::pyashcore_from_lean::PyashCoreLanguage;
 #[cfg(feature = "lang-rhocalc")]
 use mettail_languages::rhocalc::RhoCalcLanguage;
+#[cfg(all(feature = "lang-mm0lite", feature = "mork-backend"))]
+use mettail_runtime::MorkExecutionLimits;
 
 struct Args {
     lang: String,
@@ -211,6 +218,12 @@ fn print_results(results: &AscentResults, start_id: u64) {
     }
 }
 
+fn should_use_registered_backend(language: &dyn Language, backend: RuntimeBackend) -> bool {
+    matches!(backend, RuntimeBackend::Mork)
+        || (matches!(backend, RuntimeBackend::Auto)
+            && language_supports_auto_backend(language.name()))
+}
+
 fn main() -> Result<(), String> {
     let args = parse_args().unwrap_or_else(|e| {
         eprintln!("Error: {e}");
@@ -219,6 +232,63 @@ fn main() -> Result<(), String> {
 
     #[cfg(feature = "mork-backend")]
     mettail_languages::register_default_core_backends()?;
+
+    let language = build_language(&args.lang)?;
+
+    #[cfg(feature = "lang-petta")]
+    if args.lang.eq_ignore_ascii_case("petta") && args.file.is_some() {
+        let file_path = args.file.as_ref().unwrap();
+        if file_path.ends_with(".metta") {
+            let result = if should_use_registered_backend(language.as_ref(), args.backend) {
+                run_metta_surface_file_via_backend_from_path(
+                    language.as_ref(),
+                    args.backend,
+                    Path::new(file_path),
+                    language.metadata().library_aliases(),
+                )?
+            } else {
+                run_metta_surface_file_from_path(
+                    Path::new(file_path),
+                    language.metadata().library_aliases(),
+                )?
+            };
+            for line in &result.outputs {
+                println!("{}", line);
+            }
+            // Test assertions are now handled by MORK TestAssertion host
+            // kind; failures appear as [error] lines in outputs.
+            let error_count = result.outputs.iter().filter(|l| l.starts_with("[error]")).count();
+            if error_count > 0 {
+                return Err(format!("{} error(s) in output", error_count));
+            }
+            return Ok(());
+        }
+    }
+
+    #[cfg(feature = "lang-he")]
+    if (args.lang.eq_ignore_ascii_case("mettahe") || args.lang.eq_ignore_ascii_case("he"))
+        && args.file.is_some()
+    {
+        let file_path = args.file.as_ref().unwrap();
+        if file_path.ends_with(".metta") {
+            let result = run_mettahe_surface_file_from_path(
+                language.as_ref(),
+                args.backend,
+                Path::new(file_path),
+                language.metadata().library_aliases(),
+            )?;
+            for line in &result.outputs {
+                println!("{}", line);
+            }
+            // Test assertions are now handled by MORK TestAssertion host
+            // kind; failures appear as [error] lines in outputs.
+            let error_count = result.outputs.iter().filter(|l| l.starts_with("[error]")).count();
+            if error_count > 0 {
+                return Err(format!("{} error(s) in output", error_count));
+            }
+            return Ok(());
+        }
+    }
 
     let input = if let Some(term) = args.term {
         term
@@ -245,34 +315,9 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
-    // PeTTa surface file runner: auto-detect .metta files with !/test syntax
-    #[cfg(feature = "lang-petta")]
-    if args.lang.eq_ignore_ascii_case("petta") && args.file.is_some() {
-        let file_path = args.file.as_ref().unwrap();
-        if file_path.ends_with(".metta") {
-            let result = run_metta_surface_file(&input)?;
-            for line in &result.outputs {
-                println!("{}", line);
-            }
-            if result.tests_failed > 0 {
-                eprintln!(
-                    "\n{} passed, {} failed",
-                    result.tests_passed, result.tests_failed
-                );
-                return Err(format!("{} test(s) failed", result.tests_failed));
-            } else if result.tests_passed > 0 {
-                eprintln!("\n{} passed, 0 failed", result.tests_passed);
-            }
-            return Ok(());
-        }
-    }
-
-    let language = build_language(&args.lang)?;
     let term = language.parse_term(&input)?;
 
-    // For Auto/Ascent backends, prefer the lightweight run_eval path.
-    // For MORK, use run_backend which routes through the registered adapter.
-    if matches!(args.backend, RuntimeBackend::Mork) {
+    if should_use_registered_backend(language.as_ref(), args.backend) {
         let results = language.run_backend(term.as_ref(), args.backend)?;
         print_results(&results, term.term_id());
     } else {

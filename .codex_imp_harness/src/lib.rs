@@ -15,8 +15,9 @@ pub use ascent_byods_rels::eqrel;
 pub mod artifact_contract;
 #[path = "../../languages/src/imp_artifacts.rs"]
 pub mod imp_artifacts;
-#[path = "../../languages/src/native_transition_contract.rs"]
-pub mod native_transition_contract;
+// DELETED: native_transition_contract.rs was a hand-written PathMap reimplementation.
+// #[path = "../../languages/src/native_transition_contract.rs"]
+// pub mod native_transition_contract;
 #[path = "../../languages/src/rewrite_template.rs"]
 pub mod rewrite_template;
 #[path = "../../languages/src/imp_from_lean.rs"]

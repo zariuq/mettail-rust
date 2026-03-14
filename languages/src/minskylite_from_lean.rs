@@ -15,15 +15,16 @@ use crate::minskylite_artifacts::{
     load_minskylite_lookup_artifact, load_minskylite_rewrite_ir_artifact,
     load_minskylite_transition_artifact, minskylite_artifact_dir,
 };
-#[cfg(feature = "mork-backend")]
-use crate::native_transition_contract::{
-    build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
-    expect_rule_contract, NativeTransitionContract, NativeTransitionRuleMeta,
-};
-#[cfg(feature = "mork-backend")]
-use mettail_runtime::{
-    run_native_term_graph_with_timing, AscentResults, MorkExecutionLimits, Term,
-};
+// DELETED: native_transition_contract + transition_runner were hand-written PathMap reimplementations.
+// #[cfg(feature = "mork-backend")]
+// use crate::native_transition_contract::{
+//     build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
+//     expect_rule_contract, NativeTransitionContract, NativeTransitionRuleMeta,
+// };
+// #[cfg(feature = "mork-backend")]
+// use mettail_runtime::{
+//     run_native_term_graph_with_timing, AscentResults, MorkExecutionLimits, Term,
+// };
 #[cfg(feature = "mork-backend")]
 use std::sync::OnceLock;
 

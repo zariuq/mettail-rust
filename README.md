@@ -123,7 +123,57 @@ Applied rewrite →
 
 ---
 
-## 🙏 Credits
+## Tree-Sitter Parser Migration
+
+All `.metta` surface parsing now goes through **Lean-exported grammars +
+tree-sitter**. The hand-written tokenizer/parser has been deleted.
+
+- **Shared parse path**: `languages/src/tree_sitter_parser.rs`
+- **Shared S-expression IR**: `languages/src/sexpr.rs`
+- **Grammar artifacts**: `languages/artifacts/syntax/` (JSON specs, tree-sitter JS, checksums)
+- **Policy**: No hand-written surface parsers. Parsing uses Lean-exported
+  grammar artifacts + tree-sitter only. One shared `.metta` parser path
+  for all languages; evaluation may differ, parsing must not.
+
+## Multi-Language Backends
+
+Beyond the rho-calculus example above, mettail-rust supports multiple
+formal language backends via feature gates:
+
+- **PeTTa** (`lang-petta`): Prolog-based MeTTa with `.metta` file support
+- **HE** (`lang-he`): Hyperon Experimental (requires `mork-backend`)
+- **IMP, MM0Lite, Calculator, Lambda, RhoCal, Ambient, PyashCore, MinskyLite**
+
+## CLI
+
+**Primary interface** — `mettail-direct` binary:
+
+```bash
+cargo run -p mettail-languages --bin mettail-direct \
+  --no-default-features --features "lang-petta" \
+  -- --lang petta --file examples/program.metta
+```
+
+Supports `--lang <name>`, `--backend [auto|ascent|mork]`, `--term '<program>'`, `--file <path>`.
+
+**REPL** — `cargo run` (interactive shell with term exploration and step-by-step rewriting).
+
+## Runtime Backends
+
+- **MORK/PathMap**: Primary backend for verification (opt-in: `--features "mork-backend"`)
+- **Ascent**: Default datalog-based execution for reachability queries
+- **Auto**: Runtime selects based on language capabilities
+
+## Contract-First Architecture
+
+Execution routes through Lean-certified contracts and artifacts, not
+ad-hoc interpreters. A new executable lane must first exist as a
+Lean-exported contract entry; Rust validates, lowers to MM2/MORK, and
+provides explicitly contracted host-builtin plumbing.
+
+---
+
+## Credits
 
 **Core Technologies:**
 - [ascent](https://github.com/s-arash/ascent) - Datalog in Rust via macros

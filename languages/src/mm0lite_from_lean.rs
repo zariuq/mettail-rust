@@ -225,15 +225,16 @@ use crate::mm0lite_artifacts::{
     load_mm0lite_lookup_artifact, load_mm0lite_rewrite_ir_artifact,
     load_mm0lite_transition_artifact, mm0lite_artifact_dir,
 };
-#[cfg(feature = "mork-backend")]
-use crate::native_transition_contract::{
-    build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
-    NativeTransitionContract, NativeTransitionRuleMeta,
-};
-#[cfg(feature = "mork-backend")]
-use mettail_runtime::{
-    run_native_term_graph_with_timing, AscentResults, LookupFamilyIndex, MorkExecutionLimits, Term,
-};
+// DELETED: native_transition_contract + transition_runner were hand-written PathMap reimplementations.
+// #[cfg(feature = "mork-backend")]
+// use crate::native_transition_contract::{
+//     build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
+//     NativeTransitionContract, NativeTransitionRuleMeta,
+// };
+// #[cfg(feature = "mork-backend")]
+// use mettail_runtime::{
+//     run_native_term_graph_with_timing, AscentResults, LookupFamilyIndex, MorkExecutionLimits, Term,
+// };
 #[cfg(feature = "mork-backend")]
 use std::cell::RefCell;
 #[cfg(feature = "mork-backend")]

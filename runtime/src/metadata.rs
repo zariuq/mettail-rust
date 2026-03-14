@@ -241,7 +241,7 @@ pub struct LogicRuleDef {
 
 /// Alias from `(library <name>)` imports to concrete file path tokens.
 ///
-/// Example: `(library lib_pln)` -> `repl/src/examples/petta_adapted/lib/lib_pln.metta`.
+/// Example: `(library lib_pln)` -> `PeTTa/lib/lib_pln.metta` (resolved via parent dir).
 #[derive(Debug, Clone, Copy)]
 pub struct LibraryAliasDef {
     /// Library alias name used in surface files.

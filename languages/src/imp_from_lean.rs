@@ -20,18 +20,19 @@ use crate::imp_artifacts::{
     imp_artifact_dir, load_imp_lookup_artifact, load_imp_rewrite_ir_artifact,
     load_imp_transition_artifact,
 };
-#[cfg(feature = "mork-backend")]
-use crate::native_transition_contract::{
-    build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
-    NativeTransitionContract,
-};
-#[cfg(feature = "mork-backend")]
-use crate::rewrite_template::{
-    bind_var, execute_rule_to_runtime_strings, resolve_query_arg, CPrefixConstructorCodec,
-    ResolvedQueryArg, RewritePremiseEvaluator, TemplateBindings,
-};
-#[cfg(feature = "mork-backend")]
-use mettail_runtime::{run_native_term_graph_with_timing, AscentResults, MorkExecutionLimits};
+// DELETED: native_transition_contract + transition_runner were hand-written PathMap reimplementations.
+// #[cfg(feature = "mork-backend")]
+// use crate::native_transition_contract::{
+//     build_native_transition_contract, cached_contract_result, dispatch_active_source_step,
+//     NativeTransitionContract,
+// };
+// #[cfg(feature = "mork-backend")]
+// use crate::rewrite_template::{
+//     bind_var, execute_rule_to_runtime_strings, resolve_query_arg, CPrefixConstructorCodec,
+//     ResolvedQueryArg, RewritePremiseEvaluator, TemplateBindings,
+// };
+// #[cfg(feature = "mork-backend")]
+// use mettail_runtime::{run_native_term_graph_with_timing, AscentResults, MorkExecutionLimits};
 #[cfg(feature = "mork-backend")]
 use std::collections::HashMap;
 #[cfg(feature = "mork-backend")]

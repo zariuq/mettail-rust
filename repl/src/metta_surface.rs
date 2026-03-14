@@ -8,7 +8,6 @@ use mettail_runtime::{
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::Instant;
-use tree_sitter::{Language as TSLanguage, Node as TSNode, Parser as TSParser};
 
 use crate::lookup_plan::{
     relation_metadata_index, try_load_lookup_plan, LookupPlanArtifact, LookupRelationMetadata,
@@ -54,11 +53,7 @@ pub enum SurfaceParserBackend {
     TreeSitter,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SExpr {
-    Atom(String),
-    List(Vec<SExpr>),
-}
+pub use mettail_languages::sexpr::SExpr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceStmt {
@@ -1789,98 +1784,12 @@ fn dialect_key_for_tree_sitter(
     }
 }
 
-extern "C" {
-    fn tree_sitter_metta_he() -> TSLanguage;
-    fn tree_sitter_metta_petta() -> TSLanguage;
-}
-
-fn tree_sitter_language_for_dialect(dialect_key: &str) -> Result<TSLanguage> {
-    match dialect_key {
-        "he" => Ok(unsafe { tree_sitter_metta_he() }),
-        "petta" => Ok(unsafe { tree_sitter_metta_petta() }),
-        other => bail!("unsupported embedded tree-sitter dialect '{}'", other),
-    }
-}
+// Tree-sitter parsing is now shared via mettail_languages::tree_sitter_parser.
+// The REPL delegates to that shared module; see Parser Policy in CLAUDE.md.
 
 fn parse_sexpr_via_tree_sitter(dialect_key: &str, input: &str) -> Result<(bool, SExpr)> {
-    let mut parser = TSParser::new();
-    let language = tree_sitter_language_for_dialect(dialect_key)?;
-    parser.set_language(&language).map_err(|e| {
-        anyhow!("failed to set embedded tree-sitter language '{}': {e}", dialect_key)
-    })?;
-    let tree = parser
-        .parse(input, None)
-        .ok_or_else(|| anyhow!("embedded tree-sitter returned no parse tree"))?;
-    let root = tree.root_node();
-    if root.has_error() || root.is_error() {
-        bail!("embedded tree-sitter parse contains ERROR/MISSING nodes");
-    }
-    decode_tree_sitter_root(root, input)
-}
-
-fn decode_tree_sitter_root(root: TSNode<'_>, source: &str) -> Result<(bool, SExpr)> {
-    let mut tops = Vec::new();
-    for idx in 0..root.named_child_count() {
-        if let Some(child) = root.named_child(idx) {
-            if matches!(child.kind(), "eval_form" | "atom") {
-                tops.push(child);
-            }
-        }
-    }
-
-    if tops.is_empty() {
-        bail!("embedded tree-sitter parse produced no top-level form");
-    }
-    if tops.len() != 1 {
-        bail!(
-            "embedded tree-sitter parse produced {} top-level forms; expected exactly 1",
-            tops.len()
-        );
-    }
-
-    let top = tops[0];
-    if top.kind() == "eval_form" {
-        let atom = first_named_child_of_kind(top, "atom")
-            .ok_or_else(|| anyhow!("embedded tree-sitter eval_form missing atom child"))?;
-        return Ok((true, decode_tree_sitter_atom(atom, source)?));
-    }
-    Ok((false, decode_tree_sitter_atom(top, source)?))
-}
-
-fn first_named_child_of_kind<'a>(node: TSNode<'a>, kind: &str) -> Option<TSNode<'a>> {
-    (0..node.named_child_count())
-        .filter_map(|idx| node.named_child(idx))
-        .find(|child| child.kind() == kind)
-}
-
-fn decode_tree_sitter_atom(node: TSNode<'_>, source: &str) -> Result<SExpr> {
-    match node.kind() {
-        "atom" => {
-            let child = (0..node.named_child_count())
-                .filter_map(|idx| node.named_child(idx))
-                .find(|child| child.kind() != "comment")
-                .ok_or_else(|| anyhow!("embedded tree-sitter atom node has no concrete child"))?;
-            decode_tree_sitter_atom(child, source)
-        },
-        "symbol" | "variable" | "string" => {
-            let text = node
-                .utf8_text(source.as_bytes())
-                .map_err(|e| anyhow!("invalid utf8 span from embedded tree-sitter: {e}"))?;
-            Ok(SExpr::Atom(text.to_string()))
-        },
-        "list" => {
-            let mut items = Vec::new();
-            for idx in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(idx) {
-                    if child.kind() == "atom" {
-                        items.push(decode_tree_sitter_atom(child, source)?);
-                    }
-                }
-            }
-            Ok(SExpr::List(items))
-        },
-        other => bail!("unsupported embedded tree-sitter atom node kind '{}'", other),
-    }
+    mettail_languages::tree_sitter_parser::parse_sexpr_via_tree_sitter(dialect_key, input)
+        .map_err(|e| anyhow!("{e}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3279,7 +3188,7 @@ mod tests {
     #[test]
     fn backend_parity_he_fixture_file() {
         let he_spec = load_real_syntax_spec("he");
-        let forms = coalesced_forms("repl/src/examples/petta_adapted/he_minimalmetta.metta");
+        let forms = coalesced_forms("../PeTTa/examples/he_minimalmetta.metta");
         assert!(!forms.is_empty(), "fixture should provide parse inputs");
         assert_backend_parity_for_forms(&he_spec, &forms, "he_minimalmetta");
     }
@@ -3287,7 +3196,7 @@ mod tests {
     #[test]
     fn backend_parity_petta_fixture_file() {
         let petta_spec = load_real_syntax_spec("petta");
-        let forms = coalesced_forms("repl/src/examples/petta_adapted/comments.metta");
+        let forms = coalesced_forms("../PeTTa/examples/comments.metta");
         assert!(!forms.is_empty(), "fixture should provide parse inputs");
         assert_backend_parity_for_forms(&petta_spec, &forms, "petta_comments");
     }

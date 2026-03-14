@@ -3422,10 +3422,19 @@ mod tests {
         )
         .expect("artifact directory should be creatable");
 
+        // Try: repl/src/examples/, src/examples/, or absolute path
         let rel = PathBuf::from(format!("repl/src/examples/{fixture}"));
         let local = PathBuf::from(format!("src/examples/{fixture}"));
-        let input_path = if rel.exists() { rel } else { local };
-        assert!(input_path.exists(), "fixture should exist: {}", input_path.display());
+        let abs = PathBuf::from(fixture);
+        let input_path = if rel.exists() {
+            rel
+        } else if local.exists() {
+            local
+        } else if abs.exists() {
+            abs
+        } else {
+            panic!("fixture not found: tried {}, {}, {}", rel.display(), local.display(), fixture);
+        };
 
         let cmd = format!(
             "run-metta-file {} --report=json --report-file {}",
@@ -3506,8 +3515,8 @@ mod tests {
         )
         .expect("artifact directory should be creatable");
 
-        let rel = PathBuf::from("repl/src/examples/petta_adapted/pln_deduction_demo.metta");
-        let local = PathBuf::from("src/examples/petta_adapted/pln_deduction_demo.metta");
+        let rel = PathBuf::from("../PeTTa/examples/pln_deduction_demo.metta");
+        let local = PathBuf::from("../../PeTTa/examples/pln_deduction_demo.metta");
         let input_path = if rel.exists() { rel } else { local };
         assert!(input_path.exists(), "fixture should exist: {}", input_path.display());
         let cmd = format!(
@@ -3743,7 +3752,7 @@ mod tests {
     #[test]
     fn run_metta_file_petta_comments_fixture_passes() {
         let report = run_petta_fixture_and_read_report(
-            "petta_adapted/comments.metta",
+            "../PeTTa/examples/comments.metta",
             "petta_comments_report",
         );
         assert!(
@@ -3756,7 +3765,7 @@ mod tests {
     #[test]
     fn run_metta_file_petta_constanthead_fixture_passes() {
         let report = run_petta_fixture_and_read_report(
-            "petta_adapted/constanthead.metta",
+            "../PeTTa/examples/constanthead.metta",
             "petta_constanthead_report",
         );
         assert!(
@@ -3769,7 +3778,7 @@ mod tests {
     #[test]
     fn run_metta_file_petta_case_fixture_passes() {
         let report =
-            run_petta_fixture_and_read_report("petta_adapted/case.metta", "petta_case_report");
+            run_petta_fixture_and_read_report("../PeTTa/examples/case.metta", "petta_case_report");
         assert!(
             report.contains("\"failed\":0"),
             "expected zero failures in report, got: {report}"

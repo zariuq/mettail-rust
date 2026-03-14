@@ -1,0 +1,27 @@
+line:; parser drift probe => ok:MeTTailCore.MeTTaSyntax.SyntaxCommand.empty
+line:!(foo) => ok:MeTTailCore.MeTTaSyntax.SyntaxCommand.eval (MeTTailCore.MeTTaIL.Syntax.Pattern.apply "foo" [])
+program:"!\n(foo)\n" => ok:[(1, MeTTailCore.MeTTaSyntax.SyntaxCommand.eval (MeTTailCore.MeTTaIL.Syntax.Pattern.apply "foo" []))]
+line:(= (f a) b) => ok:MeTTailCore.MeTTaSyntax.SyntaxCommand.defineEq
+  (MeTTailCore.MeTTaIL.Syntax.Pattern.apply "f" [MeTTailCore.MeTTaIL.Syntax.Pattern.apply "a" []])
+  (MeTTailCore.MeTTaIL.Syntax.Pattern.apply "b" [])
+line:(= (f a)) => ok:MeTTailCore.MeTTaSyntax.SyntaxCommand.fact
+  (MeTTailCore.MeTTaIL.Syntax.Pattern.apply
+    "="
+    [MeTTailCore.MeTTaIL.Syntax.Pattern.apply "f" [MeTTailCore.MeTTaIL.Syntax.Pattern.apply "a" []]])
+line:(relation! edge tim tom) => ok:MeTTailCore.MeTTaSyntax.SyntaxCommand.relationFact
+  "edge"
+  [MeTTailCore.MeTTaIL.Syntax.Pattern.apply "tim" [], MeTTailCore.MeTTaIL.Syntax.Pattern.apply "tom" []]
+line:(builtin! eq tim tom) => ok:MeTTailCore.MeTTaSyntax.SyntaxCommand.builtinFact
+  "eq"
+  [MeTTailCore.MeTTaIL.Syntax.Pattern.apply "tim" [], MeTTailCore.MeTTaIL.Syntax.Pattern.apply "tom" []]
+line:(in-space &tmp (match foo foo)) => ok:MeTTailCore.MeTTaSyntax.SyntaxCommand.fact
+  (MeTTailCore.MeTTaIL.Syntax.Pattern.apply
+    "in-space"
+    [MeTTailCore.MeTTaIL.Syntax.Pattern.apply "&tmp" [],
+     MeTTailCore.MeTTaIL.Syntax.Pattern.apply
+       "match"
+       [MeTTailCore.MeTTaIL.Syntax.Pattern.apply "foo" [], MeTTailCore.MeTTaIL.Syntax.Pattern.apply "foo" []]])
+line:(declare-memoized! fib) => ok:MeTTailCore.MeTTaSyntax.SyntaxCommand.fact
+  (MeTTailCore.MeTTaIL.Syntax.Pattern.apply "declare-memoized!" [MeTTailCore.MeTTaIL.Syntax.Pattern.apply "fib" []])
+line:!name => ok:MeTTailCore.MeTTaSyntax.SyntaxCommand.eval (MeTTailCore.MeTTaIL.Syntax.Pattern.apply "name" [])
+line:) => ok:MeTTailCore.MeTTaSyntax.SyntaxCommand.fact (MeTTailCore.MeTTaIL.Syntax.Pattern.apply ")" [])

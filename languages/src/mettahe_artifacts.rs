@@ -1,9 +1,9 @@
 use crate::artifact_contract::load_json_with_checksum;
 pub use crate::artifact_contract::{
-    index_rewrite_ir_v2_rules_by_id,
-    parse_rule_ids_from_generated_language, LookupArtifact, LookupContracts, LookupDemand,
-    LookupDemandArg, LookupFamily, RewriteIRArtifact, RewriteIRRule, RewriteIRV2Artifact,
-    RewriteIRV2Rule, TransitionArtifact, TransitionRule, TransitionSemKey, TransitionSource,
+    index_rewrite_ir_v2_rules_by_id, parse_rule_ids_from_generated_language, LookupArtifact,
+    LookupContracts, LookupDemand, LookupDemandArg, LookupFamily, RewriteIRArtifact, RewriteIRRule,
+    RewriteIRV2Artifact, RewriteIRV2Rule, TransitionArtifact, TransitionRule, TransitionSemKey,
+    TransitionSource,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

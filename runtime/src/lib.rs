@@ -79,9 +79,10 @@ pub use oracle::*;
 mod matchings;
 pub use matchings::*;
 
-// Shared bounded transition-graph runner for native backends.
-mod transition_runner;
-pub use transition_runner::*;
+// DELETED: transition_runner.rs was a hand-written PathMap reimplementation.
+// All execution must go through mork::space::Space::metta_calculus() via MM2.
+// mod transition_runner;
+// pub use transition_runner::*;
 
 /// Wrapper that provides `Display` for slices/Vecs of `Display` items.
 ///

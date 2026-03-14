@@ -60,6 +60,28 @@ pub struct RewriteIRRule {
     pub rhs: Option<PatternNode>,
     #[serde(default)]
     pub premises: Vec<PremiseNode>,
+    #[serde(default)]
+    pub lhs_vars: Vec<String>,
+    #[serde(default)]
+    pub premise_var_flow: Vec<RewriteIRV2PremiseVarFlow>,
+    #[serde(default)]
+    pub rhs_vars: Vec<String>,
+    #[serde(default)]
+    pub rhs_fresh_vars: Vec<String>,
+    #[serde(default, alias = "rhs_requires")]
+    pub rhs_eval_requires: Vec<String>,
+    #[serde(default)]
+    pub rule_mode: Option<RewriteRuleMode>,
+    #[serde(default)]
+    pub root_update: Option<RewriteIRV2RootUpdateHint>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteRuleMode {
+    OrdinaryForward,
+    CompatHead,
+    SymbolicOutput,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -286,7 +308,7 @@ pub fn index_rewrite_ir_v2_rules_by_id(
 ) -> Result<BTreeMap<String, RewriteIRV2Rule>, String> {
     let mut indexed = BTreeMap::new();
     for rule in &artifact.rules {
-      if indexed.insert(rule.rule_id.clone(), rule.clone()).is_some() {
+        if indexed.insert(rule.rule_id.clone(), rule.clone()).is_some() {
             return Err(format!(
                 "duplicate rewrite-ir-v2 rule_id '{}' in dialect {}",
                 rule.rule_id, artifact.dialect

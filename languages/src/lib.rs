@@ -12,8 +12,12 @@
 #[cfg(feature = "lang-ambient")]
 pub mod ambient;
 pub mod artifact_contract;
+pub mod compat_head_boundary;
+// DELETED: artifact_runtime.rs was built on native_transition_contract (hand-written PathMap).
+// pub mod artifact_runtime;
 #[cfg(feature = "lang-calculator")]
 pub mod calculator;
+pub mod execution_contract;
 #[cfg(feature = "lang-imp")]
 pub mod imp_artifacts;
 #[cfg(feature = "lang-imp")]
@@ -22,12 +26,15 @@ pub mod imp_from_lean;
 pub mod imp_surface;
 #[cfg(feature = "lang-lambda")]
 pub mod lambda;
+pub mod metta_file;
 #[cfg(feature = "lang-mettafull-legacy")]
 pub mod mettafull_legacy;
 #[cfg(feature = "lang-he")]
 pub mod mettahe_artifacts;
 #[cfg(feature = "lang-he")]
 pub mod mettahe_from_lean;
+#[cfg(feature = "lang-he")]
+pub mod mettahe_surface;
 #[cfg(feature = "lang-minskylite")]
 pub mod minskylite_artifacts;
 #[cfg(feature = "lang-minskylite")]
@@ -36,7 +43,9 @@ pub mod minskylite_from_lean;
 pub mod mm0lite_artifacts;
 #[cfg(feature = "lang-mm0lite")]
 pub mod mm0lite_from_lean;
-pub mod native_transition_contract;
+// DELETED: native_transition_contract.rs was a hand-written MM2 rule dispatcher.
+// All execution must go through mork::space::Space::metta_calculus() via MM2.
+// pub mod native_transition_contract;
 #[cfg(feature = "lang-petta")]
 pub mod petta_artifacts;
 #[cfg(feature = "lang-petta")]
@@ -44,8 +53,11 @@ pub mod petta_from_lean;
 #[cfg(feature = "lang-pyashcore")]
 pub mod pyashcore_from_lean;
 pub mod rewrite_template;
+pub mod scope_contract;
 #[cfg(feature = "lang-rhocalc")]
 pub mod rhocalc;
+pub mod sexpr;
+pub mod tree_sitter_parser;
 
 #[cfg(feature = "mork-backend")]
 pub mod mork_backend;
@@ -54,32 +66,18 @@ pub mod mork_backend;
 ///
 /// This keeps backend wiring language-agnostic at runtime: dispatch resolves by
 /// `(language_name, backend)` registration, not REPL-level special cases.
+// Re-register only language backends that execute through real MM2 ->
+// mork::space::Space::metta_calculus(). The deleted native-transition path
+// must not be reintroduced here.
 #[cfg(feature = "mork-backend")]
 pub fn register_default_core_backends() -> Result<(), String> {
-    #[cfg(feature = "lang-imp")]
+    #[cfg(feature = "lang-petta")]
     mettail_runtime::register_mork_backend_runner(
-        "IMP",
-        imp_from_lean::run_imp_mork_backend,
+        "PeTTa",
+        petta_from_lean::run_petta_mork_backend,
         true,
     )?;
-    #[cfg(feature = "lang-he")]
-    mettail_runtime::register_mork_backend_runner(
-        "MeTTaHE",
-        mettahe_from_lean::run_mettahe_mork_backend,
-        true,
-    )?;
-    #[cfg(feature = "lang-mm0lite")]
-    mettail_runtime::register_mork_backend_runner(
-        "MM0Lite",
-        mm0lite_from_lean::run_mm0lite_mork_backend,
-        true,
-    )?;
-    #[cfg(feature = "lang-minskylite")]
-    mettail_runtime::register_mork_backend_runner(
-        "MinskyLite",
-        minskylite_from_lean::run_minskylite_mork_backend,
-        true,
-    )?;
+
     Ok(())
 }
 
