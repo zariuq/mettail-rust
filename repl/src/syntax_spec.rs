@@ -3,7 +3,8 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const EXPECTED_SYNTAX_SPEC_SCHEMA_VERSION: u64 = 2;
+const MIN_SYNTAX_SPEC_SCHEMA_VERSION: u64 = 2;
+const MAX_SYNTAX_SPEC_SCHEMA_VERSION: u64 = 3;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +88,23 @@ impl Default for DispatchPolicy {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ProgramPolicy {
+    pub explicit_query_only: bool,
+    pub allow_implicit_last_query: bool,
+    pub default_space: String,
+}
+
+impl Default for ProgramPolicy {
+    fn default() -> Self {
+        Self {
+            explicit_query_only: true,
+            allow_implicit_last_query: false,
+            default_space: "&self".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SyntaxSpec {
     pub schema_version: u64,
@@ -97,6 +115,8 @@ pub struct SyntaxSpec {
     pub lowering_heads: LoweringHeads,
     #[serde(default)]
     pub dispatch_policy: DispatchPolicy,
+    #[serde(default)]
+    pub program_policy: ProgramPolicy,
     pub command_heads: Vec<CommandHead>,
     #[serde(default)]
     pub head_aliases: Vec<SugarAlias>,
@@ -169,12 +189,15 @@ fn load_from_paths(json_path: &Path, checksum_path: &Path) -> Result<LoadedSynta
     }
     let spec: SyntaxSpec = serde_json::from_str(json_text)
         .with_context(|| format!("invalid syntax spec json payload at {}", json_path.display()))?;
-    if spec.schema_version != EXPECTED_SYNTAX_SPEC_SCHEMA_VERSION {
+    if spec.schema_version < MIN_SYNTAX_SPEC_SCHEMA_VERSION
+        || spec.schema_version > MAX_SYNTAX_SPEC_SCHEMA_VERSION
+    {
         return Err(anyhow!(
-            "unsupported syntax spec schema_version {} at {} (expected {})",
+            "unsupported syntax spec schema_version {} at {} (expected {}-{})",
             spec.schema_version,
             json_path.display(),
-            EXPECTED_SYNTAX_SPEC_SCHEMA_VERSION
+            MIN_SYNTAX_SPEC_SCHEMA_VERSION,
+            MAX_SYNTAX_SPEC_SCHEMA_VERSION
         ));
     }
     Ok(LoadedSyntaxSpec {
@@ -572,7 +595,7 @@ mod tests {
         );
 
         let payload_schema =
-            payload_unknown.replace("\"schema_version\":2", "\"schema_version\":3");
+            payload_unknown.replace("\"schema_version\":2", "\"schema_version\":99");
         let payload_schema = payload_schema.replace(",\n  \"unknown_field\":true", "");
         let checksum_schema = fnv1a64(&payload_schema);
         fs::write(&json_path, format!("{payload_schema}\n")).expect("json should be writable");

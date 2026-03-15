@@ -15,7 +15,7 @@ use crate::lookup_plan::{
 use crate::syntax_spec::{
     try_load_atom_encoding, try_load_display_profile, try_load_syntax_spec, AtomEncodingSpec,
     CommandHead, DisplayProfile, DispatchPolicy, EvalPrefixPolicy, LexerSpec, LoweringHeads,
-    SyntaxSpec,
+    ProgramPolicy, SyntaxSpec,
 };
 use std::borrow::Cow;
 
@@ -66,6 +66,8 @@ pub enum SurfaceStmt {
     AddAtom { space: String, atom_expr: SExpr },
     RemoveAtom { space: String, atom_expr: SExpr },
     NewSpace { space: String },
+    Import { target_space: String, path: SExpr },
+    SetFuel(u64),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -533,12 +535,10 @@ impl MeTTaSurfaceSession {
                 })
             },
             SurfaceStmt::Eval(expr) => {
-                let core_terms = self.lower_eval_to_core_states(&expr)?;
-                Ok(SurfaceOutcome::EvalMany { core_terms })
+                self.lower_eval_to_outcome(DEFAULT_SPACE_IDENT, &expr)
             },
             SurfaceStmt::EvalIn { space, expr } => {
-                let core_terms = self.lower_eval_to_core_states_in_space(&space, &expr)?;
-                Ok(SurfaceOutcome::EvalMany { core_terms })
+                self.lower_eval_to_outcome(&space, &expr)
             },
             SurfaceStmt::AddAtom { space, atom_expr } => {
                 self.last_surface_diagnostics = None;
@@ -574,6 +574,22 @@ impl MeTTaSurfaceSession {
                     ),
                 })
             },
+            SurfaceStmt::Import { target_space, path } => {
+                self.last_surface_diagnostics = None;
+                Ok(SurfaceOutcome::Mutation {
+                    message: format!(
+                        "import into {}: {} (surface-level import; file loading handled by caller)",
+                        target_space,
+                        mettail_languages::sexpr::render_sexpr(&path)
+                    ),
+                })
+            },
+            SurfaceStmt::SetFuel(n) => {
+                self.last_surface_diagnostics = None;
+                Ok(SurfaceOutcome::Mutation {
+                    message: format!("set fuel to {}", n),
+                })
+            },
         }
     }
 
@@ -592,6 +608,53 @@ impl MeTTaSurfaceSession {
 
     fn lower_eval_to_core_states(&mut self, expr: &SExpr) -> Result<Vec<String>> {
         self.lower_eval_to_core_states_in_space(DEFAULT_SPACE_IDENT, expr)
+    }
+
+    fn lower_eval_to_outcome(&mut self, space: &str, expr: &SExpr) -> Result<SurfaceOutcome> {
+        use crate::surface_lowering::PreparedEval;
+
+        if self.lowering.bypasses_surface_rewriter() {
+            let space_state = self.space_state(space);
+            let prepared = self.lowering.lower_eval_prepared(
+                expr,
+                space_state,
+                self.atom_encoding.as_ref(),
+            )?;
+            match prepared {
+                #[cfg(feature = "lang-petta")]
+                PreparedEval::PeTTa(program) => {
+                    self.last_surface_diagnostics = Some(SurfaceEvalDiagnostics {
+                        steps: 0, frontier_terms: 0, max_frontier: 0,
+                        rewrite_calls: 0, cache_hits: 0, cache_misses: 0,
+                        candidate_rules: 0, rule_checks: 0, rule_matches: 0,
+                        child_rewrites: 0, ground_rewrites: 0,
+                        memo_hits: 0, memo_misses: 0, memo_stores: 0,
+                        memo_in_progress_blocks: 0, truncated_by_branch_cap: 0,
+                        truncated_by_outcome_cap: false, hit_step_cap: false,
+                        normal_forms: program.queries.len(),
+                        elapsed_ms: 0.0,
+                    });
+                    return Ok(SurfaceOutcome::EvalPreparedPeTTa(program));
+                },
+                PreparedEval::Text(terms) => {
+                    self.last_surface_diagnostics = Some(SurfaceEvalDiagnostics {
+                        steps: 0, frontier_terms: 0, max_frontier: 0,
+                        rewrite_calls: 0, cache_hits: 0, cache_misses: 0,
+                        candidate_rules: 0, rule_checks: 0, rule_matches: 0,
+                        child_rewrites: 0, ground_rewrites: 0,
+                        memo_hits: 0, memo_misses: 0, memo_stores: 0,
+                        memo_in_progress_blocks: 0, truncated_by_branch_cap: 0,
+                        truncated_by_outcome_cap: false, hit_step_cap: false,
+                        normal_forms: terms.len(),
+                        elapsed_ms: 0.0,
+                    });
+                    return Ok(SurfaceOutcome::EvalMany { core_terms: terms });
+                },
+            }
+        }
+
+        let core_terms = self.lower_eval_to_core_states_in_space(space, expr)?;
+        Ok(SurfaceOutcome::EvalMany { core_terms })
     }
 
     fn lower_eval_to_core_states_in_space(
@@ -1619,6 +1682,7 @@ fn legacy_builtin_syntax_spec() -> &'static SyntaxSpec {
         },
         lowering_heads: LoweringHeads::default(),
         dispatch_policy: DispatchPolicy::default(),
+        program_policy: ProgramPolicy::default(),
         command_heads: vec![
             CommandHead {
                 head: "=".to_string(),
@@ -1743,17 +1807,48 @@ fn classify_surface_stmt_from_expr(
         None => legacy_builtin_syntax_spec(),
     };
     if let SExpr::List(items) = &expr {
-        if items.len() == 3 {
+        if items.len() >= 2 {
             if let SExpr::Atom(head) = &items[0] {
+                let tail = &items[1..];
                 match command_for_head(head, syntax_spec) {
-                    Some(KnownCommand::DefineEq) => {
-                        return Ok(Some(SurfaceStmt::DefineEq(items[1].clone(), items[2].clone())));
-                    },
-                    Some(KnownCommand::DefineType) => {
-                        return Ok(Some(SurfaceStmt::DefineType(
-                            items[1].clone(),
-                            items[2].clone(),
+                    Some(KnownCommand::DefineEq) if tail.len() == 2 => {
+                        return Ok(Some(SurfaceStmt::DefineEq(
+                            tail[0].clone(),
+                            tail[1].clone(),
                         )));
+                    },
+                    Some(KnownCommand::DefineType) if tail.len() == 2 => {
+                        return Ok(Some(SurfaceStmt::DefineType(
+                            tail[0].clone(),
+                            tail[1].clone(),
+                        )));
+                    },
+                    Some(KnownCommand::Import) if tail.len() == 1 => {
+                        let default_space = syntax_spec
+                            .program_policy
+                            .default_space
+                            .clone();
+                        return Ok(Some(SurfaceStmt::Import {
+                            target_space: default_space,
+                            path: tail[0].clone(),
+                        }));
+                    },
+                    Some(KnownCommand::Import) if tail.len() == 2 => {
+                        let target_space = match &tail[0] {
+                            SExpr::Atom(s) => s.clone(),
+                            other => mettail_languages::sexpr::render_sexpr(other),
+                        };
+                        return Ok(Some(SurfaceStmt::Import {
+                            target_space,
+                            path: tail[1].clone(),
+                        }));
+                    },
+                    Some(KnownCommand::SetFuel) if tail.len() == 1 => {
+                        if let SExpr::Atom(n_str) = &tail[0] {
+                            if let Ok(n) = n_str.parse::<u64>() {
+                                return Ok(Some(SurfaceStmt::SetFuel(n)));
+                            }
+                        }
                     },
                     _ => {},
                 }
@@ -1801,6 +1896,8 @@ enum KnownCommand {
     NewSpace,
     DeclareMemoized,
     InSpace,
+    Import,
+    SetFuel,
 }
 
 fn known_command_from_name(name: &str) -> Option<KnownCommand> {
@@ -1812,6 +1909,8 @@ fn known_command_from_name(name: &str) -> Option<KnownCommand> {
         "newSpace" => Some(KnownCommand::NewSpace),
         "declareMemoized" => Some(KnownCommand::DeclareMemoized),
         "inSpace" => Some(KnownCommand::InSpace),
+        "import" => Some(KnownCommand::Import),
+        "setFuel" => Some(KnownCommand::SetFuel),
         _ => None,
     }
 }
@@ -1964,6 +2063,11 @@ fn retarget_surface_stmt(stmt: SurfaceStmt, default_space: &str) -> SurfaceStmt 
             space: remap_stmt_space(space, default_space),
         },
         SurfaceStmt::AllocSpace => SurfaceStmt::AllocSpace,
+        SurfaceStmt::Import { target_space, path } => SurfaceStmt::Import {
+            target_space: remap_stmt_space(target_space, default_space),
+            path,
+        },
+        SurfaceStmt::SetFuel(n) => SurfaceStmt::SetFuel(n),
     }
 }
 
@@ -2044,10 +2148,12 @@ fn parse_eval_space_stmt(
     None
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceOutcome {
     Mutation { message: String },
     EvalMany { core_terms: Vec<String> },
+    /// Structured PeTTa evaluation — bypasses text round-trip.
+    #[cfg(feature = "lang-petta")]
+    EvalPreparedPeTTa(mettail_languages::petta_from_lean::PreparedPeTTaProgram),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2954,6 +3060,7 @@ mod tests {
             },
             lowering_heads: LoweringHeads::default(),
             dispatch_policy: DispatchPolicy::default(),
+            program_policy: ProgramPolicy::default(),
             command_heads,
             head_aliases: vec![],
             eval_space_aliases: vec![],
@@ -4469,5 +4576,203 @@ mod tests {
                 .any(|d| d.contains("C_Return(C_AFalse)")),
             "expected match 7 8 to return false, got: {displays_neq:?}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "lang-petta"))]
+mod syntax_spec_authority_tests {
+    use super::*;
+    use crate::syntax_spec::{
+        CommandHead, DispatchPolicy, EvalPrefixPolicy, LexerSpec, LoweringHeads,
+        ProgramPolicy, SyntaxSpec,
+    };
+
+    fn make_petta_style_spec(command_heads: Vec<CommandHead>) -> SyntaxSpec {
+        SyntaxSpec {
+            schema_version: 3,
+            dialect: "TestPeTTa".to_string(),
+            lexer: LexerSpec {
+                line_comment_start: Some(";".to_string()),
+                supports_string_literals: true,
+                string_delimiter: "\"".to_string(),
+                escape_char: "\\".to_string(),
+                sexpr_open: "(".to_string(),
+                sexpr_close: ")".to_string(),
+                allow_hash_in_symbol: true,
+                reserve_hash_in_variable: true,
+                trim_ascii_whitespace: true,
+            },
+            eval_prefix: EvalPrefixPolicy {
+                prefix: "!".to_string(),
+                allow_whitespace_after_prefix: true,
+                allow_newline_after_prefix: true,
+                bang_prefixed_word_is_symbol: false,
+            },
+            lowering_heads: LoweringHeads::default(),
+            dispatch_policy: DispatchPolicy::default(),
+            program_policy: ProgramPolicy {
+                explicit_query_only: true,
+                allow_implicit_last_query: false,
+                default_space: "&self".to_string(),
+            },
+            command_heads,
+            head_aliases: vec![],
+            eval_space_aliases: vec![],
+            predicate_special_heads: vec![],
+        }
+    }
+
+    #[test]
+    fn petta_rule_via_syntax_spec_command_heads() {
+        let spec = make_petta_style_spec(vec![CommandHead {
+            head: "=".to_string(),
+            command: "defineEq".to_string(),
+            arity_min: 2,
+            arity_max: Some(2),
+        }]);
+        let expr = SExpr::List(vec![
+            SExpr::Atom("=".to_string()),
+            SExpr::Atom("foo".to_string()),
+            SExpr::Atom("bar".to_string()),
+        ]);
+        let result = classify_surface_stmt_from_expr(expr, false, Some(&spec))
+            .expect("classify should succeed")
+            .expect("should produce a statement");
+        assert!(
+            matches!(result, SurfaceStmt::DefineEq(_, _)),
+            "expected DefineEq, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn petta_import_via_syntax_spec_command_heads() {
+        let spec = make_petta_style_spec(vec![CommandHead {
+            head: "import!".to_string(),
+            command: "import".to_string(),
+            arity_min: 1,
+            arity_max: Some(2),
+        }]);
+        // Single-arg import: (import! "path.metta")
+        let expr1 = SExpr::List(vec![
+            SExpr::Atom("import!".to_string()),
+            SExpr::Atom("path.metta".to_string()),
+        ]);
+        let result1 = classify_surface_stmt_from_expr(expr1, false, Some(&spec))
+            .expect("classify should succeed")
+            .expect("should produce a statement");
+        match &result1 {
+            SurfaceStmt::Import { target_space, path } => {
+                assert_eq!(target_space, "&self");
+                assert_eq!(*path, SExpr::Atom("path.metta".to_string()));
+            },
+            other => panic!("expected Import, got: {:?}", other),
+        }
+
+        // Two-arg import: (import! &target "path.metta")
+        let expr2 = SExpr::List(vec![
+            SExpr::Atom("import!".to_string()),
+            SExpr::Atom("&target".to_string()),
+            SExpr::Atom("path.metta".to_string()),
+        ]);
+        let result2 = classify_surface_stmt_from_expr(expr2, false, Some(&spec))
+            .expect("classify should succeed")
+            .expect("should produce a statement");
+        match &result2 {
+            SurfaceStmt::Import { target_space, path } => {
+                assert_eq!(target_space, "&target");
+                assert_eq!(*path, SExpr::Atom("path.metta".to_string()));
+            },
+            other => panic!("expected Import, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn petta_fact_fallback_via_dispatch_policy() {
+        let spec = make_petta_style_spec(vec![CommandHead {
+            head: "=".to_string(),
+            command: "defineEq".to_string(),
+            arity_min: 2,
+            arity_max: Some(2),
+        }]);
+        // Unknown head with fallback_unknown_head_to_fact = true → Eval (fact-like)
+        let expr = SExpr::List(vec![
+            SExpr::Atom("unknown".to_string()),
+            SExpr::Atom("a".to_string()),
+            SExpr::Atom("b".to_string()),
+        ]);
+        let result = classify_surface_stmt_from_expr(expr, false, Some(&spec))
+            .expect("classify should succeed")
+            .expect("should produce a statement");
+        // Unknown head that isn't a command → falls through to Eval
+        assert!(
+            matches!(result, SurfaceStmt::Eval(_)),
+            "expected Eval (fallback), got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn petta_set_fuel_via_syntax_spec() {
+        let spec = make_petta_style_spec(vec![CommandHead {
+            head: "set-fuel".to_string(),
+            command: "setFuel".to_string(),
+            arity_min: 1,
+            arity_max: Some(1),
+        }]);
+        let expr = SExpr::List(vec![
+            SExpr::Atom("set-fuel".to_string()),
+            SExpr::Atom("100".to_string()),
+        ]);
+        let result = classify_surface_stmt_from_expr(expr, false, Some(&spec))
+            .expect("classify should succeed")
+            .expect("should produce a statement");
+        assert!(
+            matches!(result, SurfaceStmt::SetFuel(100)),
+            "expected SetFuel(100), got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn petta_eval_form_classified_as_query() {
+        let spec = make_petta_style_spec(vec![]);
+        // force_eval=true → treated as Eval/query
+        let expr = SExpr::List(vec![
+            SExpr::Atom("some-query".to_string()),
+            SExpr::Atom("arg".to_string()),
+        ]);
+        let result = classify_surface_stmt_from_expr(expr, true, Some(&spec))
+            .expect("classify should succeed")
+            .expect("should produce a statement");
+        assert!(
+            matches!(result, SurfaceStmt::Eval(_)),
+            "expected Eval, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn petta_import_uses_default_space_from_program_policy() {
+        let mut spec = make_petta_style_spec(vec![CommandHead {
+            head: "import!".to_string(),
+            command: "import".to_string(),
+            arity_min: 1,
+            arity_max: Some(2),
+        }]);
+        spec.program_policy.default_space = "&custom".to_string();
+        let expr = SExpr::List(vec![
+            SExpr::Atom("import!".to_string()),
+            SExpr::Atom("path.metta".to_string()),
+        ]);
+        let result = classify_surface_stmt_from_expr(expr, false, Some(&spec))
+            .expect("classify should succeed")
+            .expect("should produce a statement");
+        match &result {
+            SurfaceStmt::Import { target_space, .. } => {
+                assert_eq!(target_space, "&custom");
+            },
+            other => panic!("expected Import, got: {:?}", other),
+        }
     }
 }

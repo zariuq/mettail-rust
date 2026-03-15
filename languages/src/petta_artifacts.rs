@@ -34,8 +34,85 @@ use crate::scope_contract::{
     load_scope_contract_artifact_from_dir, ordered_free_vars_with_scope_contract,
     ScopeContractArtifact, ScopeKind,
 };
+use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// §0 Bundle Manifest (schema v3)
+// ---------------------------------------------------------------------------
+
+/// An artifact entry in the bundle manifest.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestArtifactEntry {
+    pub name: String,
+    pub sha256: String,
+}
+
+/// The top-level PeTTa bundle manifest.
+/// This is the integrity root for the artifact bundle (schema v3+).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PeTTaBundleManifest {
+    pub schema_version: u64,
+    pub dialect: String,
+    pub semantics_variant: String,
+    pub stage: String,
+    pub program_fingerprint: Option<String>,
+    pub artifacts: Vec<ManifestArtifactEntry>,
+}
+
+/// Load the optional bundle manifest from a directory.
+pub fn load_manifest(dir: &Path) -> Result<Option<PeTTaBundleManifest>, String> {
+    let manifest_path = dir.join("petta.manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("failed reading manifest {}: {}", manifest_path.display(), e))?;
+    let manifest: PeTTaBundleManifest = serde_json::from_str(text.trim())
+        .map_err(|e| format!("invalid manifest {}: {}", manifest_path.display(), e))?;
+    Ok(Some(manifest))
+}
+
+/// Validate all artifact file digests against the manifest.
+pub fn validate_manifest_digests(manifest: &PeTTaBundleManifest, dir: &Path) -> Result<(), String> {
+    for entry in &manifest.artifacts {
+        let artifact_path = dir.join(&entry.name);
+        if !artifact_path.is_file() {
+            return Err(format!(
+                "manifest references {} but file not found at {}",
+                entry.name, artifact_path.display()
+            ));
+        }
+        let content = std::fs::read_to_string(&artifact_path)
+            .map_err(|e| format!("failed reading {}: {}", artifact_path.display(), e))?;
+        // Hash raw file content (including trailing newline) to match Lean's IO.FS.readFile
+        let actual_sha256 = crate::artifact_contract::sha256_hex(&content);
+        if actual_sha256 != entry.sha256 {
+            return Err(format!(
+                "SHA-256 mismatch for {}: manifest says {}, file has {}",
+                entry.name, entry.sha256, actual_sha256
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Cross-validate that manifest and native profile agree on semantics_variant.
+pub fn validate_manifest_profile_agreement(
+    manifest: &PeTTaBundleManifest,
+    profile: &crate::native_profile::PeTTaNativeProfileArtifact,
+) -> Result<(), String> {
+    if !profile.semantics_variant.is_empty()
+        && manifest.semantics_variant != profile.semantics_variant
+    {
+        return Err(format!(
+            "semantics_variant mismatch: manifest='{}', native_profile='{}'",
+            manifest.semantics_variant, profile.semantics_variant
+        ));
+    }
+    Ok(())
+}
 
 /// A PeTTa rewrite rule in its abstract form (pre-artifact).
 /// This is what the surface parser produces from `(= lhs rhs)` definitions.
@@ -45,6 +122,123 @@ pub struct PeTTaRule {
     pub left: PatternNode,
     pub right: PatternNode,
     pub premises: Vec<PremiseNode>,
+}
+
+// ---------------------------------------------------------------------------
+// Lean AOT bridge: serialize PeTTaRules to JSON for Lean ingestion
+// ---------------------------------------------------------------------------
+
+/// Serialize a `PatternNode` to JSON matching the Lean-side `parsePatternJson`
+/// format: `{ "kind": "apply", "ctor": "foo", "args": [...] }`.
+fn pattern_node_to_json(p: &PatternNode) -> String {
+    match p {
+        PatternNode::Fvar { name } => format!(r#"{{"kind":"fvar","name":{}}}"#, json_str(name)),
+        PatternNode::Bvar { index } => format!(r#"{{"kind":"bvar","index":{}}}"#, index),
+        PatternNode::Apply { ctor, args } => {
+            let args_json: Vec<String> = args.iter().map(pattern_node_to_json).collect();
+            format!(
+                r#"{{"kind":"apply","ctor":{},"args":[{}]}}"#,
+                json_str(ctor),
+                args_json.join(",")
+            )
+        }
+        PatternNode::Lambda { body } => {
+            format!(r#"{{"kind":"lambda","body":{}}}"#, pattern_node_to_json(body))
+        }
+        PatternNode::MultiLambda { arity, body } => {
+            format!(
+                r#"{{"kind":"multi_lambda","arity":{},"body":{}}}"#,
+                arity,
+                pattern_node_to_json(body)
+            )
+        }
+        PatternNode::Subst { body, repl } => {
+            format!(
+                r#"{{"kind":"subst","fn":{},"arg":{}}}"#,
+                pattern_node_to_json(body),
+                pattern_node_to_json(repl)
+            )
+        }
+        PatternNode::Collection {
+            collection_type,
+            elements,
+            rest,
+        } => {
+            let elems_json: Vec<String> = elements.iter().map(pattern_node_to_json).collect();
+            let rest_json = match rest {
+                Some(r) => format!(",\"rest\":{}", json_str(r)),
+                None => String::new(),
+            };
+            format!(
+                r#"{{"kind":"collection","collection_type":{},"elements":[{}]{}}}"#,
+                json_str(collection_type),
+                elems_json.join(","),
+                rest_json
+            )
+        }
+    }
+}
+
+/// Serialize a `PremiseNode` to JSON matching the Lean-side `parsePremiseJson`.
+fn premise_node_to_json(p: &PremiseNode) -> String {
+    match p {
+        PremiseNode::RelationQuery { relation, args } => {
+            let args_json: Vec<String> = args.iter().map(pattern_node_to_json).collect();
+            format!(
+                r#"{{"kind":"relation_query","relation":{},"args":[{}]}}"#,
+                json_str(relation),
+                args_json.join(",")
+            )
+        }
+        PremiseNode::Freshness { var_name, term } => {
+            format!(
+                r#"{{"kind":"freshness","var":{},"pattern":{}}}"#,
+                json_str(var_name),
+                pattern_node_to_json(term)
+            )
+        }
+        PremiseNode::Congruence { lhs, rhs } => {
+            format!(
+                r#"{{"kind":"congruence","left":{},"right":{}}}"#,
+                pattern_node_to_json(lhs),
+                pattern_node_to_json(rhs)
+            )
+        }
+    }
+}
+
+/// Escape a string for JSON output.
+fn json_str(s: &str) -> String {
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    )
+}
+
+/// Serialize a set of `PeTTaRule`s to the JSON format consumed by the Lean
+/// AOT bridge (`export_petta_native_profile_from_json.lean`).
+///
+/// The output is a JSON object with `"rules"` and `"facts"` arrays.
+pub fn serialize_rules_for_lean_export(rules: &[PeTTaRule]) -> String {
+    let rules_json: Vec<String> = rules
+        .iter()
+        .map(|r| {
+            let premises_json: Vec<String> =
+                r.premises.iter().map(premise_node_to_json).collect();
+            format!(
+                r#"{{"name":{},"left":{},"right":{},"premises":[{}]}}"#,
+                json_str(&r.name),
+                pattern_node_to_json(&r.left),
+                pattern_node_to_json(&r.right),
+                premises_json.join(",")
+            )
+        })
+        .collect();
+    format!(r#"{{"rules":[{}],"facts":[]}}"#, rules_json.join(","))
 }
 
 /// Source dispatch key: (head_tag, arity).
@@ -484,7 +678,7 @@ pub fn build_petta_rewrite_ir(rules: &[PeTTaRule]) -> Result<RewriteIRArtifact, 
     })
 }
 
-fn petta_transition_search_paths() -> Vec<PathBuf> {
+pub(crate) fn petta_transition_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(dir) = std::env::var("METTAIL_PETTA_EXECUTION_CONTRACT_DIR") {
         paths.push(PathBuf::from(dir));
@@ -994,6 +1188,7 @@ pub struct PeTTaArtifactBundle {
     pub rewrite_ir: RewriteIRArtifact,
     pub execution_contract: Option<ExecutionContractArtifact>,
     pub scope_contract: Option<ScopeContractArtifact>,
+    pub native_profile: Option<crate::native_profile::PeTTaNativeProfileArtifact>,
 }
 
 pub fn build_petta_artifact_bundle(rules: &[PeTTaRule]) -> Result<PeTTaArtifactBundle, String> {
@@ -1003,12 +1198,33 @@ pub fn build_petta_artifact_bundle(rules: &[PeTTaRule]) -> Result<PeTTaArtifactB
     let rewrite_ir = build_petta_rewrite_ir(rules)?;
     let execution_contract = load_optional_petta_execution_contract_artifact()?;
     let scope_contract = load_optional_petta_scope_contract_artifact()?;
+    let native_profile = crate::native_profile::load_optional_petta_native_profile_artifact()?;
+
+    // Try manifest-first validation if available
+    for dir in petta_transition_search_paths() {
+        if let Ok(Some(manifest)) = load_manifest(&dir) {
+            if let Err(e) = validate_manifest_digests(&manifest, &dir) {
+                eprintln!("warning: manifest validation failed at {}: {}", dir.display(), e);
+            } else {
+                eprintln!("manifest validated at {} ({} artifacts)", dir.display(), manifest.artifacts.len());
+                // Cross-validate manifest↔profile agreement
+                if let Some(ref profile) = native_profile {
+                    if let Err(e) = validate_manifest_profile_agreement(&manifest, profile) {
+                        return Err(e);
+                    }
+                }
+            }
+            break;
+        }
+    }
+
     Ok(PeTTaArtifactBundle {
         transition,
         lookup,
         rewrite_ir,
         execution_contract,
         scope_contract,
+        native_profile,
     })
 }
 
@@ -2289,4 +2505,74 @@ mod tests {
         assert!(err.contains("relation_query"));
     }
     END of commented-out PeTTaArtifactRuntime tests */
+
+    #[test]
+    fn test_serialize_rules_for_lean_export_roundtrip() {
+        let rules = vec![
+            PeTTaRule {
+                name: "ordinary".to_string(),
+                left: PatternNode::Apply {
+                    ctor: "foo".to_string(),
+                    args: vec![PatternNode::Fvar {
+                        name: "X".to_string(),
+                    }],
+                },
+                right: PatternNode::Apply {
+                    ctor: "bar".to_string(),
+                    args: vec![PatternNode::Fvar {
+                        name: "X".to_string(),
+                    }],
+                },
+                premises: vec![],
+            },
+            PeTTaRule {
+                name: "with_premise".to_string(),
+                left: PatternNode::Apply {
+                    ctor: "lookup".to_string(),
+                    args: vec![PatternNode::Fvar {
+                        name: "X".to_string(),
+                    }],
+                },
+                right: PatternNode::Fvar {
+                    name: "Z".to_string(),
+                },
+                premises: vec![PremiseNode::RelationQuery {
+                    relation: "spaceMatch".to_string(),
+                    args: vec![
+                        PatternNode::Fvar { name: "X".to_string() },
+                        PatternNode::Fvar { name: "Y".to_string() },
+                        PatternNode::Fvar { name: "Z".to_string() },
+                    ],
+                }],
+            },
+        ];
+
+        let json = serialize_rules_for_lean_export(&rules);
+
+        // Verify it's valid JSON
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("serialized JSON must parse");
+        let rules_arr = parsed["rules"].as_array().expect("rules array");
+        assert_eq!(rules_arr.len(), 2);
+
+        // Check first rule
+        assert_eq!(rules_arr[0]["name"], "ordinary");
+        assert_eq!(rules_arr[0]["left"]["kind"], "apply");
+        assert_eq!(rules_arr[0]["left"]["ctor"], "foo");
+        assert_eq!(rules_arr[0]["left"]["args"][0]["kind"], "fvar");
+        assert_eq!(rules_arr[0]["left"]["args"][0]["name"], "X");
+        assert_eq!(rules_arr[0]["premises"].as_array().unwrap().len(), 0);
+
+        // Check second rule (premise_aware)
+        assert_eq!(rules_arr[1]["name"], "with_premise");
+        assert_eq!(rules_arr[1]["premises"][0]["kind"], "relation_query");
+        assert_eq!(rules_arr[1]["premises"][0]["relation"], "spaceMatch");
+        assert_eq!(
+            rules_arr[1]["premises"][0]["args"].as_array().unwrap().len(),
+            3
+        );
+
+        // Verify facts is empty
+        assert_eq!(parsed["facts"].as_array().unwrap().len(), 0);
+    }
 }

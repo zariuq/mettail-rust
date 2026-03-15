@@ -2267,6 +2267,16 @@ fn eval_new_space(ctx: &mut EvalContext) -> Result<Vec<PatternNode>, String> {
     Ok(vec![sym(&handle)])
 }
 
+/// Compute a memo cache key for a ground pure call (legacy evaluator only).
+///
+/// **Legacy-only**: This function is used by `eval_user_rules` in the disabled
+/// handwritten evaluator (behind `legacy-petta-direct-eval` feature flag).
+/// The MORK/MM2 production path does NOT have per-call memo caching.
+///
+/// When MORK caching is added, it should consult
+/// `native_profile::authoritative_memo_eligible(authority, source_head)`
+/// before caching. That function is implemented and tested — it checks the
+/// native profile's `memo_eligible` field for all rules matching the head.
 fn pure_call_memo_key(term: &PatternNode) -> Option<String> {
     if !is_ground_pure_call(term) {
         return None;
@@ -2554,6 +2564,106 @@ impl PeTTaTerm {
     }
 }
 
+/// A PeTTa program ready for backend execution — built from classified
+/// `SyntaxCommand`s, no text re-parsing needed.
+///
+/// Every `SyntaxCommand` variant is handled explicitly. Commands that cannot
+/// be part of a prepared program (Import, NewSpace, AddAtom, RemoveAtom) error
+/// because they must be resolved at a higher level before program building.
+#[derive(Debug, Clone)]
+pub struct PreparedPeTTaProgram {
+    pub space: PeTTaSpace,
+    pub queries: Vec<PatternNode>,
+}
+
+impl PreparedPeTTaProgram {
+    /// Build from a sequence of classified `SyntaxCommand`s.
+    pub fn from_syntax_commands(
+        cmds: &[crate::surface_spec::SyntaxCommand],
+    ) -> Result<Self, String> {
+        use crate::sexpr::sexpr_to_pattern;
+        use crate::surface_spec::SyntaxCommand;
+
+        let mut space = PeTTaSpace::empty();
+        let mut queries = Vec::new();
+
+        for (idx, cmd) in cmds.iter().enumerate() {
+            match cmd {
+                SyntaxCommand::Empty => {},
+                SyntaxCommand::DefineEq(lhs, rhs) => {
+                    let left = sexpr_to_pattern(lhs)?;
+                    let right = sexpr_to_pattern(rhs)?;
+                    space.add_rule(PeTTaRule {
+                        name: format!("rule_{}", idx + 1),
+                        left,
+                        right,
+                        premises: vec![],
+                    });
+                },
+                SyntaxCommand::Fact(sexpr) => {
+                    space.add_atom(sexpr_to_pattern(sexpr)?);
+                },
+                SyntaxCommand::Eval(sexpr) => {
+                    queries.push(sexpr_to_pattern(sexpr)?);
+                },
+                SyntaxCommand::DefineType(_atom, _ty) => {
+                    // Type annotations: PeTTa backend does not yet implement a type system.
+                    // Intentionally ignored — not stored as facts because PeTTa facts are
+                    // rewrite rules, and (: x T) is not a rewrite.
+                },
+                SyntaxCommand::SetFuel(_) => {
+                    // Runtime tuning — handled by caller, not by program builder.
+                },
+                SyntaxCommand::Import { .. } => {
+                    return Err(
+                        "import! must be resolved before building PreparedPeTTaProgram".into(),
+                    );
+                },
+                SyntaxCommand::NewSpace { .. } => {
+                    return Err(
+                        "new-space! must be resolved before building PreparedPeTTaProgram".into(),
+                    );
+                },
+                SyntaxCommand::AddAtom { .. } => {
+                    return Err(
+                        "add-atom! must be resolved before building PreparedPeTTaProgram".into(),
+                    );
+                },
+                SyntaxCommand::RemoveAtom { .. } => {
+                    return Err(
+                        "remove-atom! must be resolved before building PreparedPeTTaProgram".into(),
+                    );
+                },
+                SyntaxCommand::RelationFact { .. } | SyntaxCommand::BuiltinFact { .. } => {
+                    return Err(
+                        "relation!/builtin! facts not yet supported in PreparedPeTTaProgram"
+                            .into(),
+                    );
+                },
+                SyntaxCommand::Directive { name, .. } => {
+                    return Err(format!(
+                        "unsupported directive '{}' in PreparedPeTTaProgram",
+                        name
+                    ));
+                },
+            }
+        }
+
+        Ok(PreparedPeTTaProgram { space, queries })
+    }
+
+    /// Convert to a `PeTTaTerm` (for backend execution).
+    /// Uses the first query, or errors if no queries.
+    pub fn into_term(self) -> Result<PeTTaTerm, String> {
+        let query = self
+            .queries
+            .into_iter()
+            .next()
+            .ok_or("PreparedPeTTaProgram has no queries")?;
+        Ok(PeTTaTerm::new(self.space, query))
+    }
+}
+
 pub fn load_petta_surface_program_from_path(
     file_path: &Path,
     library_aliases: &[mettail_runtime::LibraryAliasDef],
@@ -2593,8 +2703,9 @@ pub fn parse_petta_term_from_surface_file_path(
     file_path: &Path,
     library_aliases: &[mettail_runtime::LibraryAliasDef],
 ) -> Result<PeTTaTerm, String> {
+    let spec = petta_surface_spec()?;
     let program = load_petta_surface_program_from_path(file_path, library_aliases)?;
-    let (space, query) = parse_petta_program(&program)?;
+    let (space, query) = parse_petta_program(&program, spec)?;
     Ok(PeTTaTerm::new(space, query))
 }
 
@@ -3759,39 +3870,86 @@ fn load_petta_grounded_builtin_contract_for_node(
 }
 
 #[cfg(feature = "mork-backend")]
-fn compile_i32_intrinsic_arg(node: &PatternNode) -> Result<MorkSExpr, String> {
+fn compile_i32_intrinsic_arg(
+    node: &PatternNode,
+    eval_ctx: Option<(&PeTTaSpace, MorkExecutionLimits)>,
+) -> Result<MorkSExpr, String> {
     match node {
         PatternNode::Fvar { .. } => return i32_symbol_expr(node),
         PatternNode::Apply { args, .. } if args.is_empty() => return i32_symbol_expr(node),
         _ => {},
     }
-    match compile_numeric_intrinsic_expr(node)? {
+    match compile_numeric_intrinsic_expr(node, eval_ctx)? {
         Some(lowered) if lowered.kind == NumericExprKind::I32 => Ok(lowered.expr),
         Some(_) => Err(format!(
             "PeTTa real MORK backend expected integer-shaped nested numeric term, got float-shaped term {:?}",
             node
         )),
-        None => Err(format!(
-            "PeTTa real MORK backend does not yet lower nested non-numeric integer intrinsic term {:?}",
-            node
-        )),
+        None => {
+            // Not a numeric intrinsic — try evaluating the subterm if we have a runtime context.
+            // STRICT GUARDS: single result, no state effects, numeric literal.
+            if let Some((space, limits)) = eval_ctx {
+                let nested = PeTTaTerm::new(space.clone(), node.clone());
+                let run = eval_nested_mm2_or_residual(&nested, limits)?;
+                if !run.self_updates.is_empty() {
+                    return Err(format!(
+                        "nested subterm has state effects; cannot use as i32 intrinsic arg: {:?}",
+                        node
+                    ));
+                }
+                if run.results.len() != 1 {
+                    return Err(format!(
+                        "nested subterm produced {} results (expected 1); cannot use as i32 intrinsic arg: {:?}",
+                        run.results.len(), node
+                    ));
+                }
+                return i32_symbol_expr(&run.results[0]);
+            }
+            Err(format!(
+                "PeTTa real MORK backend does not yet lower nested non-numeric integer intrinsic term {:?}",
+                node
+            ))
+        },
     }
 }
 
 #[cfg(feature = "mork-backend")]
-fn compile_f64_intrinsic_arg(node: &PatternNode) -> Result<MorkSExpr, String> {
+fn compile_f64_intrinsic_arg(
+    node: &PatternNode,
+    eval_ctx: Option<(&PeTTaSpace, MorkExecutionLimits)>,
+) -> Result<MorkSExpr, String> {
     match node {
         PatternNode::Fvar { .. } => return f64_symbol_expr(node),
         PatternNode::Apply { args, .. } if args.is_empty() => return f64_symbol_expr(node),
         _ => {},
     }
-    match compile_numeric_intrinsic_expr(node)? {
+    match compile_numeric_intrinsic_expr(node, eval_ctx)? {
         Some(lowered) if lowered.kind == NumericExprKind::F64 => Ok(lowered.expr),
         Some(lowered) => Ok(mm2_call("i32_as_f64", vec![lowered.expr])),
-        None => Err(format!(
-            "PeTTa real MORK backend does not yet lower nested non-numeric float intrinsic term {:?}",
-            node
-        )),
+        None => {
+            // Not a numeric intrinsic — try evaluating the subterm if we have a runtime context.
+            if let Some((space, limits)) = eval_ctx {
+                let nested = PeTTaTerm::new(space.clone(), node.clone());
+                let run = eval_nested_mm2_or_residual(&nested, limits)?;
+                if !run.self_updates.is_empty() {
+                    return Err(format!(
+                        "nested subterm has state effects; cannot use as f64 intrinsic arg: {:?}",
+                        node
+                    ));
+                }
+                if run.results.len() != 1 {
+                    return Err(format!(
+                        "nested subterm produced {} results (expected 1); cannot use as f64 intrinsic arg: {:?}",
+                        run.results.len(), node
+                    ));
+                }
+                return f64_symbol_expr(&run.results[0]);
+            }
+            Err(format!(
+                "PeTTa real MORK backend does not yet lower nested non-numeric float intrinsic term {:?}",
+                node
+            ))
+        },
     }
 }
 
@@ -3811,8 +3969,9 @@ fn numeric_result_shape_for_contract(
 fn compile_i32_numeric_expr(
     ctor: &str,
     args: &[PatternNode],
+    eval_ctx: Option<(&PeTTaSpace, MorkExecutionLimits)>,
 ) -> Result<Option<LoweredNumericExpr>, String> {
-    let compiled_args: Result<Vec<_>, _> = args.iter().map(compile_i32_intrinsic_arg).collect();
+    let compiled_args: Result<Vec<_>, _> = args.iter().map(|a| compile_i32_intrinsic_arg(a, eval_ctx)).collect();
     let compiled_args = compiled_args?;
     let expr = match ctor {
         "+" => {
@@ -3869,6 +4028,7 @@ fn compile_f64_numeric_expr(
     node: &PatternNode,
     ctor: &str,
     args: &[PatternNode],
+    eval_ctx: Option<(&PeTTaSpace, MorkExecutionLimits)>,
 ) -> Result<Option<LoweredNumericExpr>, String> {
     // Grounding boundary:
     // These heads stay on the MM2/MORK lane because the MORK kernel really
@@ -3894,7 +4054,7 @@ fn compile_f64_numeric_expr(
     ) {
         return Ok(None);
     }
-    let compiled_args: Result<Vec<_>, _> = args.iter().map(compile_f64_intrinsic_arg).collect();
+    let compiled_args: Result<Vec<_>, _> = args.iter().map(|a| compile_f64_intrinsic_arg(a, eval_ctx)).collect();
     let compiled_args = compiled_args?;
     let expr = match ctor {
         "+" => {
@@ -4047,6 +4207,7 @@ fn compile_f64_numeric_expr(
 #[cfg(feature = "mork-backend")]
 fn compile_numeric_intrinsic_expr(
     node: &PatternNode,
+    eval_ctx: Option<(&PeTTaSpace, MorkExecutionLimits)>,
 ) -> Result<Option<LoweredNumericExpr>, String> {
     match node {
         PatternNode::Apply { ctor, args } => {
@@ -4068,12 +4229,12 @@ fn compile_numeric_intrinsic_expr(
                             "+" | "-" | "*" | "/" | "%" | "pow-math" | "abs-math"
                         ) =>
                     {
-                        if let Some(lowered) = compile_i32_numeric_expr(ctor, args)? {
+                        if let Some(lowered) = compile_i32_numeric_expr(ctor, args, eval_ctx)? {
                             return Ok(Some(lowered));
                         }
                     },
                     GroundNumericValue::F64(_) => {
-                        if let Some(lowered) = compile_f64_numeric_expr(node, ctor, args)? {
+                        if let Some(lowered) = compile_f64_numeric_expr(node, ctor, args, eval_ctx)? {
                             return Ok(Some(lowered));
                         }
                     },
@@ -4081,12 +4242,12 @@ fn compile_numeric_intrinsic_expr(
                 }
             }
             let lowered = match shape {
-                NumericResultShape::AlwaysFloat => compile_f64_numeric_expr(node, ctor, args)?,
+                NumericResultShape::AlwaysFloat => compile_f64_numeric_expr(node, ctor, args, eval_ctx)?,
                 NumericResultShape::AlwaysInteger => {
                     if ctor == "%" {
-                        compile_i32_numeric_expr(ctor, args)?
+                        compile_i32_numeric_expr(ctor, args, eval_ctx)?
                     } else {
-                        compile_f64_numeric_expr(node, ctor, args)?
+                        compile_f64_numeric_expr(node, ctor, args, eval_ctx)?
                     }
                 },
                 NumericResultShape::PreserveIntegralIfExact => {
@@ -4097,13 +4258,13 @@ fn compile_numeric_intrinsic_expr(
                     );
                     match ctor.as_str() {
                         "+" | "-" | "*" if arg_class == StaticNumericClass::IntegerLike => {
-                            match compile_i32_numeric_expr(ctor, args)? {
+                            match compile_i32_numeric_expr(ctor, args, eval_ctx)? {
                                 Some(lowered) => Some(lowered),
-                                None => compile_f64_numeric_expr(node, ctor, args)?,
+                                None => compile_f64_numeric_expr(node, ctor, args, eval_ctx)?,
                             }
                         },
-                        "/" | "pow-math" => compile_f64_numeric_expr(node, ctor, args)?,
-                        _ => compile_f64_numeric_expr(node, ctor, args)?,
+                        "/" | "pow-math" => compile_f64_numeric_expr(node, ctor, args, eval_ctx)?,
+                        _ => compile_f64_numeric_expr(node, ctor, args, eval_ctx)?,
                     }
                 },
                 NumericResultShape::PreserveInputNumericClass => {
@@ -4113,12 +4274,12 @@ fn compile_numeric_intrinsic_expr(
                             .collect::<Result<Vec<_>, _>>()?,
                     );
                     if arg_class == StaticNumericClass::IntegerLike {
-                        match compile_i32_numeric_expr(ctor, args)? {
+                        match compile_i32_numeric_expr(ctor, args, eval_ctx)? {
                             Some(lowered) => Some(lowered),
-                            None => compile_f64_numeric_expr(node, ctor, args)?,
+                            None => compile_f64_numeric_expr(node, ctor, args, eval_ctx)?,
                         }
                     } else {
-                        compile_f64_numeric_expr(node, ctor, args)?
+                        compile_f64_numeric_expr(node, ctor, args, eval_ctx)?
                     }
                 },
             };
@@ -5301,7 +5462,10 @@ fn compile_grounded_builtin_output(
 }
 
 #[cfg(feature = "mork-backend")]
-fn compile_intrinsic_output(node: &PatternNode) -> Result<LaneAttempt<LoweredMm2Output>, String> {
+fn compile_intrinsic_output(
+    node: &PatternNode,
+    eval_ctx: Option<(&PeTTaSpace, MorkExecutionLimits)>,
+) -> Result<LaneAttempt<LoweredMm2Output>, String> {
     let Some(contract) = load_petta_mm2_intrinsic_contract_for_node(node)? else {
         return Ok(LaneAttempt::NotThisLane);
     };
@@ -5311,7 +5475,7 @@ fn compile_intrinsic_output(node: &PatternNode) -> Result<LaneAttempt<LoweredMm2
 
     match contract.builtin_demand {
         BuiltinDemandKind::NumericArgs => {
-            let lowered = compile_numeric_intrinsic_expr(node)?.ok_or_else(|| {
+            let lowered = compile_numeric_intrinsic_expr(node, eval_ctx)?.ok_or_else(|| {
                 format!(
                     "PeTTa execution contract certifies intrinsic '{}', but the real MORK backend does not yet lower that numeric intrinsic form",
                     contract.head
@@ -5347,7 +5511,7 @@ fn compile_intrinsic_output(node: &PatternNode) -> Result<LaneAttempt<LoweredMm2
             Ok(LaneAttempt::Lowered(output))
         },
         BuiltinDemandKind::FloatArgs => {
-            let lowered = compile_numeric_intrinsic_expr(node)?.ok_or_else(|| {
+            let lowered = compile_numeric_intrinsic_expr(node, eval_ctx)?.ok_or_else(|| {
                 format!(
                     "PeTTa execution contract certifies intrinsic '{}', but the real MORK backend does not yet lower that float intrinsic form",
                     contract.head
@@ -5408,9 +5572,9 @@ fn compile_intrinsic_output(node: &PatternNode) -> Result<LaneAttempt<LoweredMm2
                 },
             };
             if cond {
-                compile_branch_output(&args[1]).map(LaneAttempt::Lowered)
+                compile_branch_output(&args[1], eval_ctx).map(LaneAttempt::Lowered)
             } else if args.len() == 3 {
-                compile_branch_output(&args[2]).map(LaneAttempt::Lowered)
+                compile_branch_output(&args[2], eval_ctx).map(LaneAttempt::Lowered)
             } else {
                 Ok(LaneAttempt::Lowered(LoweredMm2Output::NoResult))
             }
@@ -5448,8 +5612,11 @@ fn compile_intrinsic_output(node: &PatternNode) -> Result<LaneAttempt<LoweredMm2
 }
 
 #[cfg(feature = "mork-backend")]
-fn compile_branch_output(node: &PatternNode) -> Result<LoweredMm2Output, String> {
-    match compile_intrinsic_output(node)? {
+fn compile_branch_output(
+    node: &PatternNode,
+    eval_ctx: Option<(&PeTTaSpace, MorkExecutionLimits)>,
+) -> Result<LoweredMm2Output, String> {
+    match compile_intrinsic_output(node, eval_ctx)? {
         LaneAttempt::Lowered(output) => return Ok(output),
         LaneAttempt::Inapplicable(_) | LaneAttempt::NotThisLane => {},
     }
@@ -5542,7 +5709,7 @@ fn build_result_emit_ops(
     result_var: &str,
     rhs: &PatternNode,
 ) -> Result<Vec<MorkSExpr>, String> {
-    if let LaneAttempt::Lowered(output) = compile_intrinsic_output(rhs)? {
+    if let LaneAttempt::Lowered(output) = compile_intrinsic_output(rhs, None)? {
         return Ok(emit_compiled_output_ops(result_relation, qid_var, result_var, output));
     }
     if let LaneAttempt::Lowered(output) = compile_grounded_builtin_output(rhs)? {
@@ -5564,7 +5731,7 @@ fn build_result_emit_ops_with_witnesses(
     rhs: &PatternNode,
     witness_vars: &[String],
 ) -> Result<Vec<MorkSExpr>, String> {
-    if let LaneAttempt::Lowered(output) = compile_intrinsic_output(rhs)? {
+    if let LaneAttempt::Lowered(output) = compile_intrinsic_output(rhs, None)? {
         return Ok(emit_compiled_output_ops_with_witnesses(
             result_relation,
             qid_var,
@@ -5598,6 +5765,7 @@ fn build_petta_rewrite_mm2_program(
     bundle: &crate::petta_artifacts::PeTTaArtifactBundle,
     facts: &[PatternNode],
     query: &PatternNode,
+    authority: Option<&crate::native_profile::PeTTaDispatchAuthority>,
 ) -> Result<(Vec<u8>, String), String> {
     let space_match_contract =
         load_petta_relation_premise_contract_from_bundle(bundle, "spaceMatch", 3)?;
@@ -5632,7 +5800,7 @@ fn build_petta_rewrite_mm2_program(
         .iter()
         .filter(|rule| rule.source_label == query_source_label)
     {
-        let plan = derive_rule_application_plan(rule)?;
+        let plan = crate::native_profile::authoritative_rule_plan(authority, rule)?;
         if plan.mode == RewriteRuleMode::CompatHead {
             continue;
         }
@@ -5796,6 +5964,7 @@ fn build_petta_compat_probe_mm2_program(
     facts: &[PatternNode],
     query: &PatternNode,
     witness_vars: &[String],
+    authority: Option<&crate::native_profile::PeTTaDispatchAuthority>,
 ) -> Result<(Vec<u8>, String), String> {
     let space_match_contract =
         load_petta_relation_premise_contract_from_bundle(bundle, "spaceMatch", 3)?;
@@ -5830,7 +5999,7 @@ fn build_petta_compat_probe_mm2_program(
         .iter()
         .filter(|rule| rule.source_label == query_source_label)
     {
-        let plan = derive_rule_application_plan(rule)?;
+        let plan = crate::native_profile::authoritative_rule_plan(authority, rule)?;
         if plan.mode == RewriteRuleMode::CompatHead {
             continue;
         }
@@ -6006,8 +6175,9 @@ fn probe_non_compat_term_with_witnesses(
     limits: MorkExecutionLimits,
 ) -> Result<Vec<WitnessedPatternOutcome>, String> {
     let stored_atoms = space.stored_atoms();
+    // Authority not threaded through the trait path yet; pass None.
     let (program, result_relation) =
-        build_petta_compat_probe_mm2_program(bundle, &stored_atoms, expr, witness_vars)?;
+        build_petta_compat_probe_mm2_program(bundle, &stored_atoms, expr, witness_vars, None)?;
     let nested_run = run_mm2_program_for_patterns(
         &program,
         &result_relation,
@@ -6228,10 +6398,12 @@ fn try_eval_grounded_builtin_with_witnesses(
     }
 }
 
-struct PeTTaCompatHeadBoundary;
+struct PeTTaCompatHeadBoundary<'a> {
+    authority: Option<&'a crate::native_profile::PeTTaDispatchAuthority>,
+}
 
 #[cfg(feature = "mork-backend")]
-impl CompatHeadService for PeTTaCompatHeadBoundary {
+impl<'a> CompatHeadService for PeTTaCompatHeadBoundary<'a> {
     type Space = PeTTaSpace;
     type Bundle = crate::petta_artifacts::PeTTaArtifactBundle;
     type RunResult = PeTTaMm2Run;
@@ -6266,7 +6438,7 @@ impl CompatHeadService for PeTTaCompatHeadBoundary {
         limits: MorkExecutionLimits,
     ) -> Result<Vec<TemplateBindings>, String> {
         compat_head_probe_bindings_generic(
-            &PeTTaCompatHeadBoundary,
+            &PeTTaCompatHeadBoundary { authority: None },
             &PeTTaPatternOps,
             space,
             bundle,
@@ -6279,7 +6451,7 @@ impl CompatHeadService for PeTTaCompatHeadBoundary {
 }
 
 #[cfg(feature = "mork-backend")]
-impl WitnessEvaluationBackend for PeTTaCompatHeadBoundary {
+impl<'a> WitnessEvaluationBackend for PeTTaCompatHeadBoundary<'a> {
     type Space = PeTTaSpace;
     type Bundle = crate::petta_artifacts::PeTTaArtifactBundle;
 
@@ -6357,7 +6529,7 @@ impl WitnessEvaluationBackend for PeTTaCompatHeadBoundary {
         probe_non_compat_term_with_witnesses(space, bundle, expr, witness_vars, limits)
     }
 
-    fn rewrite_rules<'a>(&self, bundle: &'a Self::Bundle) -> &'a [RewriteIRRule] {
+    fn rewrite_rules<'b>(&self, bundle: &'b Self::Bundle) -> &'b [RewriteIRRule] {
         &bundle.rewrite_ir.rules
     }
 
@@ -6403,7 +6575,7 @@ impl WitnessEvaluationBackend for PeTTaCompatHeadBoundary {
             if lhs_ctor != query_ctor || lhs_args.len() != query_args.len() {
                 continue;
             }
-            let boundary = PeTTaCompatHeadBoundary;
+            let boundary = PeTTaCompatHeadBoundary { authority: self.authority };
             let envs = boundary.match_args(space, bundle, lhs_args, query_args, limits)?;
             for matched_env in envs {
                 let matched_env = normalize_template_bindings(&matched_env);
@@ -6469,6 +6641,31 @@ impl WitnessEvaluationBackend for PeTTaCompatHeadBoundary {
             }
         }
         Ok(out)
+    }
+
+    fn boundary_entry(
+        &self,
+        _bundle: &Self::Bundle,
+        head: &str,
+    ) -> Result<Option<crate::compat_head_boundary::BoundaryDispatchPolicy>, String> {
+        let Some(auth) = self.authority else {
+            return Ok(None); // no authority → structural heuristic (scaffolding)
+        };
+        // Use the pre-built index from the authority — O(log n), not O(n).
+        match auth.boundary_policy(head) {
+            Some(entry) => Ok(Some(crate::compat_head_boundary::BoundaryDispatchPolicy {
+                boundary_kind: entry.boundary_kind,
+                witness_lane: entry.witness_lane,
+                residual_lane: entry.residual_lane,
+            })),
+            None => match auth.mode {
+                crate::native_profile::SemanticAuthorityMode::Strict => Err(format!(
+                    "strict mode: boundary head '{}' entered dispatch but is not covered by native profile",
+                    head
+                )),
+                _ => Ok(None),
+            },
+        }
     }
 }
 
@@ -6538,6 +6735,7 @@ fn run_petta_compat_head_rewrite_rule_runs(
     rule: &RewriteIRRule,
     plan: &RuleApplicationPlan,
     limits: MorkExecutionLimits,
+    authority: Option<&crate::native_profile::PeTTaDispatchAuthority>,
 ) -> Result<Vec<PeTTaMm2Run>, String> {
     if !matches!(plan.mode, RewriteRuleMode::CompatHead) {
         return Ok(Vec::new());
@@ -6578,7 +6776,7 @@ fn run_petta_compat_head_rewrite_rule_runs(
         return Ok(Vec::new());
     }
 
-    let boundary = PeTTaCompatHeadBoundary;
+    let boundary = PeTTaCompatHeadBoundary { authority };
     let envs = boundary.match_args(&term.space, bundle, lhs_args, query_args, limits)?;
     let mut out = Vec::new();
     for env in envs {
@@ -6627,7 +6825,7 @@ fn run_petta_compat_head_rewrite_rule_runs(
                 if is_control {
                     let result_free_vars = ordered_pattern_free_vars(result)?;
                     let reduced = eval_term_with_witnesses_generic(
-                        &PeTTaCompatHeadBoundary,
+                        &PeTTaCompatHeadBoundary { authority },
                         &PeTTaPatternOps,
                         &term.space,
                         bundle,
@@ -6676,7 +6874,7 @@ fn run_petta_compat_head_rewrite_rule(
     limits: MorkExecutionLimits,
 ) -> Result<Vec<PatternNode>, String> {
     let mut out = Vec::new();
-    for run in run_petta_compat_head_rewrite_rule_runs(term, bundle, rule, plan, limits)? {
+    for run in run_petta_compat_head_rewrite_rule_runs(term, bundle, rule, plan, limits, None)? {
         for result in run.results {
             push_unique_pattern(&mut out, result);
         }
@@ -6688,6 +6886,7 @@ fn run_petta_compat_head_rewrite_rule(
 fn has_compat_head_rules_for_query(
     bundle: &crate::petta_artifacts::PeTTaArtifactBundle,
     query: &PatternNode,
+    authority: Option<&crate::native_profile::PeTTaDispatchAuthority>,
 ) -> Result<bool, String> {
     let query_source_label = crate::petta_artifacts::source_label_of_pattern(query);
     for rule in bundle
@@ -6696,7 +6895,7 @@ fn has_compat_head_rules_for_query(
         .iter()
         .filter(|rule| rule.source_label == query_source_label)
     {
-        let plan = derive_rule_application_plan(rule)?;
+        let plan = crate::native_profile::authoritative_rule_plan(authority, rule)?;
         if plan.mode == RewriteRuleMode::CompatHead {
             return Ok(true);
         }
@@ -6709,6 +6908,7 @@ fn run_petta_compat_head_rewrites(
     term: &PeTTaTerm,
     bundle: &crate::petta_artifacts::PeTTaArtifactBundle,
     limits: MorkExecutionLimits,
+    authority: Option<&crate::native_profile::PeTTaDispatchAuthority>,
 ) -> Result<Vec<PeTTaMm2Run>, String> {
     let mut out = Vec::new();
     let query_source_label = crate::petta_artifacts::source_label_of_pattern(&term.query);
@@ -6718,12 +6918,12 @@ fn run_petta_compat_head_rewrites(
         .iter()
         .filter(|rule| rule.source_label == query_source_label)
     {
-        let plan = derive_rule_application_plan(rule)?;
+        let plan = crate::native_profile::authoritative_rule_plan(authority, rule)?;
         if plan.mode != RewriteRuleMode::CompatHead {
             continue;
         }
         out.extend(run_petta_compat_head_rewrite_rule_runs(
-            term, bundle, rule, &plan, limits,
+            term, bundle, rule, &plan, limits, authority,
         )?);
     }
     Ok(out)
@@ -7122,7 +7322,7 @@ fn build_petta_intrinsic_mm2_program(
                 | BuiltinDemandKind::FloatArgs
                 | BuiltinDemandKind::BoolArgs
                 | BuiltinDemandKind::BoolThenElseArgs => {
-                    let output = match compile_intrinsic_output(query)? {
+                    let output = match compile_intrinsic_output(query, None)? {
                         LaneAttempt::Lowered(output) => output,
                         LaneAttempt::Inapplicable(reason) => {
                             return Ok(LaneAttempt::Inapplicable(reason))
@@ -7583,6 +7783,62 @@ fn try_run_petta_mm2_self_space_query(
     Ok(run)
 }
 
+/// Pre-evaluate non-numeric arguments of an intrinsic expression.
+/// If an argument is not a literal, variable, or recognized numeric intrinsic,
+/// evaluate it recursively. STRICT: single result, no state effects, numeric.
+#[cfg(feature = "mork-backend")]
+fn pre_evaluate_intrinsic_args(
+    query: &PatternNode,
+    space: &PeTTaSpace,
+    limits: MorkExecutionLimits,
+) -> Result<PatternNode, String> {
+    let PatternNode::Apply { ctor, args } = query else {
+        return Ok(query.clone());
+    };
+    let mut new_args = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            // Literals and variables pass through
+            PatternNode::Fvar { .. } => new_args.push(arg.clone()),
+            PatternNode::Apply { args: inner, .. } if inner.is_empty() => {
+                new_args.push(arg.clone())
+            },
+            // Numeric intrinsics pass through (they compile directly)
+            PatternNode::Apply { ctor: inner_ctor, .. }
+                if load_petta_mm2_intrinsic_contract_for_node(arg)
+                    .ok()
+                    .flatten()
+                    .is_some() =>
+            {
+                // Recursively pre-evaluate this intrinsic's own args
+                new_args.push(pre_evaluate_intrinsic_args(arg, space, limits)?);
+            },
+            // Non-intrinsic compound term: evaluate it
+            _ => {
+                let nested = PeTTaTerm::new(space.clone(), arg.clone());
+                let run = eval_nested_mm2_or_residual(&nested, limits)?;
+                if !run.self_updates.is_empty() {
+                    return Err(format!(
+                        "nested subterm has state effects; cannot use as intrinsic arg: {:?}",
+                        arg
+                    ));
+                }
+                if run.results.len() != 1 {
+                    return Err(format!(
+                        "nested subterm produced {} results (expected 1); cannot use as intrinsic arg: {:?}",
+                        run.results.len(), arg
+                    ));
+                }
+                new_args.push(run.results[0].clone());
+            },
+        }
+    }
+    Ok(PatternNode::Apply {
+        ctor: ctor.clone(),
+        args: new_args,
+    })
+}
+
 #[cfg(feature = "mork-backend")]
 fn try_run_petta_mm2_intrinsic(
     term: &PeTTaTerm,
@@ -7601,7 +7857,11 @@ fn try_run_petta_mm2_intrinsic(
         },
         Err(err) => return Err(err),
     };
-    let (program, result_relation) = match build_petta_intrinsic_mm2_program(&term.query, &contract)?
+    // Pre-evaluate non-numeric arguments before MM2 compilation.
+    // If an argument is a user-defined function call (not a numeric intrinsic),
+    // evaluate it first, then substitute the result into the query.
+    let query = pre_evaluate_intrinsic_args(&term.query, &term.space, limits)?;
+    let (program, result_relation) = match build_petta_intrinsic_mm2_program(&query, &contract)?
     {
         LaneAttempt::Lowered(compiled) => compiled,
         LaneAttempt::Inapplicable(reason) => {
@@ -8229,7 +8489,7 @@ fn try_run_petta_control_builtin(
                     let value_free_vars = ordered_pattern_free_vars(&args[value_index])?;
                     if !value_free_vars.is_empty() {
                         let value_outcomes = eval_term_with_witnesses_generic(
-                            &PeTTaCompatHeadBoundary,
+                            &PeTTaCompatHeadBoundary { authority: None },
                             &PeTTaPatternOps,
                             &term.space,
                             &bundle,
@@ -8394,9 +8654,24 @@ fn try_run_petta_mm2_pure_rewrite(
     }
 
     let bundle = build_petta_artifact_bundle(&term.space.rules)?;
+    // Native profile authority: Shadow/Strict mode validation.
+    // The authority persists for the entire eval so choke points can consult it.
+    let authority = {
+        let loaded_checksums = std::collections::BTreeMap::new();
+        // Note: dialect-static checksums (exec_contract, scope_contract) are
+        // checked at load time by read_with_checksum(). Program-specific checksums
+        // (transition_spec, rewrite_ir) are not yet available from disk.
+        // For now we pass an empty map; full checksum threading comes with AOT bundles.
+        crate::native_profile::build_dispatch_authority(&bundle, &loaded_checksums)?
+    };
+    if let Some(ref auth) = authority {
+        if auth.mode == crate::native_profile::SemanticAuthorityMode::Shadow {
+            crate::native_profile::log_profile_rule_shadow_report(auth, &bundle);
+        }
+    }
     let stored_atoms = term.space.stored_atoms();
     let (program, result_relation) =
-        build_petta_rewrite_mm2_program(&bundle, &stored_atoms, &term.query)?;
+        build_petta_rewrite_mm2_program(&bundle, &stored_atoms, &term.query, authority.as_ref())?;
     let mut run = run_mm2_program_for_patterns(
         &program,
         &result_relation,
@@ -8405,8 +8680,8 @@ fn try_run_petta_mm2_pure_rewrite(
         None,
         limits,
     )?;
-    let compat_head_claimed = has_compat_head_rules_for_query(&bundle, &term.query)?;
-    let compat_runs = run_petta_compat_head_rewrites(term, &bundle, limits)?;
+    let compat_head_claimed = has_compat_head_rules_for_query(&bundle, &term.query, authority.as_ref())?;
+    let compat_runs = run_petta_compat_head_rewrites(term, &bundle, limits, authority.as_ref())?;
     let mut saw_stateful_compat = false;
     for compat_run in compat_runs {
         if !compat_run.self_updates.is_empty() {
@@ -8629,7 +8904,8 @@ impl Language for PeTTaLanguage {
     }
 
     fn parse_term(&self, input: &str) -> Result<Box<dyn Term>, String> {
-        let (space, query) = parse_petta_program(input)?;
+        let spec = petta_surface_spec()?;
+        let (space, query) = parse_petta_program(input, spec)?;
         Ok(Box::new(PeTTaTerm::new(space, query)))
     }
 
@@ -8773,7 +9049,13 @@ fn parse_many_sexprs_to_patterns(input: &str) -> Result<Vec<PatternNode>, String
 
 /// Parse the serialized PeTTa surface-lowering payload:
 /// zero or more facts/rules, followed by a final query.
-fn parse_petta_program(input: &str) -> Result<(PeTTaSpace, PatternNode), String> {
+///
+/// Rule detection is driven by the Lean-exported `SurfaceSpec` —
+/// no hardcoded language rules in Rust.
+fn parse_petta_program(
+    input: &str,
+    spec: &crate::surface_spec::SurfaceSpec,
+) -> Result<(PeTTaSpace, PatternNode), String> {
     let forms = parse_many_sexprs_to_patterns(input)?;
     if forms.is_empty() {
         return Err("PeTTa program must contain at least one form".to_string());
@@ -8783,6 +9065,10 @@ fn parse_petta_program(input: &str) -> Result<(PeTTaSpace, PatternNode), String>
     let last_index = forms.len() - 1;
     let mut query: Option<PatternNode> = None;
 
+    // parse_petta_program is the INTERNAL lowered-term parser. It always treats
+    // the last form as the query — this is the contract between lower_eval and
+    // parse_term. User-facing program policy (explicit_query_only) is enforced
+    // in parse_surface_stmts, not here.
     for (idx, form) in forms.into_iter().enumerate() {
         if idx == last_index {
             query = Some(form);
@@ -8790,19 +9076,35 @@ fn parse_petta_program(input: &str) -> Result<(PeTTaSpace, PatternNode), String>
         }
 
         match form {
-            PatternNode::Apply { ctor, mut args } if ctor == "=" && args.len() == 2 => {
-                let left = args.remove(0);
-                let right = args.remove(0);
-                let rule_name = format!("surface_rule_{}", idx + 1);
-                space.add_rule(PeTTaRule {
-                    name: rule_name,
-                    left,
-                    right,
-                    premises: vec![],
-                });
+            PatternNode::Apply { ref ctor, ref args } => {
+                let command = crate::surface_spec::command_for_head(
+                    ctor,
+                    spec,
+                    args.len() as u64,
+                );
+                match command {
+                    Some("defineEq") => {
+                        let mut args_owned = args.clone();
+                        if args_owned.len() == 2 {
+                            let left = args_owned.remove(0);
+                            let right = args_owned.remove(0);
+                            let rule_name = format!("surface_rule_{}", idx + 1);
+                            space.add_rule(PeTTaRule {
+                                name: rule_name,
+                                left,
+                                right,
+                                premises: vec![],
+                            });
+                        } else {
+                            space.add_atom(form);
+                        }
+                    },
+                    _ => {
+                        space.add_atom(form);
+                    },
+                }
             },
             other => {
-                // Allow pre-query facts as first-class space atoms.
                 space.add_atom(other);
             },
         }
@@ -8812,9 +9114,19 @@ fn parse_petta_program(input: &str) -> Result<(PeTTaSpace, PatternNode), String>
     Ok((space, query))
 }
 
+/// Lazily loaded PeTTa surface spec — loaded once from the Lean-exported artifact.
+fn petta_surface_spec() -> Result<&'static crate::surface_spec::SurfaceSpec, String> {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Result<crate::surface_spec::SurfaceSpec, String>> = OnceLock::new();
+    SPEC.get_or_init(|| crate::surface_spec::load_surface_spec_required("petta"))
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
 // ── Surface .metta file runner ──────────────────────────────────────────────
 
 /// A statement from a surface `.metta` file.
+#[derive(Debug)]
 #[cfg_attr(not(feature = "legacy-petta-direct-eval"), allow(dead_code))]
 enum SurfaceStmt {
     /// `(= lhs rhs)` → rule/fact definition
@@ -8834,10 +9146,13 @@ enum SurfaceStmt {
 
 /// Parse a surface `.metta` file into a sequence of statements.
 ///
-/// Uses the shared tree-sitter parser. Comments and `!(expr)` syntax are
-/// handled natively by the grammar (comments in `extras`, eval via `eval_form`).
+/// Uses the shared tree-sitter parser. Statement classification is driven by
+/// the Lean-exported `SurfaceSpec` — no hardcoded language rules in Rust.
 #[cfg_attr(not(feature = "legacy-petta-direct-eval"), allow(dead_code))]
-fn parse_surface_stmts(input: &str) -> Result<Vec<SurfaceStmt>, String> {
+fn parse_surface_stmts(
+    input: &str,
+    spec: &crate::surface_spec::SurfaceSpec,
+) -> Result<Vec<SurfaceStmt>, String> {
     use crate::sexpr::{sexpr_to_pattern, SExpr};
 
     let forms = crate::tree_sitter_parser::parse_many_sexprs("petta", input)?;
@@ -8845,31 +9160,37 @@ fn parse_surface_stmts(input: &str) -> Result<Vec<SurfaceStmt>, String> {
 
     for (is_eval, sexpr) in forms {
         if is_eval {
-            // !(expr) — dispatch on inner form
+            // !(expr) — dispatch on inner form via spec command heads
             match &sexpr {
                 SExpr::List(items) if !items.is_empty() => {
                     let head = match &items[0] {
                         SExpr::Atom(s) => s.as_str(),
                         _ => "",
                     };
-                    match head {
-                        "import!" if items.len() == 2 || items.len() == 3 => {
+                    let tail_len = items.len().saturating_sub(1) as u64;
+                    let command = crate::surface_spec::command_for_head(head, spec, tail_len);
+                    match command {
+                        Some("import") => {
                             let (target_space, import_path) = if items.len() == 2 {
-                                ("&self".to_string(), sexpr_to_pattern(&items[1])?)
-                            } else {
+                                (
+                                    spec.program_policy.default_space.clone(),
+                                    sexpr_to_pattern(&items[1])?,
+                                )
+                            } else if items.len() == 3 {
                                 let target_space = match &items[1] {
                                     SExpr::Atom(s) => s.clone(),
                                     other => crate::sexpr::render_sexpr(other),
                                 };
                                 (target_space, sexpr_to_pattern(&items[2])?)
+                            } else {
+                                let pattern = sexpr_to_pattern(&sexpr)?;
+                                stmts.push(SurfaceStmt::Query(pattern));
+                                continue;
                             };
                             stmts.push(SurfaceStmt::Import { target_space, import_path });
                         },
-                        "git-import!" => {
-                            stmts
-                                .push(SurfaceStmt::UnsupportedDirective("git-import!".to_string()));
-                        },
                         _ => {
+                            // Any eval form not matching a known command → query
                             let pattern = sexpr_to_pattern(&sexpr)?;
                             stmts.push(SurfaceStmt::Query(pattern));
                         },
@@ -8882,13 +9203,45 @@ fn parse_surface_stmts(input: &str) -> Result<Vec<SurfaceStmt>, String> {
                 },
             }
         } else {
-            // Non-eval: rule or fact
+            // Non-eval: classify via spec command heads + dispatch policy
             let pattern = sexpr_to_pattern(&sexpr)?;
             match &pattern {
-                PatternNode::Apply { ctor, args } if ctor == "=" && args.len() == 2 => {
-                    stmts.push(SurfaceStmt::Rule(args[0].clone(), args[1].clone()));
+                PatternNode::Apply { ref ctor, ref args } => {
+                    let command = crate::surface_spec::command_for_head(
+                        ctor,
+                        spec,
+                        args.len() as u64,
+                    );
+                    match command {
+                        Some("defineEq") if args.len() == 2 => {
+                            stmts.push(SurfaceStmt::Rule(args[0].clone(), args[1].clone()));
+                        },
+                        Some(_) => {
+                            // Known command but unsupported lowering
+                            if spec.dispatch_policy.fallback_unsupported_command_to_fact {
+                                stmts.push(SurfaceStmt::Fact(pattern));
+                            } else {
+                                return Err(format!(
+                                    "unsupported command '{}' (dispatch policy rejects fallback)",
+                                    ctor
+                                ));
+                            }
+                        },
+                        None => {
+                            // Unknown head — check dispatch policy
+                            if spec.dispatch_policy.fallback_unknown_head_to_fact {
+                                stmts.push(SurfaceStmt::Fact(pattern));
+                            } else {
+                                return Err(format!(
+                                    "unknown command head '{}' (dispatch policy rejects fallback to fact)",
+                                    ctor
+                                ));
+                            }
+                        },
+                    }
                 },
                 _ => {
+                    // Bare atom or non-list → always a fact
                     stmts.push(SurfaceStmt::Fact(pattern));
                 },
             }
@@ -9116,7 +9469,8 @@ fn run_surface_stmts(stmts: Vec<SurfaceStmt>) -> Result<SurfaceRunResult, String
 /// Run a surface `.metta` file: execute rules, queries, and tests sequentially.
 #[cfg(feature = "legacy-petta-direct-eval")]
 pub fn run_metta_surface_file(input: &str) -> Result<SurfaceRunResult, String> {
-    let stmts = parse_surface_stmts(input)?;
+    let spec = petta_surface_spec()?;
+    let stmts = parse_surface_stmts(input, spec)?;
     run_surface_stmts(stmts)
 }
 
@@ -9137,8 +9491,114 @@ pub fn run_metta_surface_file_via_backend(
             language.name()
         ));
     }
-    let stmts = parse_surface_stmts(input)?;
-    run_surface_stmts_via_backend(language, backend, stmts)
+    let spec = petta_surface_spec()?;
+    let forms = crate::tree_sitter_parser::parse_many_sexprs("petta", input)?;
+    let commands: Vec<crate::surface_spec::SyntaxCommand> = forms
+        .iter()
+        .map(|(is_eval, sexpr)| {
+            crate::surface_spec::classify_to_syntax_command(*is_eval, sexpr, spec)
+        })
+        .collect::<Result<_, _>>()?;
+    run_syntax_commands_via_backend(language, backend, commands)
+}
+
+/// Execute a sequence of `SyntaxCommand`s via the backend — structured path.
+/// Rules/facts accumulate, queries execute against the current space.
+fn run_syntax_commands_via_backend(
+    language: &dyn Language,
+    backend: RuntimeBackend,
+    commands: Vec<crate::surface_spec::SyntaxCommand>,
+) -> Result<SurfaceRunResult, String> {
+    use crate::sexpr::sexpr_to_pattern;
+    use crate::surface_spec::SyntaxCommand;
+
+    let mut space = PeTTaSpace::empty();
+    let mut result = SurfaceRunResult {
+        outputs: Vec::new(),
+    };
+
+    for cmd in commands {
+        match cmd {
+            SyntaxCommand::Empty => {},
+            SyntaxCommand::DefineEq(lhs, rhs) => {
+                let left = sexpr_to_pattern(&lhs)?;
+                let right = sexpr_to_pattern(&rhs)?;
+                let rule_name = format!("surface_rule_{}", space.rules.len() + 1);
+                space.add_rule(PeTTaRule {
+                    name: rule_name,
+                    left,
+                    right,
+                    premises: vec![],
+                });
+            },
+            SyntaxCommand::Fact(sexpr) => {
+                space.add_atom(sexpr_to_pattern(&sexpr)?);
+            },
+            SyntaxCommand::Eval(sexpr) => {
+                let expr = sexpr_to_pattern(&sexpr)?;
+                match eval_surface_expr_via_backend(language, backend, &space, &expr) {
+                    Ok(outcome) => {
+                        if let Some(facts) = outcome.updated_self_facts {
+                            space.facts = facts;
+                        }
+                        for update in outcome.self_updates {
+                            match update {
+                                PeTTaSelfSpaceUpdate::AddAtom(atom) => space.add_atom(atom),
+                                PeTTaSelfSpaceUpdate::RemoveAtom(atom) => {
+                                    space.remove_atom(&atom)
+                                },
+                            }
+                        }
+                        result.outputs.extend(outcome.outputs);
+                    },
+                    Err(e) => {
+                        result.outputs.push(format!("[error] {}", e));
+                    },
+                }
+            },
+            SyntaxCommand::DefineType(_, _) => {
+                // PeTTa backend does not yet implement type system
+            },
+            SyntaxCommand::SetFuel(_) => {
+                // Runtime tuning — not yet wired through backend
+            },
+            SyntaxCommand::Import { space: _, path } => {
+                let path_str = match &path {
+                    crate::sexpr::SExpr::Atom(s) => s.clone(),
+                    other => crate::sexpr::render_sexpr(other),
+                };
+                eprintln!(
+                    "[petta-surface] skipping import without file context: {}",
+                    path_str
+                );
+            },
+            SyntaxCommand::NewSpace { name } => {
+                eprintln!(
+                    "[petta-surface] skipping new-space! without session context: {}",
+                    name
+                );
+            },
+            SyntaxCommand::AddAtom { space: _space_ref, atom } => {
+                let atom_pattern = sexpr_to_pattern(&atom)?;
+                space.add_atom(atom_pattern);
+                result.outputs.push("()".to_string());
+            },
+            SyntaxCommand::RemoveAtom { space: _space_ref, atom } => {
+                let atom_pattern = sexpr_to_pattern(&atom)?;
+                space.remove_atom(&atom_pattern);
+                result.outputs.push("()".to_string());
+            },
+            SyntaxCommand::RelationFact { .. }
+            | SyntaxCommand::BuiltinFact { .. } => {
+                eprintln!("[petta-surface] skipping relation/builtin fact");
+            },
+            SyntaxCommand::Directive { name, .. } => {
+                eprintln!("[petta-surface] skipping unsupported directive: {}", name);
+            },
+        }
+    }
+
+    Ok(result)
 }
 
 /// Run a surface `.metta` file from a real filesystem path so imports can be expanded.
@@ -9176,7 +9636,8 @@ pub fn run_metta_surface_file_from_path(
         }
     }
 
-    let stmts = parse_surface_stmts(&program)?;
+    let spec = petta_surface_spec()?;
+    let stmts = parse_surface_stmts(&program, spec)?;
     run_surface_stmts(stmts)
 }
 
@@ -9202,8 +9663,15 @@ pub fn run_metta_surface_file_via_backend_from_path(
         ));
     }
     let program = load_petta_surface_program_from_path(file_path, library_aliases)?;
-    let stmts = parse_surface_stmts(&program)?;
-    run_surface_stmts_via_backend(language, backend, stmts)
+    let spec = petta_surface_spec()?;
+    let forms = crate::tree_sitter_parser::parse_many_sexprs("petta", &program)?;
+    let commands: Vec<crate::surface_spec::SyntaxCommand> = forms
+        .iter()
+        .map(|(is_eval, sexpr)| {
+            crate::surface_spec::classify_to_syntax_command(*is_eval, sexpr, spec)
+        })
+        .collect::<Result<_, _>>()?;
+    run_syntax_commands_via_backend(language, backend, commands)
 }
 
 #[cfg(not(feature = "legacy-petta-direct-eval"))]
@@ -9968,6 +10436,83 @@ mod direct_eval_disabled_tests {
             other => panic!("expected Apply node, got {:?}", other),
         }
     }
+
+    #[test]
+    fn petta_parse_term_uses_lean_exported_spec() {
+        // This test proves that PeTTaLanguage::parse_term goes through the
+        // Lean-exported SurfaceSpec. If the spec fails to load, parse_term
+        // will error — no fallback to hardcoded defaults.
+        let lang = PeTTaLanguage;
+
+        // parse_term must load the spec and use it to classify "=" as defineEq
+        let term = lang.parse_term("(= (id $x) $x)\n(id 7)")
+            .expect("parse_term should succeed with Lean-exported spec");
+
+        // Verify the term was assembled correctly (rule + query)
+        let pterm = term.as_any().downcast_ref::<PeTTaTerm>()
+            .expect("should be a PeTTaTerm");
+        assert_eq!(pterm.space.rules.len(), 1, "should have 1 rule from spec-driven '=' classification");
+        assert!(
+            matches!(&pterm.query, PatternNode::Apply { ctor, args } if ctor == "id" && args.len() == 1),
+            "query should be (id 7), got: {:?}",
+            pterm.query
+        );
+    }
+
+    #[test]
+    fn petta_parse_term_spec_classifies_facts_correctly() {
+        // Non-= forms should be classified as facts (atoms in the space),
+        // not rules. This is driven by the spec's command_heads, not hardcoded.
+        let lang = PeTTaLanguage;
+        let term = lang.parse_term("(foo bar)\n(baz)")
+            .expect("parse_term should succeed");
+        let pterm = term.as_any().downcast_ref::<PeTTaTerm>()
+            .expect("should be a PeTTaTerm");
+        assert_eq!(pterm.space.rules.len(), 0, "no rules — (foo bar) is a fact, not a rule");
+    }
+
+    #[test]
+    fn petta_surface_spec_loads_successfully() {
+        // Verify the Lean-exported spec loads and has the expected command heads
+        let spec = petta_surface_spec().expect("spec should load from bundled artifact");
+        assert_eq!(spec.dialect, "PeTTa");
+        assert!(spec.command_heads.iter().any(|ch| ch.head == "=" && ch.command == "defineEq"));
+        assert!(spec.command_heads.iter().any(|ch| ch.head == "import!" && ch.command == "import"));
+        assert!(spec.program_policy.explicit_query_only);
+    }
+
+    #[test]
+    fn petta_dispatch_policy_is_consumed() {
+        // The current PeTTa spec has fallback_unknown_head_to_fact = true,
+        // which means unknown non-eval heads become facts. This test verifies
+        // that the policy IS consumed — if we changed it to false, unknown
+        // heads would error instead of silently becoming facts.
+        let spec = petta_surface_spec().expect("spec should load");
+        assert!(
+            spec.dispatch_policy.fallback_unknown_head_to_fact,
+            "PeTTa dispatch policy should allow unknown heads to fall back to fact"
+        );
+        // Verify parse_surface_stmts with the real spec handles unknown heads as facts
+        let input = "(unknown-head a b)";
+        let stmts = parse_surface_stmts(input, spec).expect("should parse with fallback");
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(stmts[0], SurfaceStmt::Fact(_)));
+    }
+
+    #[test]
+    fn petta_dispatch_policy_fail_closed_on_strict_spec() {
+        // Construct a strict spec where fallback_unknown_head_to_fact = false
+        let mut spec = petta_surface_spec().expect("spec should load").clone();
+        spec.dispatch_policy.fallback_unknown_head_to_fact = false;
+
+        let input = "(unknown-head a b)";
+        let err = parse_surface_stmts(input, &spec)
+            .expect_err("should fail with strict dispatch policy");
+        assert!(
+            err.contains("unknown command head"),
+            "error should mention unknown command head, got: {err}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "mork-backend"))]
@@ -9998,7 +10543,7 @@ mod mork_backend_tests {
         };
         let bundle = build_petta_artifact_bundle(&space.rules).expect("artifact bundle");
         let bindings = compat_head_probe_bindings_generic(
-            &PeTTaCompatHeadBoundary,
+            &PeTTaCompatHeadBoundary { authority: None },
             &PeTTaPatternOps,
             &space,
             &bundle,
@@ -10096,7 +10641,7 @@ mod mork_backend_tests {
         };
         let bundle = build_petta_artifact_bundle(&space.rules).expect("artifact bundle");
         let witnessed = eval_term_with_witnesses_generic(
-            &PeTTaCompatHeadBoundary,
+            &PeTTaCompatHeadBoundary { authority: None },
             &PeTTaPatternOps,
             &space,
             &bundle,
@@ -10108,7 +10653,7 @@ mod mork_backend_tests {
         )
         .expect("witnessed outcomes");
         let bindings = compat_head_probe_bindings_generic(
-            &PeTTaCompatHeadBoundary,
+            &PeTTaCompatHeadBoundary { authority: None },
             &PeTTaPatternOps,
             &space,
             &bundle,
@@ -10137,7 +10682,7 @@ mod mork_backend_tests {
         };
         let bundle = build_petta_artifact_bundle(&space.rules).expect("artifact bundle");
         let witnessed = eval_term_with_witnesses_generic(
-            &PeTTaCompatHeadBoundary,
+            &PeTTaCompatHeadBoundary { authority: None },
             &PeTTaPatternOps,
             &space,
             &bundle,
@@ -10211,7 +10756,7 @@ mod mork_backend_tests {
         }])
         .expect("artifact bundle");
         let witnessed = eval_term_with_witnesses_generic(
-            &PeTTaCompatHeadBoundary,
+            &PeTTaCompatHeadBoundary { authority: None },
             &PeTTaPatternOps,
             &PeTTaSpace {
                 facts: vec![],
@@ -10302,7 +10847,7 @@ mod mork_backend_tests {
         else {
             panic!("query was not apply: {:?}", pterm.query);
         };
-        let boundary = PeTTaCompatHeadBoundary;
+        let boundary = PeTTaCompatHeadBoundary { authority: None };
         let envs = boundary
             .match_args(
                 &pterm.space,
@@ -10337,7 +10882,7 @@ mod mork_backend_tests {
             .expect("PeTTaTerm");
         let bundle = build_petta_artifact_bundle(&pterm.space.rules).expect("artifact bundle");
         let bindings = compat_head_probe_bindings_generic(
-            &PeTTaCompatHeadBoundary,
+            &PeTTaCompatHeadBoundary { authority: None },
             &PeTTaPatternOps,
             &pterm.space,
             &bundle,
@@ -10370,7 +10915,7 @@ mod mork_backend_tests {
             .expect("PeTTaTerm");
         let bundle = build_petta_artifact_bundle(&pterm.space.rules).expect("artifact bundle");
         let outcomes = eval_term_with_witnesses_generic(
-            &PeTTaCompatHeadBoundary,
+            &PeTTaCompatHeadBoundary { authority: None },
             &PeTTaPatternOps,
             &pterm.space,
             &bundle,
@@ -10598,7 +11143,7 @@ mod mork_backend_tests {
             app("compilefib", vec![]),
         );
         let bundle = build_petta_artifact_bundle(&term.space.rules).expect("artifact bundle");
-        build_petta_rewrite_mm2_program(&bundle, &term.space.facts, &term.query)
+        build_petta_rewrite_mm2_program(&bundle, &term.space.facts, &term.query, None)
             .expect("rhs scope should compile without spurious unbound vars");
     }
 
@@ -11225,7 +11770,7 @@ mod mork_backend_tests {
             app("add-reduct", vec![sym("space0"), sym("f0")]),
         );
         let bundle = build_petta_artifact_bundle(&term.space.rules).expect("artifact bundle");
-        build_petta_rewrite_mm2_program(&bundle, &term.space.facts, &term.query)
+        build_petta_rewrite_mm2_program(&bundle, &term.space.facts, &term.query, None)
             .expect("imported let* scope shape should compile without spurious unbound vars");
     }
 
@@ -11281,7 +11826,8 @@ mod mork_backend_tests {
         ));
         let program = load_petta_surface_program_from_path(file_path, &[])
             .expect("load surface program");
-        let stmts = parse_surface_stmts(&program).expect("parse surface stmts");
+        let spec = petta_surface_spec().expect("load petta surface spec");
+        let stmts = parse_surface_stmts(&program, &spec).expect("parse surface stmts");
 
         let mut space = PeTTaSpace::empty();
         let mut query = None;
@@ -11348,6 +11894,7 @@ mod mork_backend_tests {
             &bundle,
             &space.stored_atoms(),
             &remove_all_atoms_query,
+            None,
         )
         .expect("rewrite program");
         let rewrite_run = run_mm2_program_for_patterns(
@@ -11430,7 +11977,8 @@ mod mork_backend_tests {
         ));
         let program = load_petta_surface_program_from_path(file_path, lang.metadata().library_aliases())
             .expect("load surface program");
-        let stmts = parse_surface_stmts(&program).expect("parse surface stmts");
+        let spec = petta_surface_spec().expect("load petta surface spec");
+        let stmts = parse_surface_stmts(&program, &spec).expect("parse surface stmts");
         let mut space = PeTTaSpace::empty();
         let target = "(remove-all-atoms &self)";
 

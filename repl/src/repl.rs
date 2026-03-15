@@ -2599,6 +2599,48 @@ impl Repl {
                 self.last_core_diagnostics = aggregate_core_eval_diagnostics(&merged_diagnostics);
                 Ok(())
             },
+            #[cfg(feature = "lang-petta")]
+            SurfaceOutcome::EvalPreparedPeTTa(program) => {
+                // Structured PeTTa path — no text re-parse needed.
+                let petta_term = program.into_term()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                if !self.suppress_output {
+                    println!();
+                    print!("Executing prepared PeTTa program... ");
+                }
+
+                let term: Box<dyn mettail_runtime::Term> = Box::new(petta_term);
+
+                let language_name = self.state.language_name()
+                    .ok_or_else(|| anyhow::anyhow!("No language loaded"))?;
+                let language = self.registry.get(language_name)?;
+                let eval_result = language.run_eval(term.as_ref())
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                let mut merged_surface = Vec::new();
+                for nf in &eval_result.normal_forms {
+                    let decoded = self.metta_surface_session
+                        .as_ref()
+                        .map(|s| s.decode_atom_to_surface(nf))
+                        .unwrap_or_else(|| nf.clone());
+                    if !decoded.is_empty() && decoded != "()" {
+                        if !self.suppress_output {
+                            println!("{}", decoded);
+                        }
+                        merged_surface.push(decoded);
+                    }
+                }
+                if !merged_surface.is_empty() {
+                    merged_surface.sort();
+                    self.last_surface_results = Some(merged_surface);
+                }
+
+                if !self.suppress_output {
+                    println!("{}", "✓".green());
+                }
+                Ok(())
+            },
         }
     }
 

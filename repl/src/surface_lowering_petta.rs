@@ -6,7 +6,7 @@
 use anyhow::Result;
 
 use crate::metta_surface::{SExpr, SurfaceSpaceState};
-use crate::surface_lowering::SurfaceLowering;
+use crate::surface_lowering::{PreparedEval, SurfaceLowering};
 use crate::syntax_spec::{AtomEncodingSpec, DisplayProfile};
 
 pub struct PeTTaSurfaceLowering;
@@ -28,29 +28,19 @@ impl SurfaceLowering for PeTTaSurfaceLowering {
         &self,
         expr: &SExpr,
         space: &SurfaceSpaceState,
-        _enc: Option<&AtomEncodingSpec>,
+        enc: Option<&AtomEncodingSpec>,
     ) -> Result<Vec<String>> {
-        // PeTTa lowering: encode the query expression and space entries as a
-        // single term that PeTTaLanguage::parse_term can consume.
-        let query = render_sexpr(expr);
-
-        // Build space entries from both exact and pattern equation rules.
-        let mut space_lines = Vec::new();
-        for (lhs, rhs) in &space.eq_entries {
-            space_lines.push(format!("(= {lhs} {rhs})"));
+        // PeTTa uses the structured path (lower_eval_prepared → PreparedEval::PeTTa).
+        // This text fallback exists only to satisfy the trait contract for callers
+        // that haven't migrated to lower_eval_prepared yet.
+        match self.lower_eval_prepared(expr, space, enc)? {
+            PreparedEval::PeTTa(program) => {
+                let term = program.into_term()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(vec![term.to_string()])
+            },
+            PreparedEval::Text(terms) => Ok(terms),
         }
-        for (lhs, rhs) in &space.pattern_eq_entries {
-            space_lines.push(format!("(= {lhs} {rhs})"));
-        }
-
-        // Combine into a term: space entries newline-separated, then the query
-        let mut term_text = space_lines.join("\n");
-        if !term_text.is_empty() {
-            term_text.push('\n');
-        }
-        term_text.push_str(&query);
-
-        Ok(vec![term_text])
     }
 
     fn decode_atom(
@@ -78,11 +68,42 @@ impl SurfaceLowering for PeTTaSurfaceLowering {
     }
 
     fn requires_syntax_spec(&self) -> bool {
-        false
+        true
     }
 
     fn requires_lookup_plan(&self) -> bool {
         true
+    }
+
+    fn lower_eval_prepared(
+        &self,
+        expr: &SExpr,
+        space: &SurfaceSpaceState,
+        _enc: Option<&AtomEncodingSpec>,
+    ) -> anyhow::Result<PreparedEval> {
+        use mettail_languages::petta_artifacts::PeTTaRule;
+        use mettail_languages::petta_from_lean::{PeTTaSpace, PreparedPeTTaProgram};
+        use mettail_languages::sexpr::sexpr_to_pattern;
+
+        let mut petta_space = PeTTaSpace::empty();
+        for (idx, (lhs, rhs)) in space.eq_patterns.iter().enumerate() {
+            let left = sexpr_to_pattern(lhs)
+                .map_err(|e| anyhow::anyhow!("rule lhs: {}", e))?;
+            let right = sexpr_to_pattern(rhs)
+                .map_err(|e| anyhow::anyhow!("rule rhs: {}", e))?;
+            petta_space.add_rule(PeTTaRule {
+                name: format!("surface_rule_{}", idx + 1),
+                left,
+                right,
+                premises: vec![],
+            });
+        }
+        let query = sexpr_to_pattern(expr)
+            .map_err(|e| anyhow::anyhow!("query: {}", e))?;
+        Ok(PreparedEval::PeTTa(PreparedPeTTaProgram {
+            space: petta_space,
+            queries: vec![query],
+        }))
     }
 }
 

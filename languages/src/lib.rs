@@ -17,6 +17,8 @@ pub mod compat_head_boundary;
 // pub mod artifact_runtime;
 #[cfg(feature = "lang-calculator")]
 pub mod calculator;
+#[cfg(feature = "lang-petta")]
+pub mod eval_ir;
 pub mod execution_contract;
 #[cfg(feature = "lang-imp")]
 pub mod imp_artifacts;
@@ -29,6 +31,8 @@ pub mod lambda;
 pub mod metta_file;
 #[cfg(feature = "lang-mettafull-legacy")]
 pub mod mettafull_legacy;
+#[cfg(feature = "lang-petta")]
+pub mod native_profile;
 #[cfg(feature = "lang-he")]
 pub mod mettahe_artifacts;
 #[cfg(feature = "lang-he")]
@@ -57,6 +61,7 @@ pub mod scope_contract;
 #[cfg(feature = "lang-rhocalc")]
 pub mod rhocalc;
 pub mod sexpr;
+pub mod surface_spec;
 pub mod tree_sitter_parser;
 
 #[cfg(feature = "mork-backend")]

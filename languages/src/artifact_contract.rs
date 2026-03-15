@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,7 +77,7 @@ pub struct RewriteIRRule {
     pub root_update: Option<RewriteIRV2RootUpdateHint>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RewriteRuleMode {
     OrdinaryForward,
@@ -244,6 +245,19 @@ pub fn fnv1a64(text: &str) -> u64 {
         .fold(FNV64_OFFSET, |h, b| (h ^ (b as u64)).wrapping_mul(FNV64_PRIME))
 }
 
+/// Compute SHA-256 of a string (UTF-8 bytes) and return 64-char lowercase hex.
+/// Matches Lean's `sha256Hex` which also hashes `String.toUTF8`.
+pub fn sha256_hex(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Detect checksum format: 64-char hex → SHA-256, decimal digits → FNV-64.
+fn is_sha256_checksum(checksum_text: &str) -> bool {
+    checksum_text.len() == 64 && checksum_text.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 pub fn read_with_checksum(json_path: &Path, checksum_path: &Path) -> Result<String, String> {
     let json_text_raw = fs::read_to_string(json_path)
         .map_err(|e| format!("failed reading {}: {}", json_path.display(), e))?;
@@ -251,17 +265,27 @@ pub fn read_with_checksum(json_path: &Path, checksum_path: &Path) -> Result<Stri
         .map_err(|e| format!("failed reading {}: {}", checksum_path.display(), e))?;
     let json_text = json_text_raw.trim().to_string();
     let checksum_text = checksum_text_raw.trim();
-    let expected_checksum: u64 = checksum_text.parse().map_err(|e| {
-        format!("invalid checksum '{}' at {}: {}", checksum_text, checksum_path.display(), e)
-    })?;
-    let actual_checksum = fnv1a64(&json_text);
-    if expected_checksum != actual_checksum {
-        return Err(format!(
-            "checksum mismatch for {}: expected {}, got {}",
-            json_path.display(),
-            expected_checksum,
-            actual_checksum
-        ));
+    if is_sha256_checksum(checksum_text) {
+        // SHA-256 validation (schema v3)
+        let actual = sha256_hex(&json_text);
+        if checksum_text != actual {
+            return Err(format!(
+                "SHA-256 mismatch for {}: expected {}, got {}",
+                json_path.display(), checksum_text, actual
+            ));
+        }
+    } else {
+        // FNV-64 validation (schema v2 backward compat)
+        let expected_checksum: u64 = checksum_text.parse().map_err(|e| {
+            format!("invalid checksum '{}' at {}: {}", checksum_text, checksum_path.display(), e)
+        })?;
+        let actual_checksum = fnv1a64(&json_text);
+        if expected_checksum != actual_checksum {
+            return Err(format!(
+                "checksum mismatch for {}: expected {}, got {}",
+                json_path.display(), expected_checksum, actual_checksum
+            ));
+        }
     }
     Ok(json_text)
 }

@@ -742,6 +742,11 @@ pub fn retarget_surface_stmt(stmt: SurfaceStmt, default_space: &str) -> SurfaceS
             space: remap_stmt_space(space, default_space),
         },
         SurfaceStmt::AllocSpace => SurfaceStmt::AllocSpace,
+        SurfaceStmt::Import { target_space, path } => SurfaceStmt::Import {
+            target_space: remap_stmt_space(target_space, default_space),
+            path,
+        },
+        SurfaceStmt::SetFuel(n) => SurfaceStmt::SetFuel(n),
     }
 }
 
