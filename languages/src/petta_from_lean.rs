@@ -8773,6 +8773,42 @@ fn try_run_petta_mm2_condition(
     Ok(None)
 }
 
+/// Guarded recursive evaluation lane: tries to lower the query+rules to the EvalIR recursive
+/// fragment, then runs via MM2 state machine with IntArithSink grounded arithmetic.
+/// Returns NotThisLane if the term doesn't match the recursive fragment.
+#[cfg(feature = "mork-backend")]
+fn try_run_petta_recursive_lane(
+    term: &PeTTaTerm,
+    _limits: MorkExecutionLimits,
+) -> Result<LaneAttempt<PeTTaMm2Run>, String> {
+    if term.space.rules.is_empty() {
+        return Ok(LaneAttempt::NotThisLane);
+    }
+    let ir = crate::eval_ir::try_lower_recursive_fragment(&term.query, &term.space.rules);
+    let Some((ir_query, ir_rules)) = ir else {
+        return Ok(LaneAttempt::NotThisLane);
+    };
+    match crate::eval_ir::run_recursive_mm2(&ir_query, &ir_rules) {
+        Ok(Some(value)) => {
+            let result_node = PatternNode::Apply {
+                ctor: value.to_string(),
+                args: vec![],
+            };
+            Ok(LaneAttempt::Lowered(PeTTaMm2Run {
+                results: vec![result_node],
+                self_facts: None,
+                self_updates: vec![],
+            }))
+        }
+        Ok(None) => Ok(LaneAttempt::Inapplicable(
+            "recursive MM2 ran but produced no result".to_string(),
+        )),
+        Err(e) => Ok(LaneAttempt::Inapplicable(
+            format!("recursive MM2 execution error: {}", e),
+        )),
+    }
+}
+
 #[cfg(feature = "mork-backend")]
 fn run_petta_mm2_with_limits(
     term: &PeTTaTerm,
@@ -8798,6 +8834,11 @@ fn run_petta_mm2_with_limits(
         LaneAttempt::NotThisLane => {},
     }
     match try_run_petta_control_builtin(term, limits)? {
+        LaneAttempt::Lowered(results) => return Ok(results),
+        LaneAttempt::Inapplicable(reason) => inapplicable_lanes.push(reason),
+        LaneAttempt::NotThisLane => {},
+    }
+    match try_run_petta_recursive_lane(term, limits)? {
         LaneAttempt::Lowered(results) => return Ok(results),
         LaneAttempt::Inapplicable(reason) => inapplicable_lanes.push(reason),
         LaneAttempt::NotThisLane => {},

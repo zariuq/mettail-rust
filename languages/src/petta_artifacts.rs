@@ -364,7 +364,20 @@ fn ordered_uniq_u64(xs: Vec<u64>) -> Vec<u64> {
     out
 }
 
+/// Cached scope contract — loaded from disk once, reused for all subsequent calls.
+static CACHED_SCOPE_CONTRACT: std::sync::OnceLock<Option<ScopeContractArtifact>> =
+    std::sync::OnceLock::new();
+
 pub fn load_optional_petta_scope_contract_artifact() -> Result<Option<ScopeContractArtifact>, String> {
+    if let Some(cached) = CACHED_SCOPE_CONTRACT.get() {
+        return Ok(cached.clone());
+    }
+    let result = load_scope_contract_from_disk()?;
+    let _ = CACHED_SCOPE_CONTRACT.set(result.clone());
+    Ok(result)
+}
+
+fn load_scope_contract_from_disk() -> Result<Option<ScopeContractArtifact>, String> {
     for dir in petta_transition_search_paths() {
         let json_path = dir.join("petta.scope_contract.json");
         let checksum_path = dir.join("petta.scope_contract.checksum");
@@ -706,7 +719,21 @@ pub(crate) fn petta_transition_search_paths() -> Vec<PathBuf> {
 /// This is the intended replacement for hardcoded Rust execution-boundary
 /// policy. If the sidecar is absent, callers must continue to fail closed or
 /// use explicitly temporary bootstrap wiring outside the production path.
+/// Cached execution contract — loaded from disk once, reused for all subsequent calls.
+static CACHED_EXECUTION_CONTRACT: std::sync::OnceLock<Option<ExecutionContractArtifact>> =
+    std::sync::OnceLock::new();
+
 pub fn load_optional_petta_execution_contract_artifact(
+) -> Result<Option<ExecutionContractArtifact>, String> {
+    if let Some(cached) = CACHED_EXECUTION_CONTRACT.get() {
+        return Ok(cached.clone());
+    }
+    let result = load_execution_contract_from_disk()?;
+    let _ = CACHED_EXECUTION_CONTRACT.set(result.clone());
+    Ok(result)
+}
+
+fn load_execution_contract_from_disk(
 ) -> Result<Option<ExecutionContractArtifact>, String> {
     let mut first_error: Option<String> = None;
     for dir in petta_transition_search_paths() {
@@ -1200,22 +1227,34 @@ pub fn build_petta_artifact_bundle(rules: &[PeTTaRule]) -> Result<PeTTaArtifactB
     let scope_contract = load_optional_petta_scope_contract_artifact()?;
     let native_profile = crate::native_profile::load_optional_petta_native_profile_artifact()?;
 
-    // Try manifest-first validation if available
-    for dir in petta_transition_search_paths() {
-        if let Ok(Some(manifest)) = load_manifest(&dir) {
-            if let Err(e) = validate_manifest_digests(&manifest, &dir) {
-                eprintln!("warning: manifest validation failed at {}: {}", dir.display(), e);
-            } else {
-                eprintln!("manifest validated at {} ({} artifacts)", dir.display(), manifest.artifacts.len());
-                // Cross-validate manifest↔profile agreement
-                if let Some(ref profile) = native_profile {
-                    if let Err(e) = validate_manifest_profile_agreement(&manifest, profile) {
-                        return Err(e);
-                    }
+    // Try manifest-first validation if available (cached — only validate once)
+    static MANIFEST_VALIDATED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    let manifest_result = MANIFEST_VALIDATED.get_or_init(|| {
+        for dir in petta_transition_search_paths() {
+            if let Ok(Some(manifest)) = load_manifest(&dir) {
+                if let Err(e) = validate_manifest_digests(&manifest, &dir) {
+                    eprintln!("warning: manifest validation failed at {}: {}", dir.display(), e);
+                } else {
+                    eprintln!("manifest validated at {} ({} artifacts)", dir.display(), manifest.artifacts.len());
+                }
+                return Ok(());
+            }
+        }
+        Ok(())
+    });
+    manifest_result.clone()?;
+    // Cross-validate manifest↔profile agreement (also once)
+    static PROFILE_AGREEMENT_VALIDATED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    if let Some(ref profile) = native_profile {
+        let agreement = PROFILE_AGREEMENT_VALIDATED.get_or_init(|| {
+            for dir in petta_transition_search_paths() {
+                if let Ok(Some(manifest)) = load_manifest(&dir) {
+                    return validate_manifest_profile_agreement(&manifest, profile);
                 }
             }
-            break;
-        }
+            Ok(())
+        });
+        agreement.clone()?;
     }
 
     Ok(PeTTaArtifactBundle {

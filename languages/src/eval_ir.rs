@@ -1,8 +1,8 @@
-/// Minimal evaluator IR for the factorial vertical slice.
+/// Minimal evaluator IR for the recursive evaluation vertical slice.
 ///
 /// Mirrors `MeTTailCore.EvalIR` in Lean exactly:
 /// - `EvalValue` = `EvalValue` (Int | Bool)
-/// - `EvalNode` = `EvalNode` (7 variants)
+/// - `EvalNode` = `EvalNode` (8 variants: intLit, boolLit, ifCond, eqInt, addInt, subInt, mulInt, userCall)
 /// - `EvalRule` = `EvalRule` (head, params, body)
 /// - `eval_host` = `eval` (fuel-bounded reference evaluator)
 ///
@@ -29,6 +29,7 @@ pub enum EvalNode {
     BoolLit(bool),
     IfCond(Box<EvalNode>, Box<EvalNode>, Box<EvalNode>),
     EqInt(Box<EvalNode>, Box<EvalNode>),
+    AddInt(Box<EvalNode>, Box<EvalNode>),
     SubInt(Box<EvalNode>, Box<EvalNode>),
     MulInt(Box<EvalNode>, Box<EvalNode>),
     UserCall { head: String, args: Vec<EvalNode> },
@@ -55,6 +56,10 @@ fn subst_node(env: &[(String, EvalNode)], node: &EvalNode) -> EvalNode {
             Box::new(subst_node(env, e)),
         ),
         EvalNode::EqInt(a, b) => EvalNode::EqInt(
+            Box::new(subst_node(env, a)),
+            Box::new(subst_node(env, b)),
+        ),
+        EvalNode::AddInt(a, b) => EvalNode::AddInt(
             Box::new(subst_node(env, a)),
             Box::new(subst_node(env, b)),
         ),
@@ -96,7 +101,7 @@ fn value_to_node(v: &EvalValue) -> EvalNode {
 /// Fuel-bounded. Mirrors Lean `MeTTailCore.EvalIR.eval` exactly.
 ///
 /// This is a REFERENCE function for testing, not an execution lane.
-/// The execution lane is MM2 (via `emit_factorial_mm2`).
+/// The execution lane is MM2 (via `emit_recursive_mm2`).
 pub fn eval_host(rules: &[EvalRule], fuel: usize, node: &EvalNode) -> Option<EvalValue> {
     match node {
         EvalNode::IntLit(n) => Some(EvalValue::Int(*n)),
@@ -111,6 +116,12 @@ pub fn eval_host(rules: &[EvalRule], fuel: usize, node: &EvalNode) -> Option<Eva
         EvalNode::EqInt(a, b) => {
             match (eval_host(rules, fuel, a)?, eval_host(rules, fuel, b)?) {
                 (EvalValue::Int(va), EvalValue::Int(vb)) => Some(EvalValue::Bool(va == vb)),
+                _ => None,
+            }
+        }
+        EvalNode::AddInt(a, b) => {
+            match (eval_host(rules, fuel, a)?, eval_host(rules, fuel, b)?) {
+                (EvalValue::Int(va), EvalValue::Int(vb)) => Some(EvalValue::Int(va + vb)),
                 _ => None,
             }
         }
@@ -153,9 +164,10 @@ pub fn eval_host(rules: &[EvalRule], fuel: usize, node: &EvalNode) -> Option<Eva
     }
 }
 
-/// The factorial rule in EvalIR form.
+/// Test fixture: factorial rule in EvalIR form.
 /// facF(n) = if (n == 0) then 1 else n * facF(n - 1)
-pub fn factorial_rules() -> Vec<EvalRule> {
+#[cfg(test)]
+fn factorial_rules() -> Vec<EvalRule> {
     vec![EvalRule {
         head: "facF".to_string(),
         params: vec!["n".to_string()],
@@ -179,14 +191,47 @@ pub fn factorial_rules() -> Vec<EvalRule> {
     }]
 }
 
-// ── Restricted factorial fragment lowering ──────────────────────────────────
+/// Test fixture: fibonacci rules in EvalIR form.
+/// fib(n) = if (n == 0) then 0 else if (n == 1) then 1 else fib(n-1) + fib(n-2)
+#[cfg(test)]
+fn fibonacci_rules() -> Vec<EvalRule> {
+    let var_n = || EvalNode::UserCall { head: "n".to_string(), args: vec![] };
+    vec![EvalRule {
+        head: "fib".to_string(),
+        params: vec!["n".to_string()],
+        body: EvalNode::IfCond(
+            Box::new(EvalNode::EqInt(Box::new(var_n()), Box::new(EvalNode::IntLit(0)))),
+            Box::new(EvalNode::IntLit(0)),
+            Box::new(EvalNode::IfCond(
+                Box::new(EvalNode::EqInt(Box::new(var_n()), Box::new(EvalNode::IntLit(1)))),
+                Box::new(EvalNode::IntLit(1)),
+                Box::new(EvalNode::AddInt(
+                    Box::new(EvalNode::UserCall {
+                        head: "fib".to_string(),
+                        args: vec![EvalNode::SubInt(
+                            Box::new(var_n()), Box::new(EvalNode::IntLit(1)),
+                        )],
+                    }),
+                    Box::new(EvalNode::UserCall {
+                        head: "fib".to_string(),
+                        args: vec![EvalNode::SubInt(
+                            Box::new(var_n()), Box::new(EvalNode::IntLit(2)),
+                        )],
+                    }),
+                )),
+            )),
+        ),
+    }]
+}
+
+// ── Restricted recursive fragment lowering ──────────────────────────────────
 
 /// Lower a PeTTa query + rules to EvalIR ONLY if the term matches the
 /// factorial fragment. Returns None if any construct is outside the supported fragment.
 ///
 /// Council: Tang/Conway — guarded, not global. Only the exact facF shape.
 #[cfg(feature = "lang-petta")]
-pub fn try_lower_factorial_fragment(
+pub fn try_lower_recursive_fragment(
     query: &PatternNode,
     rules: &[PeTTaRule],
 ) -> Option<(EvalNode, Vec<EvalRule>)> {
@@ -286,6 +331,11 @@ fn try_lower_expr(
                     let b = try_lower_expr(&args[1], params, known_heads)?;
                     Some(EvalNode::EqInt(Box::new(a), Box::new(b)))
                 }
+                "+" if args.len() == 2 => {
+                    let a = try_lower_expr(&args[0], params, known_heads)?;
+                    let b = try_lower_expr(&args[1], params, known_heads)?;
+                    Some(EvalNode::AddInt(Box::new(a), Box::new(b)))
+                }
                 "-" if args.len() == 2 => {
                     let a = try_lower_expr(&args[0], params, known_heads)?;
                     let b = try_lower_expr(&args[1], params, known_heads)?;
@@ -336,11 +386,11 @@ use crate::sexpr::SExpr;
 /// consumed. We emit `COPIES` copies of each rule template to support recursive
 /// programs (same pattern as mork_backend.rs).
 #[cfg(feature = "mork-backend")]
-pub fn emit_factorial_mm2(
+pub fn emit_recursive_mm2(
     ir_query: &EvalNode,
     ir_rules: &[EvalRule],
 ) -> Vec<u8> {
-    const COPIES: usize = 200; // each recursive level needs ~15 rule firings
+    const COPIES: usize = 500; // branching recursion (fib) needs many rounds per level
 
     // Priority scheme (MORK picks lowest-numbered exec first):
     // Phase 0 (copy 0..N): User-defined unfold (facF → body expansion)
@@ -386,6 +436,8 @@ pub fn emit_factorial_mm2(
     // ── Phase 1: Compound unfold (break down compound nodes into sub-requests) ──
     templates.push((1, "eqInt_unfold".into(),
         "(exec ({pri} {name}) (, (req $id (eqInt $a $b))) (O (+ (req (sub0 $id) $a)) (+ (req (sub1 $id) $b)) (+ (wait_eq $id)) (- (req $id (eqInt $a $b)))))".into()));
+    templates.push((1, "addInt_unfold".into(),
+        "(exec ({pri} {name}) (, (req $id (addInt $a $b))) (O (+ (req (sub0 $id) $a)) (+ (req (sub1 $id) $b)) (+ (wait_add $id)) (- (req $id (addInt $a $b)))))".into()));
     templates.push((1, "subInt_unfold".into(),
         "(exec ({pri} {name}) (, (req $id (subInt $a $b))) (O (+ (req (sub0 $id) $a)) (+ (req (sub1 $id) $b)) (+ (wait_sub $id)) (- (req $id (subInt $a $b)))))".into()));
     templates.push((1, "mulInt_unfold".into(),
@@ -401,29 +453,27 @@ pub fn emit_factorial_mm2(
     templates.push((2, "boolFalse".into(),
         "(exec ({pri} {name}) (, (req $id (boolLit 0))) (O (+ (res $id 0)) (- (req $id (boolLit 0)))))".into()));
 
-    // ── Phase 3: Fold/join (combine sub-results) ──
-    // Arithmetic uses lookup tables: (SUB $a $b $r), (MUL $a $b $r)
-    // These are data facts, not exec rules. MORK matches them in conjunctions.
-    templates.push((3, "eqInt_fold_eq".into(),
-        "(exec ({pri} {name}) (, (wait_eq $id) (res (sub0 $id) $v) (res (sub1 $id) $v)) (O (+ (res $id 1)) (- (wait_eq $id)) (- (res (sub0 $id) $v)) (- (res (sub1 $id) $v))))".into()));
+    // ── Phase 3: Fold/join (combine sub-results via IntArithSink) ──
+    // Grounded arithmetic: (ieq), (i+), (i-), (i*) — Rust-computed by MORK IntArithSink.
+    // No lookup tables needed. Mirrors Lean IntArithStep.foldArith.
+    templates.push((3, "eqInt_fold".into(),
+        "(exec ({pri} {name}) (, (wait_eq $id) (res (sub0 $id) $va) (res (sub1 $id) $vb)) (O (ieq (res $id) $va $vb) (- (wait_eq $id)) (- (res (sub0 $id) $va)) (- (res (sub1 $id) $vb))))".into()));
+    templates.push((3, "addInt_fold".into(),
+        "(exec ({pri} {name}) (, (wait_add $id) (res (sub0 $id) $va) (res (sub1 $id) $vb)) (O (i+ (res $id) $va $vb) (- (wait_add $id)) (- (res (sub0 $id) $va)) (- (res (sub1 $id) $vb))))".into()));
     templates.push((3, "subInt_fold".into(),
-        "(exec ({pri} {name}) (, (wait_sub $id) (res (sub0 $id) $va) (res (sub1 $id) $vb) (SUB $va $vb $r)) (O (+ (res $id $r)) (- (wait_sub $id)) (- (res (sub0 $id) $va)) (- (res (sub1 $id) $vb))))".into()));
+        "(exec ({pri} {name}) (, (wait_sub $id) (res (sub0 $id) $va) (res (sub1 $id) $vb)) (O (i- (res $id) $va $vb) (- (wait_sub $id)) (- (res (sub0 $id) $va)) (- (res (sub1 $id) $vb))))".into()));
     templates.push((3, "mulInt_fold".into(),
-        "(exec ({pri} {name}) (, (wait_mul $id) (res (sub0 $id) $va) (res (sub1 $id) $vb) (MUL $va $vb $r)) (O (+ (res $id $r)) (- (wait_mul $id)) (- (res (sub0 $id) $va)) (- (res (sub1 $id) $vb))))".into()));
+        "(exec ({pri} {name}) (, (wait_mul $id) (res (sub0 $id) $va) (res (sub1 $id) $vb)) (O (i* (res $id) $va $vb) (- (wait_mul $id)) (- (res (sub0 $id) $va)) (- (res (sub1 $id) $vb))))".into()));
     templates.push((3, "if_true".into(),
         "(exec ({pri} {name}) (, (wait_if $id $t $e) (res (cond $id) 1)) (O (+ (req $id $t)) (- (wait_if $id $t $e)) (- (res (cond $id) 1))))".into()));
     templates.push((3, "if_false".into(),
         "(exec ({pri} {name}) (, (wait_if $id $t $e) (res (cond $id) 0)) (O (+ (req $id $e)) (- (wait_if $id $t $e)) (- (res (cond $id) 0))))".into()));
 
-    // ── Phase 4: eqInt fold unequal (lower priority than fold equal) ──
-    templates.push((4, "eqInt_fold_neq".into(),
-        "(exec ({pri} {name}) (, (wait_eq $id) (res (sub0 $id) $va) (res (sub1 $id) $vb)) (O (+ (res $id 0)) (- (wait_eq $id)) (- (res (sub0 $id) $va)) (- (res (sub1 $id) $vb))))".into()));
-
     // ── Emit COPIES of each template with round-interleaved priorities ──
     // Priority = copy * NUM_PHASES + phase, so each "round" (copy) processes
-    // one complete computation step: unfold → compound → leaf → fold → fold_neq.
+    // one complete computation step: unfold → compound → leaf → fold.
     // MORK fires lowest priority first, creating a natural execution cascade.
-    let num_phases = 5;
+    let num_phases = 4;
     let mut forms: Vec<String> = Vec::new();
     for copy in 0..COPIES {
         for (phase, prefix, template) in &templates {
@@ -436,30 +486,8 @@ pub fn emit_factorial_mm2(
         }
     }
 
-    // ── Arithmetic lookup tables ──
-    // Pre-compute the domain needed by evaluating with the host evaluator.
-    // For facF(N): SUB needs (n, 1) for n=0..N, MUL needs the factorial chain.
-    // We generate conservatively for the domain [0..max_arg+1].
-    let max_arg = extract_max_int_arg(ir_query).unwrap_or(10) as i64;
-    let domain_max = max_arg + 1;
-
-    // SUB table: (SUB a b r) where r = a - b, for all pairs in domain
-    for a in 0..=domain_max {
-        for b in 0..=domain_max {
-            forms.push(format!("(SUB {} {} {})", a, b, a - b));
-        }
-    }
-
-    // MUL table: only the values actually needed for the factorial chain
-    // facF(0)=1, facF(1)=1, facF(2)=2, ..., facF(N)=N!
-    // MUL needed: n * facF(n-1) for n=1..max_arg
-    let mut factorial_val: i64 = 1;
-    for n in 1..=max_arg {
-        // n * factorial_val = n * (n-1)!
-        let product = n * factorial_val;
-        forms.push(format!("(MUL {} {} {})", n, factorial_val, product));
-        factorial_val = product;
-    }
+    // No lookup tables needed — IntArithSink (ieq, i+, i-, i*) computes
+    // arithmetic at runtime inside MORK. Mirrors Lean IntArithStep.foldArith.
 
     // ── Initial request ──
     let query_mm2 = eval_node_to_mm2_concrete(ir_query);
@@ -479,7 +507,7 @@ fn extract_max_int_arg(node: &EvalNode) -> Option<i64> {
             [extract_max_int_arg(c), extract_max_int_arg(t), extract_max_int_arg(e)]
                 .into_iter().flatten().max()
         }
-        EvalNode::EqInt(a, b) | EvalNode::SubInt(a, b) | EvalNode::MulInt(a, b) => {
+        EvalNode::EqInt(a, b) | EvalNode::AddInt(a, b) | EvalNode::SubInt(a, b) | EvalNode::MulInt(a, b) => {
             [extract_max_int_arg(a), extract_max_int_arg(b)]
                 .into_iter().flatten().max()
         }
@@ -504,6 +532,11 @@ fn eval_node_to_mm2(node: &EvalNode, param_map: &[(String, String)]) -> String {
         ),
         EvalNode::EqInt(a, b) => format!(
             "(eqInt {} {})",
+            eval_node_to_mm2(a, param_map),
+            eval_node_to_mm2(b, param_map),
+        ),
+        EvalNode::AddInt(a, b) => format!(
+            "(addInt {} {})",
             eval_node_to_mm2(a, param_map),
             eval_node_to_mm2(b, param_map),
         ),
@@ -559,17 +592,17 @@ pub fn extract_mm2_result(dump: &str) -> Option<i64> {
 
 /// Run the factorial MM2 state machine through MORK and return the result.
 #[cfg(feature = "mork-backend")]
-pub fn run_factorial_mm2(
+pub fn run_recursive_mm2(
     ir_query: &EvalNode,
     ir_rules: &[EvalRule],
 ) -> Result<Option<i64>, String> {
     use crate::mork_backend::mork_eval;
     use mettail_runtime::MorkExecutionLimits;
 
-    let program = emit_factorial_mm2(ir_query, ir_rules);
+    let program = emit_recursive_mm2(ir_query, ir_rules);
     let limits = MorkExecutionLimits {
-        max_steps: 100_000,
-        rule_copies: 200,
+        max_steps: 500_000,
+        rule_copies: 500,
         ..MorkExecutionLimits::default()
     };
     let run = mork_eval::run_mm2_program_with_limits(&program, limits)?;
@@ -632,6 +665,26 @@ mod tests {
         assert_eq!(eval_host(&rules, 100, &query), None);
     }
 
+    #[test]
+    fn test_eval_host_fib_10() {
+        let rules = fibonacci_rules();
+        let query = EvalNode::UserCall {
+            head: "fib".to_string(),
+            args: vec![EvalNode::IntLit(10)],
+        };
+        assert_eq!(eval_host(&rules, 1000, &query), Some(EvalValue::Int(55)));
+    }
+
+    #[test]
+    fn test_eval_host_fib_20() {
+        let rules = fibonacci_rules();
+        let query = EvalNode::UserCall {
+            head: "fib".to_string(),
+            args: vec![EvalNode::IntLit(20)],
+        };
+        assert_eq!(eval_host(&rules, 100_000, &query), Some(EvalValue::Int(6765)));
+    }
+
     #[cfg(feature = "mork-backend")]
     #[test]
     fn test_mm2_emission_produces_program() {
@@ -640,7 +693,7 @@ mod tests {
             head: "facF".to_string(),
             args: vec![EvalNode::IntLit(3)],
         };
-        let program = emit_factorial_mm2(&query, &rules);
+        let program = emit_recursive_mm2(&query, &rules);
         let program_str = String::from_utf8(program).unwrap();
         // Should contain req, res, wait tokens
         assert!(program_str.contains("(req root"));
@@ -779,7 +832,7 @@ mod tests {
             head: "facF".to_string(),
             args: vec![EvalNode::IntLit(3)],
         };
-        match run_factorial_mm2(&query, &rules) {
+        match run_recursive_mm2(&query, &rules) {
             Ok(Some(result)) => {
                 assert_eq!(result, 6, "MM2 factorial(3) should be 6");
                 // Cross-check with host evaluator
@@ -799,7 +852,7 @@ mod tests {
             head: "facF".to_string(),
             args: vec![EvalNode::IntLit(10)],
         };
-        match run_factorial_mm2(&query, &rules) {
+        match run_recursive_mm2(&query, &rules) {
             Ok(Some(result)) => {
                 assert_eq!(result, 3628800, "MM2 factorial(10) should be 3628800");
                 // Cross-check with host evaluator
